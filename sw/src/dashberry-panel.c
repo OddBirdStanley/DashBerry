@@ -269,7 +269,7 @@ static const uint8_t font8x8[95][8] = {
 
 /* Hand-drawn 8x16 RF glyphs (bit 0 = leftmost, one byte per pixel row —
  * NOT doubled). Wireless = radios live — user drawing, source of truth
- * dashcam/wireless_glyph.txt ('x' = lit); shield = radios blocked (the
+ * DashBerry/wireless_glyph.txt ('x' = lit); shield = radios blocked (the
  * fail-closed default face). VERIFY-visual: legibility + orientation. */
 static const uint8_t glyph_wireless[16] = {
     0x3C, 0x42, 0x81, 0x81, 0x3C, 0x42, 0x81, 0x81,
