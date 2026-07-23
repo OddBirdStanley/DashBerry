@@ -1,0 +1,30 @@
+#!/bin/sh
+# front-rec — front CSI camera → hardware H.264 → 60 s fragmented MP4 segments.
+# rpicam-vid does the capture+encode; GStreamer only muxes, so a mux crash
+# never touches the ISP. Writes into the per-boot session directory minted by
+# session-init (rev 6): a recorder restart REUSES the same session dir.
+set -eu
+. /etc/dashberry.conf
+
+SESSION=$(cat "$SESSION_FILE")
+OUT="$DATA/front/$SESSION"
+mkdir -p "$OUT"
+
+# Restart-in-same-session: resume the %05d counter one past the highest
+# existing segment so filenames never collide (splitmuxsink start-index).
+# VERIFY on bench: kill/restart mid-session, confirm no overwrite and a
+# clean, gap-free index sequence.
+START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.mp4$/ { if ($1 + 1 > s) s = $1 + 1 } END { print s + 0 }')
+
+# --inline: repeat SPS/PPS on every IDR so any segment decodes standalone.
+# --intra = 1 keyframe/s so splitmuxsink can cut close to the 60 s mark.
+rpicam-vid -t 0 -n \
+    --width "$FRONT_W" --height "$FRONT_H" --framerate "$FRONT_FPS" \
+    --bitrate "$FRONT_BITRATE" --inline --intra "$FRONT_FPS" \
+    --codec h264 -o - |
+gst-launch-1.0 -e fdsrc fd=0 \
+    ! h264parse \
+    ! splitmuxsink location="$OUT/%05d.mp4" \
+        start-index="$START_INDEX" \
+        max-size-time="$SEGMENT_NS" \
+        muxer-properties="properties,fragment-duration=$FRAGMENT_MS"

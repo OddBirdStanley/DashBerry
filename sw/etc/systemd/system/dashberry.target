@@ -1,0 +1,6 @@
+[Unit]
+Description=DashBerry runtime (recording, GPS, panel, retention)
+Documentation=file:///home/stanley/Desktop/work/cam/dashcam/PLAN.md
+
+[Install]
+WantedBy=multi-user.target

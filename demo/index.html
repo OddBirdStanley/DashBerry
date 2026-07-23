@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DashBerry panel demo — §3b logic visualizer</title>
+<style>
+  :root {
+    --bg: #101318; --panel: #181d24; --edge: #2a323d;
+    --ink: #d6dde6; --dim: #8a95a3; --accent: #7fb4e6;
+    --ok: #6fd08c; --err: #e07a6b; --pix: #cfe9ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.45 system-ui, sans-serif;
+    display: flex; flex-wrap: wrap; gap: 18px; padding: 18px;
+  }
+  h1 { font-size: 15px; margin: 0 0 2px; }
+  h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--dim); margin: 0 0 8px;
+  }
+  .col { display: flex; flex-direction: column; gap: 14px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--edge);
+    border-radius: 10px; padding: 12px 14px;
+  }
+  #subtitle { color: var(--dim); font-size: 12px; margin-bottom: 10px; }
+
+  /* ---- OLED ---- */
+  #bezel {
+    background: #05070a; border: 1px solid #000; border-radius: 8px;
+    padding: 18px; width: fit-content;
+    box-shadow: inset 0 0 24px #000;
+  }
+  canvas { display: block; image-rendering: pixelated; }
+  #fbnote { color: var(--dim); font-size: 11px; margin-top: 6px; height: 14px; }
+
+  /* ---- bonnet ---- */
+  #bonnet { display: flex; align-items: center; gap: 26px; }
+  #joy { display: grid; grid-template-columns: repeat(3, 44px);
+         grid-template-rows: repeat(3, 44px); gap: 4px; }
+  .key {
+    background: #232a33; color: var(--ink); border: 1px solid var(--edge);
+    border-radius: 8px; font: 600 13px system-ui; cursor: pointer;
+    user-select: none; touch-action: none;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .key:active, .key.down { background: var(--accent); color: #10151a; }
+  .ab { width: 54px; height: 54px; border-radius: 50%; font-size: 15px; }
+  #keyhints { color: var(--dim); font-size: 11px; margin-top: 8px; }
+
+  /* ---- controls ---- */
+  label.row {
+    display: flex; align-items: center; gap: 8px; padding: 2px 0;
+    cursor: pointer;
+  }
+  label.row input[type=checkbox] { accent-color: var(--accent); }
+  .slider { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+  .slider input { flex: 1; accent-color: var(--accent); }
+  .slider span.val { min-width: 72px; text-align: right; color: var(--dim);
+                     font-variant-numeric: tabular-nums; }
+  select, button.act {
+    background: #232a33; color: var(--ink); border: 1px solid var(--edge);
+    border-radius: 6px; padding: 4px 8px; font: inherit;
+  }
+  .grp { margin-bottom: 10px; }
+  .grp:last-child { margin-bottom: 0; }
+
+  /* ---- inspector ---- */
+  #inspector { min-width: 300px; }
+  .pill {
+    display: inline-block; border-radius: 20px; padding: 1px 10px;
+    font-size: 12px; font-weight: 600; margin: 1px 2px 1px 0;
+    background: #232a33; color: var(--dim);
+  }
+  .pill.on  { background: #1d3325; color: var(--ok); }
+  .pill.off { background: #392420; color: var(--err); }
+  #bigstate { font-size: 13px; margin-bottom: 8px; }
+  #bigstate .pill { font-size: 13px; padding: 3px 12px; }
+  table.kv { border-collapse: collapse; width: 100%; font-size: 12.5px; }
+  table.kv td { padding: 1.5px 0; }
+  table.kv td:first-child { color: var(--dim); padding-right: 12px; }
+  table.kv td:last-child { font-variant-numeric: tabular-nums; }
+  #blankbar { height: 4px; background: #232a33; border-radius: 2px;
+              margin-top: 6px; overflow: hidden; }
+  #blankfill { height: 100%; background: var(--accent); width: 0; }
+
+  /* ---- log ---- */
+  #log {
+    font: 11.5px/1.5 ui-monospace, monospace; color: var(--dim);
+    height: 180px; overflow-y: auto; white-space: pre-wrap;
+  }
+  #log .hi { color: var(--ink); }
+</style>
+</head>
+<body>
+
+<div class="col">
+  <div class="card">
+    <h1>DashBerry panel — §3b logic demo</h1>
+    <div id="subtitle">panel.js is a statement-level port of
+      <code>sw/src/dashberry-panel.c</code>; everything below the OLED is
+      simulated hardware.</div>
+    <div id="bezel"><canvas id="oled" width="512" height="256"></canvas></div>
+    <div id="fbnote"></div>
+  </div>
+
+  <div class="card">
+    <h2>OLED Bonnet inputs (hold A ≈ 2 s = RF kill)</h2>
+    <div id="bonnet">
+      <div id="joy">
+        <div></div><div class="key" data-key="UP">▲</div><div></div>
+        <div class="key" data-key="LEFT">◀</div>
+        <div class="key" data-key="CENTER">●</div>
+        <div class="key" data-key="RIGHT">▶</div>
+        <div></div><div class="key" data-key="DOWN">▼</div><div></div>
+      </div>
+      <div class="key ab" data-key="A">A</div>
+      <div class="key ab" data-key="B">B</div>
+    </div>
+    <div id="keyhints">keyboard: arrows = joystick · Enter = center ·
+      A / B keys · hold works for the 2 s RF toggle</div>
+  </div>
+
+  <div class="card" style="flex:1">
+    <h2>Log</h2>
+    <div id="log"></div>
+  </div>
+</div>
+
+<div class="col" style="flex:1; min-width:320px">
+  <div class="card">
+    <h2>Simulated hardware</h2>
+
+    <div class="grp">
+      <label class="row"><input type="checkbox" id="front" checked>
+        front-rec writing segments (uncheck → FRONT ERR after 10 s stale)</label>
+      <label class="row"><input type="checkbox" id="rear" checked>
+        rear-rec writing segments</label>
+      <label class="row"><input type="checkbox" id="rtc" checked>
+        DS3231 RTC readable (uncheck → TIME ERR)</label>
+    </div>
+
+    <div class="grp">
+      <label class="row"><input type="checkbox" id="gpsdel" checked>
+        gpsd delivering NMEA (uncheck → GPS ERR after 5 s silence)</label>
+      <label class="row"><input type="checkbox" id="gpsfix" checked>
+        RMC fix (uncheck → "LAT ---" placeholders, not an ERR)</label>
+      <div class="slider">GPS speed
+        <input type="range" id="knots" min="0" max="120" step="0.5" value="52.2">
+        <span class="val" id="knotsval"></span></div>
+    </div>
+
+    <div class="grp">
+      <label class="row"><input type="checkbox" id="mounted" checked>
+        /data mounted</label>
+      <label class="row"><input type="checkbox" id="rw" checked>
+        …read-write</label>
+      <label class="row"><input type="checkbox" id="fserr">
+        ext4 errors_count &gt; 0</label>
+      <div class="slider">free space
+        <input type="range" id="free" min="0" max="100" step="0.1" value="90.1">
+        <span class="val" id="freeval"></span></div>
+    </div>
+
+    <div class="grp">
+      <label class="row"><input type="checkbox" id="persistfail">
+        RF state persist FAILS (demo the fail-closed ordering)</label>
+      <label class="row"><input type="checkbox" id="fastburn">
+        test aid: burn-in shift every 3 s instead of 60 s</label>
+    </div>
+
+    <div class="grp">
+      UNITS <select id="units"><option>MPH</option><option>KMH</option></select>
+      <button class="act" id="restart">restart panel daemon</button>
+      <span style="color:var(--dim);font-size:11.5px">(conf is read at boot,
+        as in the C; rfkill state survives the restart)</span>
+    </div>
+  </div>
+
+  <div class="card" id="inspector">
+    <h2>Panel state (read-only)</h2>
+    <div id="bigstate"></div>
+    <div id="healthpills"></div>
+    <table class="kv"><tbody id="kv"></tbody></table>
+    <div id="blankbar"><div id="blankfill"></div></div>
+  </div>
+</div>
+
+<script src="panel.js"></script>
+<script>
+"use strict";
+
+/* ------------------------------------------------------- simulated hw -- */
+
+const $ = (id) => document.getElementById(id);
+
+const sim = {
+    frontLast: 0, rearLast: 0,
+    rfSoftBlocked: true,           /* rf-state oneshot booted us dark */
+    lat: 43.61871, lon: -116.21460, heading: 1.1,
+};
+
+const logEl = $("log");
+function logLine(msg, hi) {
+    const t = (performance.now() / 1000).toFixed(1).padStart(7);
+    const div = document.createElement("div");
+    div.textContent = `[${t}] ${msg}`;
+    if (hi) div.className = "hi";
+    logEl.appendChild(div);
+    while (logEl.childElementCount > 400) logEl.removeChild(logEl.firstChild);
+    logEl.scrollTop = logEl.scrollHeight;
+}
+
+let holdTimer = null;
+
+const hw = {
+    now: () => performance.now(),
+    armHold: (cb) => { clearTimeout(holdTimer);
+                       holdTimer = setTimeout(cb, PANEL.HOLD_MS); },
+    disarmHold: () => clearTimeout(holdTimer),
+    frontNewestMtimeMs: () => sim.frontLast,
+    rearNewestMtimeMs: () => sim.rearLast,
+    rtcOk: () => $("rtc").checked,
+    statvfs: () => {
+        if (!$("mounted").checked) return null;
+        const pct = parseFloat($("free").value);
+        return { rw: $("rw").checked, freePct: pct,
+                 fsErrors: $("fserr").checked };
+    },
+    rfSoftBlocked: () => sim.rfSoftBlocked,
+    rfkill: (verb, what) => {
+        logLine(`exec: rfkill ${verb} ${what}`, true);
+        if (what === "wifi") sim.rfSoftBlocked = (verb === "block");
+    },
+    rfPersist: (ch) => {
+        if ($("persistfail").checked) {
+            logLine(`persist /data/rf/state <- '${ch}'  ** FAILED **`, true);
+            return false;
+        }
+        logLine(`persist /data/rf/state <- '${ch}' (tmp,fsync,rename,fsync)`);
+        return true;
+    },
+    present: (view) => blit(view),
+    notify: (msg) => { if (msg === "READY=1") logLine("sd_notify: READY=1"); },
+    log: (msg) => logLine(msg, true),
+};
+
+let panel = PANEL.create(hw);
+
+/* ----------------------------------------------------------- display -- */
+
+const ctx = $("oled").getContext("2d");
+const SCALE = 4;
+function blit(view) {
+    ctx.fillStyle = "#05070a";
+    ctx.fillRect(0, 0, 512, 256);
+    $("fbnote").textContent =
+        view.blanked ? "FBIOBLANK POWERDOWN — display dark (AUTO-BLANK)" : "";
+    if (view.blanked) return;
+    ctx.fillStyle = "#cfe9ff";
+    for (let y = 0; y < 64; y++)
+        for (let x = 0; x < 128; x++)
+            if (view.fb[y * 128 + x])
+                ctx.fillRect(x * SCALE, y * SCALE, SCALE - 1, SCALE - 1);
+}
+
+/* ------------------------------------------------------------- input -- */
+
+function bindKey(el) {
+    const key = PANEL.KEY[el.dataset.key];
+    const gpio = PANEL.KEY_GPIO[key];
+    let down = false;
+    const press = (e) => { e.preventDefault();
+        if (down) return; down = true; el.classList.add("down");
+        panel.keyEvent(gpio, true); };
+    const release = () => { if (!down) return; down = false;
+        el.classList.remove("down"); panel.keyEvent(gpio, false); };
+    el.addEventListener("pointerdown", press);
+    el.addEventListener("pointerup", release);
+    el.addEventListener("pointerleave", release);
+    el.buttonRelease = release;
+}
+document.querySelectorAll(".key[data-key]").forEach(bindKey);
+
+const KB = { ArrowUp: "UP", ArrowDown: "DOWN", ArrowLeft: "LEFT",
+             ArrowRight: "RIGHT", Enter: "CENTER", a: "A", A: "A",
+             b: "B", B: "B" };
+const kbDown = new Set();
+addEventListener("keydown", (e) => {
+    const k = KB[e.key];
+    if (!k || e.repeat) return;
+    e.preventDefault();
+    if (kbDown.has(k)) return;
+    kbDown.add(k);
+    panel.keyEvent(PANEL.KEY_GPIO[PANEL.KEY[k]], true);
+});
+addEventListener("keyup", (e) => {
+    const k = KB[e.key];
+    if (!k || !kbDown.has(k)) return;
+    kbDown.delete(k);
+    panel.keyEvent(PANEL.KEY_GPIO[PANEL.KEY[k]], false);
+});
+
+/* ------------------------------------------- writers + GPS feed (5 Hz) -- */
+
+setInterval(() => {
+    const now = performance.now();
+    if ($("front").checked) sim.frontLast = now;
+    if ($("rear").checked)  sim.rearLast = now;
+
+    if ($("gpsdel").checked) {
+        if ($("gpsfix").checked) {
+            const knots = parseFloat($("knots").value);
+            const v = knots * 0.514444;              /* m/s */
+            const dt = 0.2;
+            sim.heading += (Math.random() - 0.5) * 0.02;
+            sim.lat += v * dt * Math.cos(sim.heading) / 111320;
+            sim.lon += v * dt * Math.sin(sim.heading) /
+                       (111320 * Math.cos(sim.lat * Math.PI / 180));
+            panel.gpsFix(sim.lat, sim.lon, knots);
+        } else {
+            panel.gpsNoFix();
+        }
+    }
+}, 200);
+
+/* --------------------------------------------------- tick + inspector -- */
+
+let prev = null;
+setInterval(() => {
+    panel.tick();
+    const s = panel.state();
+
+    /* narrate transitions */
+    if (prev) {
+        if (s.error !== prev.error)
+            logLine(s.error ? "system -> ERROR (PAGE 0, screen forced on)"
+                            : "system -> OK (wake to PAGE 1)", true);
+        if (s.blanked !== prev.blanked)
+            logLine(s.blanked ? "AUTO-BLANK: display off"
+                              : "wake (key absorbed, PAGE 1)");
+        if (s.rf_blocked !== prev.rf_blocked)
+            logLine(s.rf_blocked ? "RF: BLOCKED (shield)"
+                                 : "RF: LIVE (wireless)", true);
+    }
+    prev = s;
+
+    /* inspector */
+    $("bigstate").innerHTML =
+        `<span class="pill ${s.error ? "off" : "on"}">${s.error ? "ERROR — PAGE 0" : "OK — PAGE " + s.page}</span>` +
+        `<span class="pill ${s.blanked ? "off" : "on"}">${s.blanked ? "BLANKED" : "SCREEN ON"}</span>` +
+        `<span class="pill ${s.rf_blocked ? "on" : "off"}">${s.rf_blocked ? "RF BLOCKED 🛡" : "RF LIVE 📡"}</span>`;
+    $("healthpills").innerHTML =
+        ["front", "rear", "gpsok", "timeok", "storage"].map(k =>
+            `<span class="pill ${s.health[k] ? "on" : "off"}">${k}</span>`
+        ).join("");
+    $("kv").innerHTML = [
+        ["A key", `down=${s.keys.a_down} absorbed=${s.keys.a_absorbed} fired=${s.keys.a_fired}`],
+        ["gps", s.gps.have_fix
+            ? `${s.gps.lat.toFixed(5)}, ${s.gps.lon.toFixed(5)} @ ${s.gps.knots.toFixed(1)} kn`
+            : "no fix"],
+        ["free", `${s.df_pct.toFixed(2)} %`],
+        ["burn shift", `idx ${s.burn_idx} (yoff ${s.yoff}) — PAGE 0 only`],
+        ["repaints", `${s.repaints} (change-only, 5 Hz cap)`],
+        ["watchdog pets", s.watchdog_pets],
+    ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+    $("blankfill").style.width = s.blank_in_ms === null ? "0"
+        : (100 * (1 - s.blank_in_ms / 10000)) + "%";
+
+    $("knotsval").textContent = parseFloat($("knots").value).toFixed(1) + " kn";
+    $("freeval").textContent = parseFloat($("free").value).toFixed(1) + " %";
+}, PANEL.TICK_MS);
+
+/* -------------------------------------------------------------- boot -- */
+
+$("fastburn").addEventListener("change", () =>
+    panel.setBurnStepMs($("fastburn").checked ? 3000 : 60000));
+
+function bootPanel() {
+    panel = PANEL.create(hw);
+    panel.setBurnStepMs($("fastburn").checked ? 3000 : 60000);
+    panel.boot($("units").value);
+    prev = null;
+    logLine(`dashberry-panel booted (UNITS=${$("units").value}); ` +
+            `health must prove itself — expect a moment of PAGE 0`, true);
+}
+$("restart").addEventListener("click", bootPanel);
+bootPanel();
+</script>
+</body>
+</html>

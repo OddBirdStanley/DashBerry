@@ -1,0 +1,13 @@
+[Unit]
+Description=Per-boot session directory (mint name, create dirs)
+PartOf=dashberry.target
+RequiresMountsFor=/data
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/session-init
+
+[Install]
+WantedBy=dashberry.target

@@ -1,0 +1,30 @@
+# Merge into /boot/firmware/config.txt (Pi 4, Raspberry Pi OS Lite 64-bit).
+
+# --- front camera: CSI Camera Module 3 (auto-detect handles IMX708) ---
+camera_auto_detect=1
+
+# --- I2C at 400 kHz: 5 Hz OLED repaints need it; that's also the DS3231's
+# fast-mode ceiling (shared bus: 0x3c panel + 0x68 RTC) ---
+dtparam=i2c_arm=on,i2c_arm_baudrate=400000
+
+# --- DS3231 RTC ---
+dtoverlay=i2c-rtc,ds3231
+
+# --- 128x64 OLED Bonnet (#3531): SSD1306 at 0x3C, mainline ssd1307fb driver
+# exposes it as /dev/fb1. Overlay defaults are already 0x3C/128x64 — pass no
+# extra params. VERIFY on bench: /dev/fb1 appears, i2cdetect shows 0x3c+0x68,
+# dmesg clean of I2C errors over the 50 cm ribbon at 400 kHz. ---
+dtoverlay=ssd1306
+
+# --- no HDMI/audio needed headless; trims boot + power ---
+dtoverlay=vc4-kms-v3d
+disable_splash=1
+
+# ---------------------------------------------------------------
+# cmdline.txt notes (rev 6):
+#  - Do NOT add fbcon=map:10. dashberry-panel owns /dev/fb1 directly; fbcon
+#    must stay OFF fb1. VERIFY on bench: boot with HDMI absent and confirm
+#    fbcon hasn't grabbed fb1 anyway (con2fbmap 1 / garbage on the OLED);
+#    mitigation if it does: append fbcon=map:0.
+#  - No consoleblank needed: the panel blanks itself (AUTO-BLANK, PLAN §3b).
+# ---------------------------------------------------------------

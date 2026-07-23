@@ -1,0 +1,7 @@
+[Unit]
+Description=Footage retention sweep (delete oldest below free-space floor)
+RequiresMountsFor=/data
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/retention

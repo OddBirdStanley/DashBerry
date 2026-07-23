@@ -1,0 +1,27 @@
+#!/bin/sh
+# session-init — mint the per-boot session name and directories (PLAN §3).
+# Name: <YYYYmmdd-HHMMSS>-<NNNN> — RTC-backed clock plus a monotonic boot
+# counter, so session names stay unique (and one-session ⇔ one-DRIVE grouping
+# stays structural) even across boots with a wrong RTC.
+# Runs once per boot (session.service, oneshot) after /data mounts; recorders
+# and gps-log read $SESSION_FILE instead of minting their own timestamps.
+set -eu
+. /etc/dashberry.conf
+
+mkdir -p /run/dashberry
+
+# Boot counter: atomic increment (tmp -> fsync -> rename), garbage-tolerant.
+c=$(cat "$DATA/.boot-counter" 2>/dev/null || echo 0)
+case "$c" in
+    ''|*[!0-9]*) c=0 ;;
+esac
+c=$((c + 1))
+printf '%s' "$c" > "$DATA/.boot-counter.tmp"
+sync "$DATA/.boot-counter.tmp"
+mv "$DATA/.boot-counter.tmp" "$DATA/.boot-counter"
+sync "$DATA"
+
+SESSION="$(date +%Y%m%d-%H%M%S)-$(printf '%04d' $((c % 10000)))"
+mkdir -p "$DATA/front/$SESSION" "$DATA/rear/$SESSION" "$DATA/gps/$SESSION"
+printf '%s' "$SESSION" > "$SESSION_FILE"
+echo "session-init: session $SESSION (boot #$c)"

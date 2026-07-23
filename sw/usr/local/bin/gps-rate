@@ -1,0 +1,34 @@
+#!/bin/sh
+# gps-rate — set the u-blox receiver to 5 Hz before gpsd claims the device
+# (Before=gpsd.service — the port must be free when we write to it).
+# The setting survives power-off only in the module's battery-backed RAM, so
+# this re-runs every boot (PLAN §3, rev 6).
+#
+# UBX CFG-RATE: class=0x06 id=0x08 len=0x0006, payload:
+#   measRate = 200 ms  -> C8 00   (little-endian; 200 ms => 5 Hz)
+#   navRate  = 1       -> 01 00
+#   timeRef  = 1 (GPS) -> 01 00
+# Checksum = 8-bit Fletcher over class,id,len,payload:
+#   06 -> A=06 B=06 | 08 -> A=0E B=14 | 06 -> A=14 B=28 | 00 -> A=14 B=3C
+#   C8 -> A=DC B=18 | 00 -> A=DC B=F4 | 01 -> A=DD B=D1 | 00 -> A=DD B=AE
+#   01 -> A=DE B=8C | 00 -> A=DE B=6A          => CK_A=DE CK_B=6A
+# Full frame: B5 62 06 08 06 00 C8 00 01 00 01 00 DE 6A
+#
+# VERIFY (bench): confirm 5 Hz NMEA cadence after a COLD power cycle (count
+# RMC sentences per second with gpspipe -r); if the puck enumerates later
+# than this unit runs, the rate silently stays 1 Hz — panel still shows GPS
+# OK, so check cadence explicitly.
+set -eu
+. /etc/dashberry.conf
+
+if [ ! -c "$GPS_DEV" ]; then
+    echo "gps-rate: $GPS_DEV absent; skipping (a missing puck surfaces as GPS ERR on the panel)"
+    exit 0
+fi
+
+# Raw mode so the tty layer can't mangle bytes. (No byte in the frame is
+# 0x0A/0x0D, so even cooked mode would pass it — belt and suspenders.)
+stty -F "$GPS_DEV" raw -echo 2>/dev/null || true
+
+printf '\265\142\006\010\006\000\310\000\001\000\001\000\336\152' > "$GPS_DEV"
+echo "gps-rate: sent UBX CFG-RATE (5 Hz) to $GPS_DEV"

@@ -1,0 +1,7 @@
+# Stable name for the rear showmewebcam UVC camera.
+# VERIFY on bench: plug the Zero in and run
+#   udevadm info -a /dev/video0 | grep -iE 'idVendor|idProduct|product'
+# showmewebcam's gadget defaults to Linux Foundation IDs (1d6b:0104) with
+# product string "Piwebcam"; adjust ATTRS below to whatever your build reports.
+# The index match keeps the symlink on the capture node (UVC exposes two).
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0104", ATTR{index}=="0", SYMLINK+="rear-cam"

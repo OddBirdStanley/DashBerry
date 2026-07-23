@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""dashberry-cli — PC-side tooling for a copy of the DashBerry /data tree.
+
+PLAN.md §3c. Runs on an external machine against a pulled-card copy of /data.
+This tool NEVER ships on the Pi image (the runtime footprint rule — no
+interpreters on the image — does not bind PC-side tooling, which is why it
+may be Python). install.sh deliberately does not install it.
+
+Stdlib only; ffmpeg/ffprobe are invoked as subprocesses for all heavy lifting.
+
+Subcommands:
+  catalog  one line per DRIVE (= per-boot session directory)
+  render   cut/concat (optionally GPS-annotated) video from one drive
+  gpx      GPX 1.0 track (native <speed>, m/s) from the session NMEA log
+
+Time alignment note (RENDER): a segment file's mtime is when it was LAST
+written, i.e. the segment's END. Segment start = mtime - duration(ffprobe).
+Getting this wrong shifts every annotation by one segment length.
+"""
+
+import argparse
+import datetime as dt
+import os
+import subprocess
+import sys
+import tempfile
+
+KNOTS_TO_MPH = 1.15078
+KNOTS_TO_KMH = 1.852
+KNOTS_TO_MS = 0.514444
+
+
+# --------------------------------------------------------------- helpers --
+
+def die(msg):
+    sys.exit("dashberry-cli: " + msg)
+
+
+def sessions(data):
+    """Union of session dir names across front/rear/gps."""
+    names = set()
+    for sub in ("front", "rear", "gps"):
+        d = os.path.join(data, sub)
+        if os.path.isdir(d):
+            for e in os.listdir(d):
+                if os.path.isdir(os.path.join(d, e)):
+                    names.add(e)
+    return sorted(names)
+
+
+def segments(data, session, camera):
+    """Sorted [(path, mtime)] for one camera of one session."""
+    d = os.path.join(data, camera, session)
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for e in sorted(os.listdir(d)):
+        if e.endswith(".mp4"):
+            p = os.path.join(d, e)
+            out.append((p, os.path.getmtime(p)))
+    return out
+
+
+def nmea_path(data, session):
+    d = os.path.join(data, "gps", session)
+    if not os.path.isdir(d):
+        return None
+    for e in sorted(os.listdir(d)):
+        if e.endswith(".nmea"):
+            return os.path.join(d, e)
+    return None
+
+
+def parse_rmc(path):
+    """[(epoch_utc, lat, lon, speed_knots)] from RMC sentences with status A."""
+    fixes = []
+    if not path or not os.path.exists(path):
+        return fixes
+    with open(path, "r", errors="replace") as f:
+        for line in f:
+            if len(line) < 6 or not line.startswith("$") or line[3:6] != "RMC":
+                continue
+            parts = line.strip().split("*")[0].split(",")
+            if len(parts) < 10 or parts[2] != "A":
+                continue
+            try:
+                t, lat, ns, lon, ew = parts[1], parts[3], parts[4], parts[5], parts[6]
+                knots = float(parts[7]) if parts[7] else 0.0
+                date = parts[9]
+                deg = int(float(lat) / 100)
+                latd = deg + (float(lat) - deg * 100) / 60.0
+                if ns == "S":
+                    latd = -latd
+                deg = int(float(lon) / 100)
+                lond = deg + (float(lon) - deg * 100) / 60.0
+                if ew == "W":
+                    lond = -lond
+                when = dt.datetime(
+                    2000 + int(date[4:6]), int(date[2:4]), int(date[0:2]),
+                    int(t[0:2]), int(t[2:4]), int(float(t[4:])),
+                    tzinfo=dt.timezone.utc)
+                fixes.append((when.timestamp(), latd, lond, knots))
+            except (ValueError, IndexError):
+                continue
+    return fixes
+
+
+def ffprobe_duration(path):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, check=True).stdout.strip()
+        return float(out)
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+        die("ffprobe failed on %s (is ffmpeg installed?)" % path)
+
+
+def parse_hms(s):
+    parts = s.split(":")
+    if len(parts) != 3:
+        die("bad time %r (want HH:MM:SS)" % s)
+    return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+
+
+def parse_tz(s):
+    """'±HH:MM' -> seconds."""
+    sign = -1 if s.startswith("-") else 1
+    body = s.lstrip("+-")
+    h, m = body.split(":")
+    return sign * (int(h) * 3600 + int(m) * 60)
+
+
+def fmt_span(seconds):
+    seconds = int(seconds)
+    return "%d:%02d:%02d" % (seconds // 3600, (seconds % 3600) // 60,
+                             seconds % 60)
+
+
+def drive_start(data, session):
+    """Earliest evidence of the drive: min over segment STARTS (mtime minus
+    duration) of both cameras and the first RMC fix. None if no evidence."""
+    starts = []
+    for cam in ("front", "rear"):
+        segs = segments(data, session, cam)
+        if segs:
+            p, mt = segs[0]
+            starts.append(mt - ffprobe_duration(p))
+    fixes = parse_rmc(nmea_path(data, session))
+    if fixes:
+        starts.append(fixes[0][0])
+    return min(starts) if starts else None
+
+
+# --------------------------------------------------------------- catalog --
+
+def cmd_catalog(args):
+    data = args.data
+    sess = sessions(data)
+    if not sess:
+        die("no sessions under %s" % data)
+    print("%-20s %-19s %9s %6s %6s  %s" %
+          ("DRIVE", "START", "DURATION", "FRONT", "REAR", "GPS"))
+    for s in sess:
+        front = segments(data, s, "front")
+        rear = segments(data, s, "rear")
+        fixes = parse_rmc(nmea_path(data, s))
+        # cheap catalog: span of segment mtimes; fall back to gps log span
+        mtimes = [m for _, m in front + rear]
+        if mtimes:
+            start, end = min(mtimes), max(mtimes)
+        elif fixes:
+            start, end = fixes[0][0], fixes[-1][0]
+        else:
+            start = end = None
+        if start is not None:
+            start_s = dt.datetime.fromtimestamp(start).strftime(
+                "%Y-%m-%d %H:%M:%S")
+            dur = fmt_span(end - start)
+        else:
+            start_s, dur = "?", "?"
+        if fixes:
+            g0 = dt.datetime.fromtimestamp(fixes[0][0], dt.timezone.utc)
+            g1 = dt.datetime.fromtimestamp(fixes[-1][0], dt.timezone.utc)
+            gps = "%s-%sZ" % (g0.strftime("%H:%M:%S"), g1.strftime("%H:%M:%S"))
+        else:
+            gps = "none"
+        print("%-20s %-19s %9s %6d %6d  %s" %
+              (s, start_s, dur, len(front), len(rear), gps))
+
+
+# ---------------------------------------------------------------- render --
+
+def select_segments(data, args):
+    segs = segments(data, args.drive, args.camera)
+    if not segs:
+        die("no %s segments for drive %s" % (args.camera, args.drive))
+    start0 = drive_start(data, args.drive)
+    # absolute epochs of the requested window (relative to drive start)
+    lo = start0 + parse_hms(getattr(args, "from")) if getattr(args, "from") else None
+    hi = start0 + parse_hms(args.to) if args.to else None
+    picked = []
+    for path, mtime in segs:
+        dur = ffprobe_duration(path)
+        seg_start = mtime - dur       # mtime = segment END (see module doc)
+        seg_end = mtime
+        if lo is not None and seg_end <= lo:
+            continue
+        if hi is not None and seg_start >= hi:
+            continue
+        picked.append((path, seg_start, dur))
+    if not picked:
+        die("no segments overlap the requested range")
+    return picked, start0
+
+
+def write_concat_list(picked, tmpdir):
+    lst = os.path.join(tmpdir, "concat.txt")
+    with open(lst, "w") as f:
+        for path, _, _ in picked:
+            f.write("file '%s'\n" % os.path.abspath(path).replace("'", r"'\''"))
+    return lst
+
+
+ASS_HEADER = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 1280
+PlayResY: 720
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: gps,DejaVu Sans Mono,28,&H00FFFFFF,&H00000000,&H80000000,0,0,1,2,0,1,20,20,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Text
+"""
+
+
+def ass_time(t):
+    if t < 0:
+        t = 0
+    cs = int(round(t * 100))
+    return "%d:%02d:%02d.%02d" % (cs // 360000, (cs // 6000) % 60,
+                                  (cs // 100) % 60, cs % 100)
+
+
+def write_ass(fixes, clip_start, clip_end, display_shift, units, tmpdir):
+    """One event per GPS epoch: wall time · lat,lon · speed."""
+    factor, label = ((KNOTS_TO_KMH, "KMH") if units == "KMH"
+                     else (KNOTS_TO_MPH, "MPH"))
+    path = os.path.join(tmpdir, "overlay.ass")
+    sel = [f for f in fixes if clip_start - 1 <= f[0] <= clip_end + 1]
+    with open(path, "w") as f:
+        f.write(ASS_HEADER)
+        for i, (t, lat, lon, knots) in enumerate(sel):
+            start = t - clip_start
+            end = (sel[i + 1][0] - clip_start) if i + 1 < len(sel) else start + 0.5
+            shown = dt.datetime.fromtimestamp(t + display_shift,
+                                              dt.timezone.utc)
+            text = "%s  %.5f,%.5f  %d %s" % (
+                shown.strftime("%Y-%m-%d %H:%M:%S"), lat, lon,
+                int(knots * factor + 0.5), label)
+            f.write("Dialogue: 0,%s,%s,gps,%s\n"
+                    % (ass_time(start), ass_time(end), text))
+    return path
+
+
+def display_shift_secs(args, start0):
+    """anchor: assert the drive's true wall-clock start (repairs wrong-RTC
+    drives); tz-offset: constant local-time offset. Both display-only."""
+    shift = 0.0
+    if args.anchor:
+        try:
+            anchor = dt.datetime.strptime(
+                args.anchor, "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=dt.timezone.utc).timestamp()
+        except ValueError:
+            die("bad --anchor (want 'YYYY-mm-dd HH:MM:SS')")
+        if start0 is None:
+            die("cannot anchor: drive has no timing evidence")
+        shift += anchor - start0
+    if args.tz_offset:
+        shift += parse_tz(args.tz_offset)
+    return shift
+
+
+def cmd_render(args):
+    picked, start0 = select_segments(args.data, args)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        lst = write_concat_list(picked, tmpdir)
+        if not args.annotate:
+            # lossless: concat-demuxer stream copy of the segment range
+            cmd = ["ffmpeg", "-hide_banner", "-y", "-f", "concat", "-safe",
+                   "0", "-i", lst, "-c", "copy", args.output]
+        else:
+            fixes = parse_rmc(nmea_path(args.data, args.drive))
+            if not fixes:
+                die("--annotate needs an NMEA log with RMC fixes")
+            clip_start = picked[0][1]
+            clip_end = picked[-1][1] + picked[-1][2]
+            shift = display_shift_secs(args, start0)
+            ass = write_ass(fixes, clip_start, clip_end, shift, args.units,
+                            tmpdir)
+            # annotation burns in -> re-encode (accepted; PLAN §3c)
+            cmd = ["ffmpeg", "-hide_banner", "-y", "-f", "concat", "-safe",
+                   "0", "-i", lst, "-vf", "ass=%s" % ass, "-c:v", "libx264",
+                   "-preset", "medium", "-crf", "23", "-an", args.output]
+        try:
+            subprocess.run(cmd, check=True)
+        except FileNotFoundError:
+            die("ffmpeg not found")
+        except subprocess.CalledProcessError as e:
+            die("ffmpeg failed (%d)" % e.returncode)
+    print("wrote %s (%d segments)" % (args.output, len(picked)))
+
+
+# ------------------------------------------------------------------- gpx --
+
+def cmd_gpx(args):
+    fixes = parse_rmc(nmea_path(args.data, args.drive))
+    if not fixes:
+        die("no RMC fixes for drive %s" % args.drive)
+    start0 = drive_start(args.data, args.drive)
+    lo = start0 + parse_hms(getattr(args, "from")) if getattr(args, "from") else None
+    hi = start0 + parse_hms(args.to) if args.to else None
+    shift = display_shift_secs(args, start0)
+    tzoff = parse_tz(args.tz_offset) if args.tz_offset else 0
+    sel = [f for f in fixes
+           if (lo is None or f[0] >= lo) and (hi is None or f[0] <= hi)]
+    if not sel:
+        die("no fixes in the requested range")
+
+    def stamp(t):
+        d = dt.datetime.fromtimestamp(t + shift, dt.timezone.utc)
+        if tzoff:
+            sign = "+" if tzoff >= 0 else "-"
+            a = abs(tzoff)
+            return d.strftime("%Y-%m-%dT%H:%M:%S") + "%s%02d:%02d" % (
+                sign, a // 3600, (a % 3600) // 60)
+        return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    out = sys.stdout if args.output in (None, "-") else open(args.output, "w")
+    # GPX 1.0 on purpose: it has a NATIVE <speed> element (m/s); 1.1 buries
+    # speed in extensions that many tools ignore (PLAN §3c).
+    out.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+    out.write('<gpx version="1.0" creator="dashberry-cli" '
+              'xmlns="http://www.topografix.com/GPX/1/0">\n')
+    out.write("<trk><name>%s</name><trkseg>\n" % args.drive)
+    for t, lat, lon, knots in sel:
+        out.write('<trkpt lat="%.6f" lon="%.6f">'
+                  "<time>%s</time><speed>%.2f</speed></trkpt>\n"
+                  % (lat, lon, stamp(t), knots * KNOTS_TO_MS))
+    out.write("</trkseg></trk>\n</gpx>\n")
+    if out is not sys.stdout:
+        out.close()
+        print("wrote %s (%d points)" % (args.output, len(sel)))
+
+
+# ------------------------------------------------------------------ main --
+
+def add_range_opts(p):
+    p.add_argument("--from", metavar="HH:MM:SS",
+                   help="range start, relative to drive start")
+    p.add_argument("--to", metavar="HH:MM:SS",
+                   help="range end, relative to drive start")
+    p.add_argument("--anchor", metavar="'YYYY-mm-dd HH:MM:SS'",
+                   help="assert the drive's true wall-clock start "
+                        "(repairs wrong-RTC drives)")
+    p.add_argument("--tz-offset", metavar="±HH:MM",
+                   help="constant timezone offset applied to displayed times")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="dashberry-cli",
+        description="DashBerry data exporter for PC")
+    ap.add_argument("--data", required=True, metavar="DIR",
+                    help="path to a copy of /data")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("catalog", help="print drive session info")
+
+    pr = sub.add_parser("render", help="produce a video file from one drive")
+    pr.add_argument("--drive", required=True, metavar="SESSION")
+    pr.add_argument("--camera", required=True, choices=["front", "rear"])
+    pr.add_argument("--annotate", action="store_true",
+                    help="burn time/position/speed into the image (re-encode)")
+    pr.add_argument("--units", choices=["MPH", "KMH"], default="MPH",
+                    help="annotation speed units (default MPH)")
+    add_range_opts(pr)
+    pr.add_argument("-o", "--output", required=True, metavar="OUT.mp4")
+
+    pg = sub.add_parser("gpx", help="generate a GPX 1.0 track from one drive")
+    pg.add_argument("--drive", required=True, metavar="SESSION")
+    add_range_opts(pg)
+    pg.add_argument("-o", "--output", metavar="OUT.gpx",
+                    help="output file (default stdout)")
+
+    args = ap.parse_args()
+    if args.cmd == "catalog":
+        cmd_catalog(args)
+    elif args.cmd == "render":
+        cmd_render(args)
+    elif args.cmd == "gpx":
+        cmd_gpx(args)
+
+
+if __name__ == "__main__":
+    main()

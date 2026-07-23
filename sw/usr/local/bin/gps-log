@@ -1,0 +1,22 @@
+#!/bin/sh
+# gps-log — one raw NMEA log per boot session, straight from gpsd.
+# NMEA is the archival ground truth; catalogs/renders/GPX all derive offline
+# via dashberry-cli (PLAN §3c). Writes /data/gps/<session>/<session>.nmea —
+# the name repeats the session id on purpose, so the file stays self-
+# describing after it's copied off the card.
+set -eu
+. /etc/dashberry.conf
+
+SESSION=$(cat "$SESSION_FILE")
+OUT="$DATA/gps/$SESSION"
+mkdir -p "$OUT"
+
+# -r = raw NMEA passthrough. Connecting activates gpsd via its socket unit.
+# APPEND (>>): a gps-log restart within the same boot must not truncate the
+# NMEA already captured for this session.
+# stdbuf -oL: redirected-to-file stdout would otherwise be fully buffered
+# (~4-8 KB = tens of seconds of NMEA at 5 Hz) — a hard power cut at impact
+# would eat the fixes that matter most, speed-at-impact included. Line
+# buffering puts every sentence in the page cache immediately; the /data
+# mount's commit=1 then bounds on-disk loss to ~1-2 s.
+exec stdbuf -oL gpspipe -r >> "$OUT/$SESSION.nmea"

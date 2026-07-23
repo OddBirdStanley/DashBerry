@@ -1,0 +1,11 @@
+[Unit]
+Description=Run retention sweep every 5 minutes
+PartOf=dashberry.target
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=dashberry.target

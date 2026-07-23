@@ -1,0 +1,13 @@
+[Unit]
+Description=u-blox GPS 5 Hz rate (UBX CFG-RATE, re-applied every boot)
+# The GPS serial device must still be free — gpsd would hold it open.
+Before=gpsd.service gpsd.socket
+PartOf=dashberry.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/gps-rate
+
+[Install]
+WantedBy=dashberry.target

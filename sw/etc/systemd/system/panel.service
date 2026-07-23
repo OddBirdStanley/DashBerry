@@ -1,0 +1,18 @@
+[Unit]
+Description=DashBerry status panel daemon (OLED, /dev/fb1)
+PartOf=dashberry.target
+# Ordering only (no Requires): the panel is the error reporter — it must run
+# and show ERR states even when /data or the session oneshot failed.
+After=session.service local-fs.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/dashberry-panel
+# Liveness is the systemd watchdog now (rev 6), not an on-screen spinner:
+# the daemon sd_notify's WATCHDOG=1 every 200 ms loop tick.
+WatchdogSec=10
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=dashberry.target

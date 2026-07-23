@@ -1,0 +1,17 @@
+[Unit]
+Description=GPS raw NMEA session logger (gpspipe)
+PartOf=dashberry.target
+RequiresMountsFor=/data
+Wants=gpsd.socket
+After=gpsd.socket
+# Session dir/name comes from session-init; never start without it.
+Requires=session.service
+After=session.service
+
+[Service]
+ExecStart=/usr/local/bin/gps-log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=dashberry.target

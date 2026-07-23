@@ -1,0 +1,16 @@
+[Unit]
+Description=RF kill state enforcement at boot (fail-closed)
+DefaultDependencies=no
+RequiresMountsFor=/data
+After=local-fs.target
+# Must complete (Type=oneshot) before anything that could key a radio starts.
+Before=network-pre.target NetworkManager.service wpa_supplicant.service bluetooth.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/rf-state
+
+[Install]
+WantedBy=sysinit.target

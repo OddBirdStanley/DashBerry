@@ -1,0 +1,7 @@
+# Append to /etc/fstab: the writable footage partition (3rd partition on the
+# card; OS partition goes read-only via `raspi-config` > Performance > Overlay FS).
+# data=ordered + commit=1: the 1 s journal commit forces each ~1 s MP4
+# fragment's data blocks to the card, so a hard power cut (every ignition-off,
+# and an impact that kills 12 V) loses ~1-2 s, not the ~5+ s that the default
+# commit interval leaves in the page cache (PLAN §3 crash-only).
+/dev/mmcblk0p3  /data  ext4  defaults,noatime,data=ordered,commit=1,nofail  0 2

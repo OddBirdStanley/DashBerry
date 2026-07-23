@@ -1,0 +1,20 @@
+[Unit]
+Description=Front camera recorder (CSI, rpicam-vid -> H.264 segments)
+PartOf=dashberry.target
+RequiresMountsFor=/data
+# Session dir/name comes from session-init; never start without it.
+Requires=session.service
+After=session.service
+
+[Service]
+ExecStart=/usr/local/bin/front-rec
+Restart=always
+RestartSec=2
+# Kill the whole pipeline (rpicam-vid | gst-launch) together.
+KillMode=control-group
+# -e on gst-launch turns SIGINT into EOS so the in-flight segment finalizes.
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=dashberry.target
