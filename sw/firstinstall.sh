@@ -42,8 +42,9 @@ if [ "$FIRSTBOOT_WIFI" = 1 ]; then
     # rf-state.service is not enabled yet (that happens below), so nothing
     # re-blocks the radio this boot. The cmdline regdom staged by
     # dashberry-install should already have left wlan unblocked (VERIFY on
-    # bench: Bookworm honors cfg80211.ieee80211_regdom headless); these are
-    # belt-and-braces — rfkill may not exist on the stock image yet.
+    # bench: Trixie honors cfg80211.ieee80211_regdom headless — known good
+    # on bookworm, unconfirmed on trixie); these are belt-and-braces —
+    # rfkill may not exist on the stock image yet.
     rfkill unblock wifi 2>/dev/null || true
     nmcli radio wifi on 2>/dev/null || true
     nm-online -q -t 90 || echo "network not online yet — apt will retry" >&2

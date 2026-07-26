@@ -17,7 +17,7 @@
 #      service that installs packages, builds dashberry-panel, enables the
 #      units, flips the OS read-only, and reboots (sw/firstinstall.sh);
 #   6. (--wifi) stages a first-boot-ONLY Wi-Fi profile plus the regulatory
-#      domain that stock Bookworm needs before it will unblock wlan, so
+#      domain that stock Pi OS (Trixie) needs before it will unblock wlan, so
 #      boot 2 can run without Ethernet — firstinstall wipes every trace of
 #      it before the overlay freezes the OS and RF lockdown arms.
 #
@@ -53,7 +53,8 @@ options:
   --wifi SSID:PSK   run the first boot over Wi-Fi instead of Ethernet: a
                     NetworkManager profile is staged for boots 1-2 only and
                     firstinstall wipes it (profile, leases, logs) before RF
-                    lockdown arms. Bookworm (NetworkManager) images only;
+                    lockdown arms. Needs a NetworkManager image — Trixie
+                    Lite is one (anything bookworm+ works, bullseye is not);
                     SSID must not contain ':'; PSK visible in shell history
   --wifi-country CC two-letter regulatory domain (required with --wifi —
                     without one the stock image keeps wlan rfkill-blocked)
@@ -118,7 +119,7 @@ if [ -n "$WIFISPEC" ]; then
     [ "${#WIFI_PSK}" -ge 8 ] && [ "${#WIFI_PSK}" -le 64 ] || \
         die "--wifi PSK must be a 8-63 char passphrase (or 64 hex digits)"
     [ -n "$WIFI_CC" ] || \
-        die "--wifi needs --wifi-country CC (stock Bookworm keeps wlan blocked without a regulatory domain)"
+        die "--wifi needs --wifi-country CC (stock Pi OS keeps wlan blocked without a regulatory domain)"
     case $WIFI_CC in [A-Za-z][A-Za-z]) ;; *) die "--wifi-country wants a two-letter code (e.g. JP, CA)" ;; esac
     WIFI_CC=$(printf '%s' "$WIFI_CC" | tr '[:lower:]' '[:upper:]')
     FIRSTBOOT_WIFI=1
@@ -263,14 +264,15 @@ trap cleanup EXIT
 
 MNT=$(mktemp -d)
 mount "$ROOTP" "$MNT"
-BOOTDIR="$MNT/boot/firmware"                  # bookworm; bullseye fallback
+BOOTDIR="$MNT/boot/firmware"                  # bookworm+ (incl. trixie); /boot fallback
 [ -d "$BOOTDIR" ] || BOOTDIR="$MNT/boot"
 mount "$BOOTP" "$BOOTDIR"
 
-# --wifi rides on NetworkManager; bail before customizing a card that could
-# never bring the profile up (bullseye and older run dhcpcd/wpa_supplicant)
+# --wifi rides on NetworkManager (the stack since bookworm, incl. trixie);
+# bail before customizing a card that could never bring the profile up
+# (bullseye and older run dhcpcd/wpa_supplicant)
 [ "$FIRSTBOOT_WIFI" = 0 ] || [ -d "$MNT/etc/NetworkManager" ] || \
-    die "--wifi needs a NetworkManager image (Raspberry Pi OS Bookworm Lite)"
+    die "--wifi needs a NetworkManager image (Raspberry Pi OS Trixie Lite)"
 
 info "appending /data to fstab (PARTUUID=$DATA_PARTUUID)..."
 mkdir -p "$MNT/data"
@@ -357,10 +359,11 @@ if [ "$FIRSTBOOT_WIFI" = 1 ]; then
         } > "$NMFILE"
     )
     chmod 600 "$NMFILE"
-    # Stock Bookworm keeps wlan rfkill-blocked until a regulatory domain is
-    # set; the kernel cmdline is the offline way to provide one. cmdline.txt
-    # is a single line — append to it, don't add a second. firstinstall
-    # removes the token again during the credential wipe.
+    # Stock Pi OS (since bullseye, still true on trixie) keeps wlan
+    # rfkill-blocked until a regulatory domain is set; the kernel cmdline is
+    # the offline way to provide one. cmdline.txt is a single line — append
+    # to it, don't add a second. firstinstall removes the token again during
+    # the credential wipe.
     [ -f "$BOOTDIR/cmdline.txt" ] || die "no cmdline.txt on the boot partition?"
     sed -i "1s/\$/ cfg80211.ieee80211_regdom=$WIFI_CC/" "$BOOTDIR/cmdline.txt"
 fi
