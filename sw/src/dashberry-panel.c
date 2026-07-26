@@ -364,6 +364,8 @@ static void draw_glyph16(int col, int row, const uint8_t *g, int yoff)
 
 static double      speed_factor = 1.15078;   /* knots -> mph (default) */
 static const char *speed_unit   = "MPH";
+static bool        bypass_time;    /* BYPASS_TIME=1: installed without DS3231 */
+static bool        bypass_rear;    /* BYPASS_REAR=1: installed without rear cam */
 
 static void load_conf(void)
 {
@@ -380,6 +382,10 @@ static void load_conf(void)
                 speed_factor = 1.15078;      /* knots -> mph */
                 speed_unit = "MPH";
             }
+        } else if (strncmp(line, "BYPASS_TIME=", 12) == 0) {
+            bypass_time = line[12] == '1';
+        } else if (strncmp(line, "BYPASS_REAR=", 12) == 0) {
+            bypass_rear = line[12] == '1';
         }
     }
     fclose(f);
@@ -654,12 +660,18 @@ static void eval_health(int64_t now)
 
     time_t t = time(NULL);
     time_t mf = newest_mp4_mtime(FRONT_BASE, session);
-    time_t mr = newest_mp4_mtime(REAR_BASE, session);
     health.front = mf != 0 && (t - mf) <= STALE_SECS;
-    health.rear  = mr != 0 && (t - mr) <= STALE_SECS;
+    /* Bypassed components (installed without the hardware) are pinned OK:
+     * never ERR, so they can never reach PAGE 0 or fault the system. */
+    if (bypass_rear) {
+        health.rear = true;
+    } else {
+        time_t mr = newest_mp4_mtime(REAR_BASE, session);
+        health.rear = mr != 0 && (t - mr) <= STALE_SECS;
+    }
     health.gpsok = gps.state == GPS_UP &&
                    (now - gps.last_nmea_ms) <= GPS_SILENT_MS;
-    health.timeok = rtc_ok();
+    health.timeok = bypass_time || rtc_ok();
     health.storage = storage_ok();
     rf_blocked = wifi_soft_blocked();
 }

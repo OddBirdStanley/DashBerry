@@ -4,7 +4,7 @@
 PLAN.md §3c. Runs on an external machine against a pulled-card copy of /data.
 This tool NEVER ships on the Pi image (the runtime footprint rule — no
 interpreters on the image — does not bind PC-side tooling, which is why it
-may be Python). install.sh deliberately does not install it.
+may be Python). firstinstall.sh deliberately does not install it.
 
 Stdlib only; ffmpeg/ffprobe are invoked as subprocesses for all heavy lifting.
 

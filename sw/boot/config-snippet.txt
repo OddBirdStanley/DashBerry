@@ -1,4 +1,7 @@
 # Merge into /boot/firmware/config.txt (Pi 4, Raspberry Pi OS Lite 64-bit).
+# cli/dashberry-install merges everything above the dashed separator
+# automatically when it builds the card (--bypass-time drops the DS3231
+# lines) — this snippet stays as the manual-install reference.
 
 # --- front camera: CSI Camera Module 3 (auto-detect handles IMX708) ---
 camera_auto_detect=1
