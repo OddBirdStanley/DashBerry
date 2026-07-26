@@ -15,7 +15,11 @@
 #   4. merges boot/config-snippet.txt into config.txt;
 #   5. stages sw/ at /opt/dashberry/sw and enables a oneshot first-boot
 #      service that installs packages, builds dashberry-panel, enables the
-#      units, flips the OS read-only, and reboots (sw/firstinstall.sh).
+#      units, flips the OS read-only, and reboots (sw/firstinstall.sh);
+#   6. (--wifi) stages a first-boot-ONLY Wi-Fi profile plus the regulatory
+#      domain that stock Bookworm needs before it will unblock wlan, so
+#      boot 2 can run without Ethernet — firstinstall wipes every trace of
+#      it before the overlay freezes the OS and RF lockdown arms.
 #
 # The stock image's own auto-expand is left in place and self-disarms: it
 # refuses to grow a root partition that is not the last one, and /data is.
@@ -46,6 +50,13 @@ options:
   --user NAME:PASS  create the first-boot user via userconf.txt (headless
                     setup; note the password is visible in shell history)
   --ssh             enable ssh from first boot
+  --wifi SSID:PSK   run the first boot over Wi-Fi instead of Ethernet: a
+                    NetworkManager profile is staged for boots 1-2 only and
+                    firstinstall wipes it (profile, leases, logs) before RF
+                    lockdown arms. Bookworm (NetworkManager) images only;
+                    SSID must not contain ':'; PSK visible in shell history
+  --wifi-country CC two-letter regulatory domain (required with --wifi —
+                    without one the stock image keeps wlan rfkill-blocked)
   -h, --help        this text
 EOF
 }
@@ -64,6 +75,10 @@ ROOT_GIB=4
 READONLY=1
 USERSPEC=
 WANT_SSH=0
+WIFISPEC=
+WIFI_CC=
+WIFI_SSID=
+FIRSTBOOT_WIFI=0
 IMG=
 DEV=
 
@@ -75,6 +90,8 @@ while [ $# -gt 0 ]; do
         --writable)    READONLY=0 ;;
         --user)        shift; USERSPEC=${1:-} ;;
         --ssh)         WANT_SSH=1 ;;
+        --wifi)        shift; WIFISPEC=${1:-} ;;
+        --wifi-country) shift; WIFI_CC=${1:-} ;;
         -h|--help)     usage; exit 0 ;;
         -*)            die "unknown option: $1 (see --help)" ;;
         *)             if   [ -z "$IMG" ]; then IMG=$1
@@ -92,9 +109,25 @@ if [ -n "$USERSPEC" ]; then
     case $USERSPEC in *:*) ;; *) die "--user wants NAME:PASS" ;; esac
     need openssl
 fi
+if [ -n "$WIFISPEC" ]; then
+    case $WIFISPEC in *:*) ;; *) die "--wifi wants SSID:PSK" ;; esac
+    WIFI_SSID=${WIFISPEC%%:*}          # split at the FIRST ':' — the PSK may
+    WIFI_PSK=${WIFISPEC#*:}            # contain colons, the SSID may not
+    [ -n "$WIFI_SSID" ] && [ "${#WIFI_SSID}" -le 32 ] || \
+        die "--wifi SSID must be 1-32 characters (and must not contain ':')"
+    [ "${#WIFI_PSK}" -ge 8 ] && [ "${#WIFI_PSK}" -le 64 ] || \
+        die "--wifi PSK must be a 8-63 char passphrase (or 64 hex digits)"
+    [ -n "$WIFI_CC" ] || \
+        die "--wifi needs --wifi-country CC (stock Bookworm keeps wlan blocked without a regulatory domain)"
+    case $WIFI_CC in [A-Za-z][A-Za-z]) ;; *) die "--wifi-country wants a two-letter code (e.g. JP, CA)" ;; esac
+    WIFI_CC=$(printf '%s' "$WIFI_CC" | tr '[:lower:]' '[:upper:]')
+    FIRSTBOOT_WIFI=1
+elif [ -n "$WIFI_CC" ]; then
+    die "--wifi-country does nothing without --wifi"
+fi
 
 for t in dd sfdisk partprobe blkid mkfs.ext4 e2fsck resize2fs lsblk \
-         blockdev udevadm findmnt mktemp awk sed; do need "$t"; done
+         blockdev udevadm findmnt mktemp awk sed tr; do need "$t"; done
 
 # --- image: must already exist locally; pick the decompressor by suffix ----
 [ -f "$IMG" ] || die "image not found: $IMG (download it first — this tool does not)"
@@ -146,6 +179,7 @@ echo "    image : $IMG"
 echo "    layout: p1 boot (from image) | p2 OS ${ROOT_GIB} GiB$( [ $READONLY = 1 ] && echo ' (read-only after install)' ) | p3 /data (rest)"
 [ "$BYPASS_TIME" = 1 ] && echo "    bypass: TIME (no DS3231 — GPS disciplines the clock)"
 [ "$BYPASS_REAR" = 1 ] && echo "    bypass: REAR (no rear camera)"
+[ "$FIRSTBOOT_WIFI" = 1 ] && echo "    wifi  : first boot joins '$WIFI_SSID' ($WIFI_CC) — wiped before RF lockdown"
 echo
 printf 'Type the device path (%s) to continue, anything else aborts: ' "$DEV"
 read -r answer
@@ -233,6 +267,11 @@ BOOTDIR="$MNT/boot/firmware"                  # bookworm; bullseye fallback
 [ -d "$BOOTDIR" ] || BOOTDIR="$MNT/boot"
 mount "$BOOTP" "$BOOTDIR"
 
+# --wifi rides on NetworkManager; bail before customizing a card that could
+# never bring the profile up (bullseye and older run dhcpcd/wpa_supplicant)
+[ "$FIRSTBOOT_WIFI" = 0 ] || [ -d "$MNT/etc/NetworkManager" ] || \
+    die "--wifi needs a NetworkManager image (Raspberry Pi OS Bookworm Lite)"
+
 info "appending /data to fstab (PARTUUID=$DATA_PARTUUID)..."
 mkdir -p "$MNT/data"
 cat >> "$MNT/etc/fstab" <<EOF
@@ -267,7 +306,8 @@ fi
 if [ "$BYPASS_REAR" = 1 ]; then
     sed -i 's/^BYPASS_REAR=0/BYPASS_REAR=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
 fi
-printf 'READONLY=%s\n' "$READONLY" > "$MNT/opt/dashberry/install-opts"
+printf 'READONLY=%s\nFIRSTBOOT_WIFI=%s\n' "$READONLY" "$FIRSTBOOT_WIFI" \
+    > "$MNT/opt/dashberry/install-opts"
 
 cat > "$MNT/etc/systemd/system/dashberry-firstinstall.service" <<'EOF'
 [Unit]
@@ -299,6 +339,31 @@ if [ "$WANT_SSH" = 1 ]; then
     info "enabling ssh..."
     : > "$BOOTDIR/ssh"
 fi
+if [ "$FIRSTBOOT_WIFI" = 1 ]; then
+    info "staging first-boot Wi-Fi '$WIFI_SSID' (firstinstall wipes it)..."
+    NMFILE="$MNT/etc/NetworkManager/system-connections/dashberry-firstboot.nmconnection"
+    mkdir -p "${NMFILE%/*}"
+    # printf, not a heredoc: the PSK must land byte-for-byte ($, \, %s-safe);
+    # umask 077 so the plaintext PSK is never world-readable, even briefly
+    # (NM refuses keyfiles that are not 600 anyway)
+    (
+        umask 077
+        {
+            printf '[connection]\nid=dashberry-firstboot\nuuid=%s\ntype=wifi\nautoconnect=true\n\n' \
+                "$(cat /proc/sys/kernel/random/uuid)"
+            printf '[wifi]\nmode=infrastructure\nssid=%s\n\n' "$WIFI_SSID"
+            printf '[wifi-security]\nkey-mgmt=wpa-psk\npsk=%s\n\n' "$WIFI_PSK"
+            printf '[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n'
+        } > "$NMFILE"
+    )
+    chmod 600 "$NMFILE"
+    # Stock Bookworm keeps wlan rfkill-blocked until a regulatory domain is
+    # set; the kernel cmdline is the offline way to provide one. cmdline.txt
+    # is a single line — append to it, don't add a second. firstinstall
+    # removes the token again during the credential wipe.
+    [ -f "$BOOTDIR/cmdline.txt" ] || die "no cmdline.txt on the boot partition?"
+    sed -i "1s/\$/ cfg80211.ieee80211_regdom=$WIFI_CC/" "$BOOTDIR/cmdline.txt"
+fi
 
 sync
 cleanup
@@ -306,13 +371,19 @@ trap - EXIT
 
 # --- done ------------------------------------------------------------------
 echo
-info "card ready. Insert it and power the Pi WITH ETHERNET CONNECTED"
-echo "    (first boot needs apt; Wi-Fi is rfkill-blocked by design)."
+if [ "$FIRSTBOOT_WIFI" = 1 ]; then
+    info "card ready. Insert it and power the Pi (first boot joins Wi-Fi '$WIFI_SSID')"
+    echo "    (setup-only network: firstinstall wipes the profile, leases and"
+    echo "     logs before the OS locks read-only)."
+else
+    info "card ready. Insert it and power the Pi WITH ETHERNET CONNECTED"
+    echo "    (first boot needs apt; Wi-Fi is rfkill-blocked by design)."
+fi
 echo
 echo "    boot 1: Pi OS housekeeping (its auto-expand self-disarms: root is"
 echo "            no longer the last partition), reboots"
 echo "    boot 2: dashberry-firstinstall — apt packages, builds"
-echo "            dashberry-panel, enables units$( [ "$READONLY" = 1 ] && echo ', flips the OS read-only' ) — reboots"
+echo "            dashberry-panel, enables units$( [ "$FIRSTBOOT_WIFI" = 1 ] && echo ', wipes the Wi-Fi traces' )$( [ "$READONLY" = 1 ] && echo ', flips the OS read-only' ) — reboots"
 echo "    boot 3: recording; radios come up BLOCKED (fresh card, fail-closed)"
 echo
 echo "    progress: journalctl -u dashberry-firstinstall (or the console)"
