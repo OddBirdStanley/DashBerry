@@ -197,7 +197,7 @@ else
     # VERIFY (bench): nonint do_overlayfs works headless — 0 = enable in
     # raspi-config's convention; takes effect at the next boot.
     if raspi-config nonint do_overlayfs 0 && grep -q boot=overlay "$CMDLINE"; then
-        echo "overlay armed (bench iteration: raspi-config nonint do_overlayfs 1 + reboot)"
+        echo "overlay armed (to make the OS writable again: raspi-config nonint do_overlayfs 1 + reboot)"
     else
         echo "WARNING: could not enable the overlay noninteractively;" >&2
         echo "         run 'sudo raspi-config' > Performance > Overlay FS by hand." >&2
@@ -215,5 +215,5 @@ if [ "$FROM_UNIT" = 1 ]; then
     echo "rebooting into the installed system..."
     systemctl --no-block reboot
 else
-    echo "reboot to start recording; then work the VERIFY table in README.md."
+    echo "reboot to start recording."
 fi
