@@ -20,8 +20,10 @@ dtoverlay=i2c-rtc,ds3231
 # (SETTLED on bench: without it everything renders mirrored): it sets
 # solomon,com-invdir, giving the COM-scan direction (0xC8) the bonnet is
 # built for; the overlay's base node sets no orientation properties and the
-# driver's segment-remap-on default (0xA1) covers the other axis. VERIFY on
-# bench: dmesg clean of I2C errors over the ribbon at 400 kHz. ---
+# driver's segment-remap-on default (0xA1) covers the other axis. Bench-
+# cleared 2026-07-27: bus clean at 400 kHz over the ribbon. (Diagnostics
+# note: /dev/i2c-* needs `modprobe i2c-dev` — nothing on the image loads
+# it; i2cdetect then shows 0x3c/0x68 as UU, i.e. driver-claimed.) ---
 dtoverlay=ssd1306,inverted
 
 # --- no HDMI/audio needed headless; trims boot + power ---
