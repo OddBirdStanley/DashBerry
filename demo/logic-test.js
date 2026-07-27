@@ -20,6 +20,7 @@ const sim = {
     gpsDelivering: true, gpsHaveFix: true,
     lat: -30.123456, lon: 111.222222, knots: 78.3,
     rtcOk: true,
+    cpuTempMc: 30566,              /* 30.566 C, a real quantized reading */
     mounted: true, rw: true, freePct: 90.1, fsErrors: false,
     logs: [],
     presented: null,
@@ -30,6 +31,7 @@ const hw = {
     frontNewestMtimeMs: () => sim.frontLast,
     rearNewestMtimeMs: () => sim.rearLast,
     rtcOk: () => sim.rtcOk,
+    cpuTempMc: () => sim.cpuTempMc,
     statvfs: () => sim.mounted
         ? { rw: sim.rw, freePct: sim.freePct, fsErrors: sim.fsErrors }
         : null,
@@ -236,6 +238,48 @@ ok(s.error === false && s.page === 1 && s.blanked === false,
     const after = panel.state().repaints;
     ok(after === before, "unchanged frames are not re-rendered (memcmp)");
 }
+
+/* PAGE 2: RIGHT pages to it, TMP is whole degrees from millidegrees. */
+press(PANEL.KEY.RIGHT); release(PANEL.KEY.RIGHT);
+advance(200);
+s = panel.state();
+ok(s.page === 2, "RIGHT from PAGE 1 shows PAGE 2");
+/* 30566 mC -> 30.566 C -> rounds to 31 */
+ok(decodeRow(0) === "TMP 31 C",
+   `PAGE 2 row 0 renders "TMP 31 C" (got "${decodeRow(0)}")`);
+ok(decodeRow(1) === "" && decodeRow(2) === "" && decodeRow(3, 15) === "",
+   "PAGE 2 rows 1-3 are reserved (empty)");
+ok(glyphCellPixels().join("") === expectedGlyphPixels('S').join(""),
+   "install-mode glyph shows on PAGE 2 too");
+
+/* Negative-safe rounding and read-failure placeholder (1 Hz cadence). */
+sim.cpuTempMc = -10499;            /* -10.499 C -> -10, not -11 or -9 */
+advance(1200);
+ok(decodeRow(0) === "TMP -10 C",
+   `-10499 mC renders "TMP -10 C" (got "${decodeRow(0)}")`);
+sim.cpuTempMc = null;              /* sysfs read failure */
+advance(1200);
+ok(decodeRow(0) === "TMP ---",
+   `temp read failure renders "TMP ---" (got "${decodeRow(0)}")`);
+ok(panel.state().error === false, "temp read failure is not a health ERR");
+sim.cpuTempMc = 30566;
+
+/* Cyclic paging: RIGHT wraps back to PAGE 1; LEFT from PAGE 1 -> PAGE 2. */
+press(PANEL.KEY.RIGHT); release(PANEL.KEY.RIGHT);
+advance(200);
+ok(panel.state().page === 1, "RIGHT from PAGE 2 wraps to PAGE 1");
+press(PANEL.KEY.LEFT); release(PANEL.KEY.LEFT);
+advance(200);
+ok(panel.state().page === 2, "LEFT from PAGE 1 wraps to PAGE 2");
+
+/* Lighting up always starts at PAGE 1: blank while on PAGE 2, wake. */
+advance(10200);
+ok(panel.state().blanked === true, "blanks while parked on PAGE 2");
+press(PANEL.KEY.CENTER); release(PANEL.KEY.CENTER);
+advance(200);
+s = panel.state();
+ok(s.blanked === false && s.page === 1,
+   "waking from blank always lands on PAGE 1, not the last page");
 
 /* No-fix placeholders: gpsd delivering but RMC status V. */
 sim.gpsHaveFix = false;

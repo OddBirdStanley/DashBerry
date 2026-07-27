@@ -2,7 +2,7 @@
  * for the browser demo/visualizer. NOT part of the Pi runtime.
  *
  * Porting rule: everything above the hardware line — the §3b UI state
- * machine (PAGE 0/1, AUTO-BLANK, strict wake-key absorption, burn-in
+ * machine (PAGE 0/1/2, AUTO-BLANK, strict wake-key absorption, burn-in
  * shift), the health model, compose()/render(), the embedded font and the
  * install-mode glyphs (shield = production, wireless = debug — baked from
  * DEBUG in dashberry.conf, no runtime RF state) — is ported
@@ -17,6 +17,8 @@
  *   frontNewestMtimeMs()     -> ms of newest front segment write, 0 = none
  *   rearNewestMtimeMs()      -> ms of newest rear segment write, 0 = none
  *   rtcOk()                  -> bool (rtc0/since_epoch readable)
+ *   cpuTempMc()              -> SoC temp in millidegrees C (thermal_zone0),
+ *                               null = read failure (PAGE 2 shows TMP ---)
  *   statvfs()                -> null (/data not mounted) or
  *                               { rw, freePct, fsErrors }
  *   present(view)               render sink: { blanked, fb (Uint8Array) }
@@ -160,7 +162,7 @@ const KEY = { UP: 0, DOWN: 1, LEFT: 2, RIGHT: 3, CENTER: 4, A: 5, B: 6 };
 const KEY_GPIO = [17, 22, 27, 23, 4, 5, 6];
 
 const BURN_OFFSETS = [0, 1, 0, -1];
-const PAGES = [1];                 /* PAGE 1 is the only designed page today */
+const PAGES = [1, 2];              /* wake order: index 0 is PAGE 1 */
 const NPAGES = PAGES.length;
 
 function create(hw) {
@@ -183,6 +185,18 @@ function create(hw) {
     const health = { front: false, rear: false, gpsok: false,
                      timeok: false, storage: false };
     let df_pct = 0;                /* free space %, for the PAGE 1 DF line */
+
+    /* SoC temperature for the PAGE 2 TMP line (read_cpu_temp in the C):
+     * millidegrees C from sysfs; not a health state, never faults. */
+    let cpu_temp_mc = 0;
+    let cpu_temp_valid = false;
+
+    function read_cpu_temp() {
+        const mc = hw.cpuTempMc();
+        cpu_temp_valid = mc !== null;
+        if (cpu_temp_valid)
+            cpu_temp_mc = mc;
+    }
 
     const ui = {
         error: false,              /* any health state ERR */
@@ -210,6 +224,7 @@ function create(hw) {
                        (now - gps.last_nmea_ms) <= GPS_SILENT_MS;
         health.timeok = hw.rtcOk();
         health.storage = storage_ok();
+        read_cpu_temp();           /* 1 Hz, off the 5 Hz paint path */
     }
 
     /* Storage OK: /data mounted rw, free > 0, no accumulated fs errors.
@@ -297,6 +312,19 @@ function create(hw) {
                               (health.timeok ? "" : "TIME");
             if (!health.storage && r < ROWS)
                 f.rows[r++] = "SD FULL";
+            return f;
+        }
+
+        if (PAGES[ui.page_idx] === 2) {
+            /* PAGE 2 — first line: Pi 4 SoC temperature, whole degrees C
+             * (negative-safe round-to-nearest); remaining lines reserved */
+            if (cpu_temp_valid) {
+                const mc = cpu_temp_mc;
+                const deg = Math.trunc((mc + (mc >= 0 ? 500 : -500)) / 1000);
+                f.rows[0] = "TMP " + deg + " C";
+            } else {
+                f.rows[0] = "TMP ---";
+            }
             return f;
         }
 

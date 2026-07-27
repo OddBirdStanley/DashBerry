@@ -166,6 +166,14 @@
     </div>
 
     <div class="grp">
+      <label class="row"><input type="checkbox" id="thermal" checked>
+        thermal_zone0 readable (uncheck → PAGE 2 "TMP ---", never an ERR)</label>
+      <div class="slider">SoC temp
+        <input type="range" id="cputemp" min="-20" max="90" step="0.487" value="42.1">
+        <span class="val" id="cputempval"></span></div>
+    </div>
+
+    <div class="grp">
       <label class="row"><input type="checkbox" id="fastburn">
         test aid: burn-in shift every 3 s instead of 60 s</label>
     </div>
@@ -218,6 +226,9 @@ const hw = {
     frontNewestMtimeMs: () => sim.frontLast,
     rearNewestMtimeMs: () => sim.rearLast,
     rtcOk: () => $("rtc").checked,
+    cpuTempMc: () => $("thermal").checked
+        ? Math.round(parseFloat($("cputemp").value) * 1000)
+        : null,
     statvfs: () => {
         if (!$("mounted").checked) return null;
         const pct = parseFloat($("free").value);
@@ -349,6 +360,8 @@ setInterval(() => {
 
     $("knotsval").textContent = parseFloat($("knots").value).toFixed(1) + " kn";
     $("freeval").textContent = parseFloat($("free").value).toFixed(1) + " %";
+    $("cputempval").textContent =
+        parseFloat($("cputemp").value).toFixed(1) + " °C";
 }, PANEL.TICK_MS);
 
 /* -------------------------------------------------------------- boot -- */

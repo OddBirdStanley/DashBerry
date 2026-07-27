@@ -4,7 +4,7 @@
  * owns everything §3b demands a single owner for:
  *   - all seven bonnet inputs (joystick + buttons A/B) via the GPIO
  *     character-device v2 API, with strict wake-key absorption;
- *   - PAGE 0 / PAGE 1 rendering to the OLED framebuffer, resolved by driver
+ *   - PAGE 0 / PAGE 1 / PAGE 2 rendering to the OLED framebuffer, resolved by driver
  *     name at startup (fb number is probe order) and rendered per its
  *     reported format: 1 bpp (fbdev ssd1307fb) or 32 bpp XRGB8888 (DRM
  *     ssd130x fbdev emulation — what Trixie's kernel binds);
@@ -63,6 +63,7 @@
 #define REAR_BASE     "/data/rear"
 #define DATA_MNT      "/data"
 #define RTC_EPOCH     "/sys/class/rtc/rtc0/since_epoch"
+#define CPU_TEMP      "/sys/class/thermal/thermal_zone0/temp"  /* milli-degC */
 
 /* --------------------------------------------------------------- timing - */
 
@@ -584,6 +585,22 @@ static struct {
 
 static double df_pct;              /* free space %, for the PAGE 1 DF line */
 
+/* SoC temperature for the PAGE 2 TMP line. The sysfs value is an integer in
+ * millidegrees Celsius (kernel thermal contract); on the Pi 4 the BCM2711
+ * sensor quantizes in ~0.487 degC steps, so whole degrees lose nothing real.
+ * Not a health state — a failed read shows TMP --- and never faults. */
+static int  cpu_temp_mc;
+static bool cpu_temp_valid;
+
+static void read_cpu_temp(void)
+{
+    char buf[16];
+    cpu_temp_valid = read_small(CPU_TEMP, buf, sizeof buf) > 0 &&
+                     (isdigit((unsigned char)buf[0]) || buf[0] == '-');
+    if (cpu_temp_valid)
+        cpu_temp_mc = atoi(buf);
+}
+
 static time_t newest_mp4_mtime(const char *base, const char *session)
 {
     if (!*session)
@@ -692,6 +709,7 @@ static void eval_health(int64_t now)
                    (now - gps.last_nmea_ms) <= GPS_SILENT_MS;
     health.timeok = bypass_time || rtc_ok();
     health.storage = storage_ok();
+    read_cpu_temp();               /* 1 Hz, off the 5 Hz paint path */
 }
 
 static bool system_err(void)
@@ -706,7 +724,7 @@ enum key { KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_CENTER, KEY_A, KEY_B,
            KEY_COUNT };
 static const uint32_t key_gpio[KEY_COUNT] = { 17, 22, 27, 23, 4, 5, 6 };
 
-static const int pages[] = { 1 };  /* PAGE 1 is the only designed page today */
+static const int pages[] = { 1, 2 };   /* wake order: index 0 is PAGE 1 */
 #define NPAGES ((int)(sizeof pages / sizeof pages[0]))
 
 static struct {
@@ -792,6 +810,19 @@ static void compose(struct frame *f)
                      health.timeok ? "" : "TIME");
         if (!health.storage && r < ROWS)
             snprintf(f->rows[r++], sizeof f->rows[0], "SD FULL");
+        return;
+    }
+
+    if (pages[ui.page_idx] == 2) {
+        /* PAGE 2 — first line: Pi 4 SoC temperature, whole degrees C
+         * (negative-safe round-to-nearest); remaining lines reserved */
+        if (cpu_temp_valid) {
+            int mc = cpu_temp_mc;
+            int deg = (mc + (mc >= 0 ? 500 : -500)) / 1000;
+            snprintf(f->rows[0], sizeof f->rows[0], "TMP %d C", deg);
+        } else {
+            snprintf(f->rows[0], sizeof f->rows[0], "TMP ---");
+        }
         return;
     }
 
