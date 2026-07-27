@@ -49,9 +49,15 @@ TAIL=$(ls "$OUT" 2>/dev/null | grep -E '^[0-9]+\.mp4$' | sort -n | tail -1)
 # splitmuxsink-fragment-closed with the file's true duration; we patch the
 # boxes the moment each file closes. stdbuf keeps -m line-buffered so the
 # patch happens within the second, not 4 KB of messages later.
+# Focus is pinned at the hyperfocal position (--autofocus-mode manual with
+# --lens-position default = rpicam's hyperfocal setting): a dashcam lens must
+# never hunt — rain/dirt on the windshield sits far inside the minimum focus
+# distance and continuous AF would pull focus off the road for it. VERIFY on
+# bench: footage sharp from hood to infinity, day and night.
 rpicam-vid -t 0 -n \
     --width "$FRONT_W" --height "$FRONT_H" --framerate "$FRONT_FPS" \
     --bitrate "$FRONT_BITRATE" --intra "$FRONT_FPS" \
+    --autofocus-mode manual --lens-position default \
     --codec libav --libav-format mpegts -o - |
 stdbuf -oL gst-launch-1.0 -e -m fdsrc fd=0 \
     ! tsdemux \
