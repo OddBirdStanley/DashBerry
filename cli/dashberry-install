@@ -175,11 +175,7 @@ fi
 [ "$BYPASS_TIME" = 1 ] && echo "    bypass: TIME"
 [ "$BYPASS_REAR" = 1 ] && echo "    bypass: REAR"
 if [ "$FIRSTBOOT_WIFI" = 1 ]; then
-    if [ "$DEBUG" = 1 ]; then
-        echo "    wifi  : '$WIFI_SSID' ($WIFI_CC)"
-    else
-        echo "    wifi  : '$WIFI_SSID' ($WIFI_CC)"
-    fi
+    echo "    wifi  : $WIFI_SSID ($WIFI_CC)"
 fi
 echo
 printf 'Type the device path (%s) to continue: ' "$DEV"
