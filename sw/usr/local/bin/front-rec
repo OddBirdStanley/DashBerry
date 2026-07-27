@@ -2,7 +2,7 @@
 # front-rec — front CSI camera → hardware H.264 → 60 s fragmented MP4 segments.
 # rpicam-vid does the capture+encode+TS-mux; GStreamer only demuxes and remuxes,
 # so a mux crash never touches the ISP. Writes into the per-boot session
-# directory minted by session-init (rev 6): a recorder restart REUSES the same
+# directory minted by session-init: a recorder restart REUSES the same
 # session dir.
 set -eu
 . /etc/dashberry.conf
@@ -21,7 +21,7 @@ START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.mp4$/ { if ($1 + 1 > s)
 TAIL=$(ls "$OUT" 2>/dev/null | grep -E '^[0-9]+\.mp4$' | sort -n | tail -1)
 [ -n "$TAIL" ] && mp4-set-duration "$OUT/$TAIL" scan || true
 
-# Timestamps travel IN-BAND (settled on bench, third iteration): the encoder's
+# Timestamps travel IN-BAND: the encoder's
 # own PTS/DTS ride the pipe inside an MPEG-TS container (--codec libav,
 # hardware h264_v4l2m2m underneath, --libav-format mpegts), and tsdemux hands
 # them to the muxer. Every earlier attempt to stamp a bare H.264 elementary
@@ -39,8 +39,8 @@ TAIL=$(ls "$OUT" 2>/dev/null | grep -E '^[0-9]+\.mp4$' | sort -n | tail -1)
 # sure completed fragments actually reach the card instead of dying in a
 # 64 KB stdio buffer.
 #
-# The -m watcher works around a GStreamer 1.26 qtmux bug (bench-verified,
-# exact same build as the Pi): with continuous input running time, each
+# The -m watcher works around a GStreamer 1.26 qtmux bug: with
+# continuous input running time, each
 # segment's DECLARED duration (mvhd/mehd) is written as the muxer's absolute
 # running time — segment N claims N minutes (VLC trusts the declaration;
 # ffprobe scans and is immune), while tfdt/trun sample data is correct. A
@@ -52,8 +52,8 @@ TAIL=$(ls "$OUT" 2>/dev/null | grep -E '^[0-9]+\.mp4$' | sort -n | tail -1)
 # Focus is pinned at the hyperfocal position (--autofocus-mode manual with
 # --lens-position default = rpicam's hyperfocal setting): a dashcam lens must
 # never hunt — rain/dirt on the windshield sits far inside the minimum focus
-# distance and continuous AF would pull focus off the road for it. VERIFY on
-# bench: footage sharp from hood to infinity, day and night.
+# distance and continuous AF would pull focus off the road for it; footage
+# should be sharp from hood to infinity, day and night.
 rpicam-vid -t 0 -n \
     --width "$FRONT_W" --height "$FRONT_H" --framerate "$FRONT_FPS" \
     --bitrate "$FRONT_BITRATE" --intra "$FRONT_FPS" \

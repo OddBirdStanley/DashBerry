@@ -5,5 +5,5 @@
 # data=ordered + commit=1: the 1 s journal commit forces each ~1 s MP4
 # fragment's data blocks to the card, so a hard power cut (every ignition-off,
 # and an impact that kills 12 V) loses ~1-2 s, not the ~5+ s that the default
-# commit interval leaves in the page cache (PLAN §3 crash-only).
+# commit interval leaves in the page cache.
 /dev/mmcblk0p3  /data  ext4  defaults,noatime,data=ordered,commit=1,nofail  0 2

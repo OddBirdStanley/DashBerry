@@ -1,5 +1,5 @@
 #!/bin/sh
-# session-init — mint the per-boot session name and directories (PLAN §3).
+# session-init — mint the per-boot session name and directories.
 # Name: <YYYYmmdd-HHMMSS>-<NNNN> — RTC-backed clock plus a monotonic boot
 # counter, so session names stay unique (and one-session ⇔ one-DRIVE grouping
 # stays structural) even across boots with a wrong RTC.

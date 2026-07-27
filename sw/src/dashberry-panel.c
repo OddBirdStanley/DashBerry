@@ -1,7 +1,7 @@
-/* dashberry-panel.c — DashBerry status panel daemon (PLAN.md §3b, rev 6).
+/* dashberry-panel.c — DashBerry status panel daemon.
  *
  * The runtime's single compiled C program. One poll()/timerfd event loop
- * owns everything §3b demands a single owner for:
+ * owns everything that needs a single owner:
  *   - all seven bonnet inputs (joystick + buttons A/B) via the GPIO
  *     character-device v2 API, with strict wake-key absorption;
  *   - button B EVENT capture: ~2 s hold on any non-blanked screen (PAGE 0
@@ -73,7 +73,7 @@
 
 /* --------------------------------------------------------------- timing - */
 
-#define TICK_MS          200      /* repaint/watchdog tick: 5 Hz cap (§3b) */
+#define TICK_MS          200      /* repaint/watchdog tick: 5 Hz cap */
 #define HEALTH_TICKS     5        /* health re-eval every 1 s */
 #define BLANK_MS         10000    /* AUTO-BLANK after 10 s without keys */
 #define STALE_SECS       10       /* segment considered stalled after this */
@@ -91,10 +91,10 @@
 #define CELL_W 8
 #define CELL_H 16
 
-/* VERIFY (bench): bit order within each 1 bpp framebuffer byte. The fbdev
- * mono convention is MSB = leftmost pixel; if the bench shows every 8-px
- * column group horizontally mirrored, set FB_MSB_LEFT to 0. Deliberately
- * isolated in putpixel() — nothing else knows about packing. */
+/* Bit order within each 1 bpp framebuffer byte. The fbdev mono
+ * convention is MSB = leftmost pixel; if every 8-px column group shows
+ * horizontally mirrored, set FB_MSB_LEFT to 0. Deliberately isolated
+ * in putpixel() — nothing else knows about packing. */
 #define FB_MSB_LEFT 1
 
 static int      fb_fd = -1;
@@ -161,9 +161,9 @@ static void sd_notify_msg(const char *msg)
 
 /* Public-domain 8x8 ASCII bitmaps (dhepper/font8x8 style: one byte per row,
  * bit 0 = leftmost pixel), pixel-doubled vertically to 8x16 at render time.
- * VERIFY-visual (bench): the UI only exercises A-Z, a few lowercase, digits
- * and - . % : — those must look right; fidelity of the rest of the printable
- * table is unchecked art, fix on sight. */
+ * The UI only exercises A-Z, a few lowercase, digits and - . % : — those
+ * must look right; fidelity of the rest of the printable table is
+ * unchecked art, fix on sight. */
 static const uint8_t font8x8[95][8] = {
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* ' ' */
     {0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00}, /* !   */
@@ -264,9 +264,8 @@ static const uint8_t font8x8[95][8] = {
 
 /* Hand-drawn 8x16 mode glyphs (bit 0 = leftmost, one byte per pixel row —
  * NOT doubled). The cell reports the INSTALL MODE, fixed for the card's
- * lifetime: wireless = DEBUG build (radios/ssh live) — user drawing,
- * source of truth DashBerry/wireless_glyph.txt ('x' = lit); shield =
- * PRODUCTION build (sealed). VERIFY-visual: legibility + orientation. */
+ * lifetime: wireless = DEBUG build (radios/ssh live); shield =
+ * PRODUCTION build (sealed). */
 static const uint8_t glyph_wireless[16] = {
     0x3C, 0x42, 0x81, 0x81, 0x3C, 0x42, 0x81, 0x81,
     0x3C, 0x42, 0x81, 0x99, 0x24, 0x00, 0x18, 0x18,
@@ -612,7 +611,7 @@ static void read_cpu_temp(void)
 
 /* Firmware throttle flags for the PAGE 2 PWR line — the same bitmask
  * vcgencmd get_throttled reports, read from the firmware driver's sysfs
- * node (VERIFY on bench: node path on Trixie): bit 0 = under-voltage NOW,
+ * node: bit 0 = under-voltage NOW,
  * bit 16 = under-voltage occurred since boot. Like TMP, informational
  * only — a failed read shows PWR --- and never faults the system. */
 static uint32_t throttled;
@@ -886,7 +885,7 @@ static const int burn_offsets[4] = { 0, 1, 0, -1 };
 static void wake(int64_t now)
 {
     ui.blanked = false;
-    ui.page_idx = 0;               /* always wake to PAGE 1 (§3b) */
+    ui.page_idx = 0;               /* always wake to PAGE 1 */
     ui.last_key_ms = now;
 }
 
@@ -902,8 +901,8 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
         return;
 
     /* Button B: EVENT capture (~2 s hold, fired from the tick) — the one
-     * key that acts on any NON-BLANKED screen, PAGE 0 included (user-
-     * approved amendment to §3b's "PAGE 0 ignores all input": an incident
+     * key that acts on any NON-BLANKED screen, PAGE 0 included (the
+     * deliberate exception to "PAGE 0 ignores all input": an incident
      * that faults the system is exactly when marking the moment matters).
      * From blank it is still a pure wake key: the waking press is
      * absorbed, the hold must restart after the wake. */
@@ -1031,7 +1030,7 @@ static void render(const struct frame *f)
     if (f->blanked) {
         memset(fbmem, 0, fb_screen);
         if (hw_blanked != 1) {
-            /* Best effort: ssd1307fb may not implement fb_blank (VERIFY);
+            /* Best effort: ssd1307fb may not implement fb_blank;
              * the memset above already darkens a self-emissive OLED. */
             ioctl(fb_fd, FBIOBLANK, FB_BLANK_POWERDOWN);
             hw_blanked = 1;

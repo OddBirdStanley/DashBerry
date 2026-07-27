@@ -8,7 +8,7 @@ After=session.service local-fs.target
 [Service]
 Type=notify
 ExecStart=/usr/local/bin/dashberry-panel
-# Liveness is the systemd watchdog (rev 6): the daemon sd_notify's
+# Liveness is the systemd watchdog: the daemon sd_notify's
 # WATCHDOG=1 every 200 ms loop tick.
 WatchdogSec=10
 Restart=always

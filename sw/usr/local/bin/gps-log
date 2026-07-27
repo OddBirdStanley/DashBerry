@@ -1,7 +1,7 @@
 #!/bin/sh
 # gps-log — one raw NMEA log per boot session, straight from gpsd.
 # NMEA is the archival ground truth; catalogs/renders/GPX all derive offline
-# via dashberry-cli (PLAN §3c). Writes /data/gps/<session>/<session>.nmea —
+# via dashberry-cli. Writes /data/gps/<session>/<session>.nmea —
 # the name repeats the session id on purpose, so the file stays self-
 # describing after it's copied off the card.
 set -eu

@@ -1,5 +1,5 @@
 # Stable name for the rear showmewebcam UVC camera.
-# VERIFY on bench: plug the Zero in and run
+# To confirm the IDs: plug the Zero in and run
 #   udevadm info -a /dev/video0 | grep -iE 'idVendor|idProduct|product'
 # showmewebcam's gadget defaults to Linux Foundation IDs (1d6b:0104) with
 # product string "Piwebcam"; adjust ATTRS below to whatever your build reports.
@@ -11,7 +11,7 @@ SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0104", ATT
 # dashberry.conf (and through it /etc/default/gpsd) points at this symlink.
 # Vendor-only match: u-blox generations differ in idProduct (7=01a7, 8=01a8,
 # 9=01a9) but all share idVendor 1546.
-# VERIFY on bench: udevadm info -a /dev/ttyACM0 | grep -i idVendor
+# To confirm: udevadm info -a /dev/ttyACM0 | grep -i idVendor
 # The systemd tag + Wants starts gps-readd.service on every enumeration —
 # it re-asserts 5 Hz and rejoins a running gpsd after a replug (and exits
 # early at boot, where gps-rate.service and gpsd's static DEVICES take over).

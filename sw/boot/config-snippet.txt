@@ -15,15 +15,14 @@ dtoverlay=i2c-rtc,ds3231
 
 # --- 128x64 OLED Bonnet (#3531): SSD1306 at 0x3C, Trixie binds the DRM
 # ssd130x driver which exposes it as /dev/fbN — the number is probe order
-# (fb0 on the bench, not the fb1 the plan assumed), so the panel resolves it
-# by driver name via /sys/class/graphics/fb*/name. "inverted" is required
-# (SETTLED on bench: without it everything renders mirrored): it sets
-# solomon,com-invdir, giving the COM-scan direction (0xC8) the bonnet is
-# built for; the overlay's base node sets no orientation properties and the
-# driver's segment-remap-on default (0xA1) covers the other axis. Bench-
-# cleared 2026-07-27: bus clean at 400 kHz over the ribbon. (Diagnostics
-# note: /dev/i2c-* needs `modprobe i2c-dev` — nothing on the image loads
-# it; i2cdetect then shows 0x3c/0x68 as UU, i.e. driver-claimed.) ---
+# and cannot be assumed, so the panel resolves it by driver name via
+# /sys/class/graphics/fb*/name. "inverted" is required (without it
+# everything renders mirrored): it sets solomon,com-invdir, giving the
+# COM-scan direction (0xC8) the bonnet is built for; the overlay's base
+# node sets no orientation properties and the driver's segment-remap-on
+# default (0xA1) covers the other axis. (Diagnostics note: /dev/i2c-*
+# needs `modprobe i2c-dev` — nothing on the image loads it; i2cdetect
+# then shows 0x3c/0x68 as UU, i.e. driver-claimed.) ---
 dtoverlay=ssd1306,inverted
 
 # --- no HDMI/audio needed headless; trims boot + power ---
@@ -32,10 +31,10 @@ disable_splash=1
 
 # ---------------------------------------------------------------
 # cmdline.txt notes:
-#  - `fbcon=map:9` is appended by dashberry-install (SETTLED on bench: the
-#    OLED enumerates as fb0, fbcon's default target — boot tty text and a
-#    blinking cursor land on the panel otherwise). fb9 never exists, so
+#  - `fbcon=map:9` is appended by dashberry-install (the OLED enumerates
+#    as fb0, fbcon's default target — boot tty text and a blinking
+#    cursor land on the panel otherwise). fb9 never exists, so
 #    fbcon binds nothing, on any probe order; the OLED's only writer is
 #    the panel daemon.
-#  - No consoleblank needed: the panel blanks itself (AUTO-BLANK, PLAN §3b).
+#  - No consoleblank needed: the panel blanks itself (AUTO-BLANK).
 # ---------------------------------------------------------------

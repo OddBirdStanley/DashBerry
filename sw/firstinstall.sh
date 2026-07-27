@@ -20,7 +20,7 @@
 #     profile instead of Ethernet).
 #
 # dashberry-cli (../cli) is PC-side and is deliberately NOT installed here —
-# it never ships on the image (PLAN §3c).
+# it never ships on the image.
 set -eu
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
@@ -42,10 +42,10 @@ CMDLINE=/boot/firmware/cmdline.txt
 if [ "$FIRSTBOOT_WIFI" = 1 ]; then
     echo "first-boot Wi-Fi: unblocking and waiting for the network..."
     # The cmdline regdom staged by dashberry-install should already have
-    # left wlan unblocked (VERIFY on bench: Trixie honors
-    # cfg80211.ieee80211_regdom headless — known good on bookworm,
-    # unconfirmed on trixie); these are belt-and-braces — rfkill may not
-    # exist on the stock image yet.
+    # left wlan unblocked (Trixie is expected to honor
+    # cfg80211.ieee80211_regdom headless — known good on bookworm);
+    # these are belt-and-braces — rfkill may not exist on the stock
+    # image yet.
     rfkill unblock wifi 2>/dev/null || true
     nmcli radio wifi on 2>/dev/null || true
     nm-online -q -t 90 || echo "network not online yet — apt will retry" >&2
@@ -194,8 +194,8 @@ else
     fi
 
     echo "enabling the read-only OS overlay..."
-    # VERIFY (bench): nonint do_overlayfs works headless — 0 = enable in
-    # raspi-config's convention; takes effect at the next boot.
+    # nonint do_overlayfs works headless — 0 = enable in raspi-config's
+    # convention; takes effect at the next boot.
     if raspi-config nonint do_overlayfs 0 && grep -q boot=overlay "$CMDLINE"; then
         echo "overlay armed (to make the OS writable again: raspi-config nonint do_overlayfs 1 + reboot)"
     else

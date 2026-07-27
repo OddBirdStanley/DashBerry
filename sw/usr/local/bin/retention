@@ -4,9 +4,9 @@
 # retention.timer every 5 min. GPS NMEA logs and health logs are tiny and
 # never deleted here.
 #
-# NOTE (rev 6): the 8 GB floor is retention's own target ONLY. The panel's
-# Storage state no longer keys off it — panel ERR means actually-full/
-# read-only/I/O-errors (PLAN §3b). The old floor↔panel coupling is gone.
+# NOTE: the free-space floor is retention's own target ONLY. The panel's
+# Storage state does not key off it — panel ERR means actually-full/
+# read-only/I/O-errors.
 set -u
 . /etc/dashberry.conf
 

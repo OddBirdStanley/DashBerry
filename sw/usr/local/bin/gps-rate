@@ -2,7 +2,7 @@
 # gps-rate — set the u-blox receiver to 5 Hz before gpsd claims the device
 # (Before=gpsd.service — the port must be free when we write to it).
 # The setting survives power-off only in the module's battery-backed RAM, so
-# this re-runs every boot (PLAN §3, rev 6).
+# this re-runs every boot.
 #
 # UBX CFG-RATE: class=0x06 id=0x08 len=0x0006, payload:
 #   measRate = 200 ms  -> C8 00   (little-endian; 200 ms => 5 Hz)
@@ -14,8 +14,8 @@
 #   01 -> A=DE B=8C | 00 -> A=DE B=6A          => CK_A=DE CK_B=6A
 # Full frame: B5 62 06 08 06 00 C8 00 01 00 01 00 DE 6A
 #
-# VERIFY (bench): confirm 5 Hz NMEA cadence after a COLD power cycle (count
-# RMC sentences per second with gpspipe -r). A puck that enumerates later
+# To confirm the 5 Hz NMEA cadence after a COLD power cycle: count RMC
+# sentences per second with gpspipe -r. A puck that enumerates later
 # than this unit runs is caught by gps-readd (udev-started on every
 # enumeration), which re-runs this script — but the panel shows GPS OK at
 # 1 Hz too, so check cadence explicitly anyway.

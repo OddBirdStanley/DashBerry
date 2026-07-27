@@ -2,7 +2,7 @@
 # rear-rec — rear UVC (showmewebcam) MJPEG → hw decode → hw H.264 → 60 s
 # fragmented MP4 segments. Exits (→ systemd Restart) if the camera is absent;
 # the Zero normally beats the Pi 4 to readiness since both power on ignition.
-# Writes into the per-boot session directory minted by session-init (rev 6):
+# Writes into the per-boot session directory minted by session-init:
 # a restart REUSES the same session dir.
 set -eu
 . /etc/dashberry.conf
@@ -14,8 +14,8 @@ OUT="$DATA/rear/$SESSION"
 mkdir -p "$OUT"
 
 # Restart-in-same-session: resume the %05d counter one past the highest
-# existing segment (splitmuxsink start-index). VERIFY on bench alongside
-# front-rec: no overwrite after unplug/replug of the rear camera.
+# existing segment (splitmuxsink start-index), so nothing is overwritten
+# after an unplug/replug of the rear camera.
 START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.mp4$/ { if ($1 + 1 > s) s = $1 + 1 } END { print s + 0 }')
 
 # Crash-restart tail: recover the previous run's last file's declared
@@ -23,10 +23,9 @@ START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.mp4$/ { if ($1 + 1 > s)
 TAIL=$(ls "$OUT" 2>/dev/null | grep -E '^[0-9]+\.mp4$' | sort -n | tail -1)
 [ -n "$TAIL" ] && mp4-set-duration "$OUT/$TAIL" scan || true
 
-# VERIFY on bench (PLAN §6 "encoder pipeline quirks"): v4l2h264enc wants
-# bitrate/period set via extra-controls and an explicit level in caps —
-# names below are the bookworm-era ones; confirm on trixie (kernel 6.12)
-# with `v4l2-ctl -d /dev/video11 -L`.
+# v4l2h264enc wants bitrate/period set via extra-controls and an explicit
+# level in caps — names below are the bookworm-era ones; on trixie
+# (kernel 6.12) they can be confirmed with `v4l2-ctl -d /dev/video11 -L`.
 # muxer= / sink= (not muxer-properties, which splitmuxsink silently ignores
 # unless async-finalize=true — the fragment-duration was never applied through
 # it): fragmented MP4 for power-cut recovery, unbuffered filesink so completed
