@@ -1,7 +1,8 @@
 #!/bin/sh
 # retention — delete oldest segments (front+rear pooled, across all session
 # dirs) until free space on /data is back above RETENTION_FLOOR_MB. Runs from
-# retention.timer every 5 min. GPS NMEA logs are tiny and never deleted here.
+# retention.timer every 5 min. GPS NMEA logs and health logs are tiny and
+# never deleted here.
 #
 # NOTE (rev 6): the 8 GB floor is retention's own target ONLY. The panel's
 # Storage state no longer keys off it — panel ERR means actually-full/

@@ -22,6 +22,7 @@ mv "$DATA/.boot-counter.tmp" "$DATA/.boot-counter"
 sync "$DATA"
 
 SESSION="$(date +%Y%m%d-%H%M%S)-$(printf '%04d' $((c % 10000)))"
-mkdir -p "$DATA/front/$SESSION" "$DATA/rear/$SESSION" "$DATA/gps/$SESSION"
+mkdir -p "$DATA/front/$SESSION" "$DATA/rear/$SESSION" "$DATA/gps/$SESSION" \
+         "$DATA/health/$SESSION"
 printf '%s' "$SESSION" > "$SESSION_FILE"
 echo "session-init: session $SESSION (boot #$c)"

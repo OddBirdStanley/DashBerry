@@ -4,13 +4,17 @@
  * owns everything §3b demands a single owner for:
  *   - all seven bonnet inputs (joystick + buttons A/B) via the GPIO
  *     character-device v2 API, with strict wake-key absorption;
+ *   - button B EVENT capture: ~2 s hold on any non-blanked screen (PAGE 0
+ *     included) appends an event marker to the health log;
  *   - PAGE 0 / PAGE 1 / PAGE 2 rendering to the OLED framebuffer, resolved by driver
  *     name at startup (fb number is probe order) and rendered per its
  *     reported format: 1 bpp (fbdev ssd1307fb) or 32 bpp XRGB8888 (DRM
  *     ssd130x fbdev emulation — what Trixie's kernel binds);
  *   - AUTO-BLANK (10 s, OK state only);
  *   - health evaluation from real signals (segments growing, NMEA flowing,
- *     RTC readable, /data writable-with-space);
+ *     RTC readable, /data writable-with-space) — logged, transitions and a
+ *     10 s heartbeat, to /data/health/<session>/<session>.log for the
+ *     PC-side renderer;
  *   - systemd watchdog liveness (hand-rolled sd_notify, Type=notify).
  *
  * The bottom-right glyph cell reports the INSTALL MODE, baked at build of
@@ -64,6 +68,8 @@
 #define DATA_MNT      "/data"
 #define RTC_EPOCH     "/sys/class/rtc/rtc0/since_epoch"
 #define CPU_TEMP      "/sys/class/thermal/thermal_zone0/temp"  /* milli-degC */
+#define GET_THROTTLED "/sys/devices/platform/soc/soc:firmware/get_throttled"
+#define HEALTH_BASE   "/data/health"
 
 /* --------------------------------------------------------------- timing - */
 
@@ -74,6 +80,9 @@
 #define GPS_SILENT_MS    5000     /* NMEA silence -> GPS ERR */
 #define GPS_BACKOFF_MAX  10000    /* gpsd reconnect backoff ceiling (ms) */
 #define BURN_STEP_MS     60000    /* PAGE 0 pixel-shift cadence */
+#define EVENT_HOLD_MS    2000     /* button B hold to mark an EVENT */
+#define EVENT_FLASH_MS   2000     /* EVENT confirmation screen duration */
+#define HB_MS            10000    /* health-log heartbeat cadence */
 
 /* -------------------------------------------------------------- display - */
 
@@ -601,6 +610,23 @@ static void read_cpu_temp(void)
         cpu_temp_mc = atoi(buf);
 }
 
+/* Firmware throttle flags for the PAGE 2 PWR line — the same bitmask
+ * vcgencmd get_throttled reports, read from the firmware driver's sysfs
+ * node (VERIFY on bench: node path on Trixie): bit 0 = under-voltage NOW,
+ * bit 16 = under-voltage occurred since boot. Like TMP, informational
+ * only — a failed read shows PWR --- and never faults the system. */
+static uint32_t throttled;
+static bool     throttled_valid;
+
+static void read_throttled(void)
+{
+    char buf[32];
+    throttled_valid = read_small(GET_THROTTLED, buf, sizeof buf) > 0 &&
+                      isxdigit((unsigned char)buf[0]);
+    if (throttled_valid)
+        throttled = (uint32_t)strtoul(buf, NULL, 16);
+}
+
 static time_t newest_mp4_mtime(const char *base, const char *session)
 {
     if (!*session)
@@ -682,6 +708,120 @@ static bool storage_ok(void)
     return true;
 }
 
+/* ----------------------------------------------------------- health log - */
+
+/* Append-only per-session health log on /data — the PC-side renderer's
+ * source of truth for "what was wrong when" (dashberry-cli --continuous
+ * turns it into No Signal / GPS Error overlays). One record per line,
+ * space-separated, first field the wall-clock epoch:
+ *   <epoch> boot                       log opened (≈ panel start)
+ *   <epoch> <comp> <OK|ERR>            comp: front rear gps time storage
+ *   <epoch> gpsfix <FIX|NOFIX>         RMC fix presence (OK-but-fixless)
+ *   <epoch> event                      button-B marker
+ *   <epoch> hb                         heartbeat — bounds session end
+ * The full state set is written once after boot so a parser needs no
+ * assumed defaults; after that only transitions, plus the 10 s heartbeat.
+ * Each record is one unbuffered write(2) (durability rides on the 1 s
+ * journal commit, same rationale as the NMEA log). Best-effort by
+ * design: any failure closes the fd and the next health tick retries the
+ * open — the log can never fault the panel. */
+static struct {
+    int     fd;
+    char    session[64];
+    bool    inited;                /* initial full state set written */
+    bool    front, rear, gpsok, timeok, storage, fix;   /* last logged */
+    int64_t last_hb_ms;
+    int     events;                /* logged this boot, for the EVENT flash */
+} hlog = { .fd = -1 };
+
+static bool hlog_line(const char *rec)
+{
+    if (hlog.fd < 0)
+        return false;
+    char buf[96];
+    int n = snprintf(buf, sizeof buf, "%lld %s\n", (long long)time(NULL), rec);
+    if (n < 0 || (size_t)n >= sizeof buf ||
+        write(hlog.fd, buf, (size_t)n) != n) {
+        close(hlog.fd);
+        hlog.fd = -1;              /* next eval_health retries the open */
+        return false;
+    }
+    return true;
+}
+
+static void hlog_state(const char *comp, bool ok)
+{
+    char rec[32];
+    snprintf(rec, sizeof rec, "%s %s", comp, ok ? "OK" : "ERR");
+    hlog_line(rec);
+}
+
+static void hlog_open(const char *session, int64_t now)
+{
+    if (hlog.fd >= 0 && strcmp(session, hlog.session) == 0)
+        return;
+    if (hlog.fd >= 0) {
+        close(hlog.fd);
+        hlog.fd = -1;
+    }
+    if (!*session)
+        return;
+    char path[600];
+    /* mkdir: session-init creates these, but a card installed before the
+     * health log existed (or a by-hand session) may lack them. */
+    mkdir(HEALTH_BASE, 0755);
+    snprintf(path, sizeof path, HEALTH_BASE "/%s", session);
+    mkdir(path, 0755);
+    snprintf(path, sizeof path, HEALTH_BASE "/%s/%s.log", session, session);
+    hlog.fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    if (hlog.fd < 0)
+        return;
+    snprintf(hlog.session, sizeof hlog.session, "%s", session);
+    hlog.inited = false;           /* a reopen re-dumps state: parser-safe */
+    hlog.last_hb_ms = now;
+    hlog_line("boot");
+}
+
+static void hlog_sync(const char *session, int64_t now)
+{
+    hlog_open(session, now);
+    if (hlog.fd < 0)
+        return;
+    bool fix = gps.have_fix;
+    if (!hlog.inited) {
+        hlog_state("front", health.front);
+        hlog_state("rear", health.rear);
+        hlog_state("gps", health.gpsok);
+        hlog_state("time", health.timeok);
+        hlog_state("storage", health.storage);
+        hlog_line(fix ? "gpsfix FIX" : "gpsfix NOFIX");
+        hlog.front = health.front;
+        hlog.rear = health.rear;
+        hlog.gpsok = health.gpsok;
+        hlog.timeok = health.timeok;
+        hlog.storage = health.storage;
+        hlog.fix = fix;
+        hlog.inited = true;
+    } else {
+        if (health.front != hlog.front)
+            hlog_state("front", hlog.front = health.front);
+        if (health.rear != hlog.rear)
+            hlog_state("rear", hlog.rear = health.rear);
+        if (health.gpsok != hlog.gpsok)
+            hlog_state("gps", hlog.gpsok = health.gpsok);
+        if (health.timeok != hlog.timeok)
+            hlog_state("time", hlog.timeok = health.timeok);
+        if (health.storage != hlog.storage)
+            hlog_state("storage", hlog.storage = health.storage);
+        if (fix != hlog.fix)
+            hlog_line((hlog.fix = fix) ? "gpsfix FIX" : "gpsfix NOFIX");
+    }
+    if (now - hlog.last_hb_ms >= HB_MS) {
+        hlog.last_hb_ms = now;
+        hlog_line("hb");
+    }
+}
+
 static void eval_health(int64_t now)
 {
     char session[64] = "";
@@ -710,6 +850,8 @@ static void eval_health(int64_t now)
     health.timeok = bypass_time || rtc_ok();
     health.storage = storage_ok();
     read_cpu_temp();               /* 1 Hz, off the 5 Hz paint path */
+    read_throttled();
+    hlog_sync(session, now);
 }
 
 static bool system_err(void)
@@ -734,6 +876,10 @@ static struct {
     int64_t last_key_ms;
     int     burn_idx;              /* PAGE 0 shift: 0,+1,0,-1 */
     int64_t burn_last_ms;
+    int64_t b_down_ms;             /* button B pressed since (0 = up) */
+    bool    b_fired;               /* this hold already marked an event */
+    int64_t flash_until_ms;        /* EVENT confirmation visible until */
+    char    flash[COLS + 1];       /* EVENT confirmation text */
 } ui;
 
 static const int burn_offsets[4] = { 0, 1, 0, -1 };
@@ -756,8 +902,30 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
     if (key < 0)
         return;
 
+    /* Button B: EVENT capture (~2 s hold, fired from the tick) — the one
+     * key that acts on any NON-BLANKED screen, PAGE 0 included (user-
+     * approved amendment to §3b's "PAGE 0 ignores all input": an incident
+     * that faults the system is exactly when marking the moment matters).
+     * From blank it is still a pure wake key: the waking press is
+     * absorbed, the hold must restart after the wake. */
+    if (key == KEY_B) {
+        if (press && ui.blanked && !ui.error) {
+            wake(now);
+            return;
+        }
+        if (press) {
+            ui.b_down_ms = now;
+            ui.b_fired = false;
+        } else {
+            ui.b_down_ms = 0;
+        }
+        if (!ui.error)
+            ui.last_key_ms = now;
+        return;
+    }
+
     if (ui.error)
-        return;                    /* PAGE 0 is static: all input ignored */
+        return;                    /* PAGE 0 is static: other input ignored */
     if (!press) {
         ui.last_key_ms = now;
         return;
@@ -771,7 +939,7 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
         ui.page_idx = (ui.page_idx + NPAGES - 1) % NPAGES;
     else if (key == KEY_RIGHT)
         ui.page_idx = (ui.page_idx + 1) % NPAGES;
-    /* A, B, UP, DOWN, CENTER: reserved — wake/reset-timer only */
+    /* A, UP, DOWN, CENTER: reserved — wake/reset-timer only */
 }
 
 /* ------------------------------------------------------------ rendering - */
@@ -783,7 +951,7 @@ struct frame {
     char rows[ROWS][COLS + 1];
 };
 
-static void compose(struct frame *f)
+static void compose(struct frame *f, int64_t now)
 {
     memset(f, 0, sizeof *f);       /* deterministic padding for memcmp */
 
@@ -792,6 +960,13 @@ static void compose(struct frame *f)
         return;
     }
     f->glyph = debug_card ? 'W' : 'S';   /* install mode, fixed per card */
+
+    if (now < ui.flash_until_ms) {
+        /* EVENT confirmation — a deliberate 2 s full-screen interruption
+         * of whatever page is up (PAGE 0 returns right after) */
+        snprintf(f->rows[1], sizeof f->rows[1], "    %.12s", ui.flash);
+        return;
+    }
 
     if (ui.error) {
         /* PAGE 0 — static, only failing groups, empty lines omitted */
@@ -814,8 +989,9 @@ static void compose(struct frame *f)
     }
 
     if (pages[ui.page_idx] == 2) {
-        /* PAGE 2 — first line: Pi 4 SoC temperature, whole degrees C
-         * (negative-safe round-to-nearest); remaining lines reserved */
+        /* PAGE 2 — line 1: Pi 4 SoC temperature, whole degrees C
+         * (negative-safe round-to-nearest); line 2: firmware power flags
+         * (under-voltage now beats latched); remaining lines reserved */
         if (cpu_temp_valid) {
             int mc = cpu_temp_mc;
             int deg = (mc + (mc >= 0 ? 500 : -500)) / 1000;
@@ -823,6 +999,14 @@ static void compose(struct frame *f)
         } else {
             snprintf(f->rows[0], sizeof f->rows[0], "TMP ---");
         }
+        if (!throttled_valid)
+            snprintf(f->rows[1], sizeof f->rows[1], "PWR ---");
+        else if (throttled & 0x1u)
+            snprintf(f->rows[1], sizeof f->rows[1], "PWR UV NOW");
+        else if (throttled & 0x10000u)
+            snprintf(f->rows[1], sizeof f->rows[1], "PWR UV SEEN");
+        else
+            snprintf(f->rows[1], sizeof f->rows[1], "PWR OK");
         return;
     }
 
@@ -1027,6 +1211,20 @@ int main(void)
                 now - ui.last_key_ms >= BLANK_MS)
                 ui.blanked = true;
 
+            /* Button B held to the 2 s mark: record the event, once per
+             * hold. The marker line is the payload; the flash is feedback
+             * (EVENT ? = the /data log is unwritable, marker lost). */
+            if (ui.b_down_ms && !ui.b_fired &&
+                now - ui.b_down_ms >= EVENT_HOLD_MS) {
+                ui.b_fired = true;
+                if (hlog_line("event"))
+                    snprintf(ui.flash, sizeof ui.flash, "EVENT #%d",
+                             ++hlog.events % 1000);
+                else
+                    snprintf(ui.flash, sizeof ui.flash, "EVENT ?");
+                ui.flash_until_ms = now + EVENT_FLASH_MS;
+            }
+
             if (now - ui.burn_last_ms >= BURN_STEP_MS) {
                 ui.burn_last_ms = now;
                 ui.burn_idx = (ui.burn_idx + 1) & 3;
@@ -1034,7 +1232,7 @@ int main(void)
 
             /* repaint on change only, at most once per tick (5 Hz cap) */
             struct frame f;
-            compose(&f);
+            compose(&f, now);
             if (memcmp(&f, &shown, sizeof f) != 0) {
                 render(&f);
                 shown = f;
