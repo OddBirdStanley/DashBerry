@@ -731,7 +731,6 @@ static struct {
     bool    inited;                /* initial full state set written */
     bool    front, rear, gpsok, timeok, storage, fix;   /* last logged */
     int64_t last_hb_ms;
-    int     events;                /* logged this boot, for the EVENT flash */
 } hlog = { .fd = -1 };
 
 static bool hlog_line(const char *rec)
@@ -1213,15 +1212,12 @@ int main(void)
 
             /* Button B held to the 2 s mark: record the event, once per
              * hold. The marker line is the payload; the flash is feedback
-             * (EVENT ? = the /data log is unwritable, marker lost). */
+             * (EVENT ERR = the /data log is unwritable, marker lost). */
             if (ui.b_down_ms && !ui.b_fired &&
                 now - ui.b_down_ms >= EVENT_HOLD_MS) {
                 ui.b_fired = true;
-                if (hlog_line("event"))
-                    snprintf(ui.flash, sizeof ui.flash, "EVENT #%d",
-                             ++hlog.events % 1000);
-                else
-                    snprintf(ui.flash, sizeof ui.flash, "EVENT ?");
+                snprintf(ui.flash, sizeof ui.flash,
+                         hlog_line("event") ? "EVENT" : "EVENT ERR");
                 ui.flash_until_ms = now + EVENT_FLASH_MS;
             }
 
