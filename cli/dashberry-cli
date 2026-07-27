@@ -11,15 +11,16 @@ Stdlib only; ffmpeg/ffprobe are invoked as subprocesses for all heavy lifting.
 Subcommands:
   catalog  one line per DRIVE (= per-boot session directory); --verbose adds
            distance / average / top speed and button-B event markers
-  render   cut/concat (optionally GPS-annotated) video from one drive;
+  render   continuous boot-to-shutdown video of one drive (footage holes
+           become black "No Signal" filler, GPS trouble is labeled from
+           the health log; --annotate burns time/position/speed);
            --camera both-prio-* composites the other camera picture-in-
-           picture; --continuous renders the whole boot-to-shutdown
-           timeline with black "No Signal" filler and health-log overlays
+           picture. Always a re-encode — near-transparent x264 settings
   gpx      GPX 1.0 track (native <speed>, m/s) from the session NMEA log
 
 The health log (/data/health/<session>/<session>.log, written by
-dashberry-panel — format in IMPL.md) is what makes --continuous honest:
-its first/last records bound the session, its gps/gpsfix records become
+dashberry-panel — format in IMPL.md) is what makes render honest: its
+first/last records bound the session, its gps/gpsfix records become
 "GPS Error" / "GPS No Signal" overlays, and its event records are the
 button-B markers. Sessions predating the health log degrade gracefully
 (footage evidence bounds the timeline, fix holes stand in for NOFIX).
@@ -364,37 +365,6 @@ def cmd_catalog(args):
 
 # ---------------------------------------------------------------- render --
 
-def select_segments(data, args):
-    segs = segments(data, args.drive, args.camera)
-    if not segs:
-        die("no %s segments for drive %s" % (args.camera, args.drive))
-    start0 = drive_start(data, args.drive)
-    # absolute epochs of the requested window (relative to drive start)
-    lo = start0 + parse_hms(getattr(args, "from")) if getattr(args, "from") else None
-    hi = start0 + parse_hms(args.to) if args.to else None
-    picked = []
-    for path, mtime in segs:
-        dur = ffprobe_duration(path)
-        seg_start = mtime - dur       # mtime = segment END (see module doc)
-        seg_end = mtime
-        if lo is not None and seg_end <= lo:
-            continue
-        if hi is not None and seg_start >= hi:
-            continue
-        picked.append((path, seg_start, dur))
-    if not picked:
-        die("no segments overlap the requested range")
-    return picked, start0
-
-
-def write_concat_list(picked, tmpdir):
-    lst = os.path.join(tmpdir, "concat.txt")
-    with open(lst, "w") as f:
-        for path, _, _ in picked:
-            f.write("file '%s'\n" % os.path.abspath(path).replace("'", r"'\''"))
-    return lst
-
-
 ASS_HEADER = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1280
@@ -417,27 +387,6 @@ def ass_time(t):
                                   (cs // 100) % 60, cs % 100)
 
 
-def write_ass(fixes, clip_start, clip_end, display_shift, units, tmpdir):
-    """One event per GPS epoch: wall time · lat,lon · speed."""
-    factor, label = ((KNOTS_TO_KMH, "KMH") if units == "KMH"
-                     else (KNOTS_TO_MPH, "MPH"))
-    path = os.path.join(tmpdir, "overlay.ass")
-    sel = [f for f in fixes if clip_start - 1 <= f[0] <= clip_end + 1]
-    with open(path, "w") as f:
-        f.write(ASS_HEADER)
-        for i, (t, lat, lon, knots) in enumerate(sel):
-            start = t - clip_start
-            end = (sel[i + 1][0] - clip_start) if i + 1 < len(sel) else start + 0.5
-            shown = dt.datetime.fromtimestamp(t + display_shift,
-                                              dt.timezone.utc)
-            text = "%s  %.5f,%.5f  %d %s" % (
-                shown.strftime("%Y-%m-%d %H:%M:%S"), lat, lon,
-                int(knots * factor + 0.5), label)
-            f.write("Dialogue: 0,%s,%s,gps,%s\n"
-                    % (ass_time(start), ass_time(end), text))
-    return path
-
-
 def display_shift_secs(args, start0):
     """anchor: assert the drive's true wall-clock start (repairs wrong-RTC
     drives); tz-offset: constant local-time offset. Both display-only."""
@@ -457,14 +406,15 @@ def display_shift_secs(args, start0):
     return shift
 
 
-# ------------------------------------------------- render: timeline mode --
-# Used for --continuous and for --camera both-prio-* (PiP needs the two
-# cameras on one absolute clock, so it is timeline-based even without
-# --continuous). Wall-clock timeline covered piece by piece: real segments
-# (trimmed to the window — sub-second exact, unlike the whole-segment
-# stream-copy path) alternating with generated black filler; --continuous
-# extends the timeline to the health log's boot..last-heartbeat span and
-# labels filler "No Signal" / GPS trouble "GPS Error"/"GPS No Signal".
+# ------------------------------------------------- render: the timeline --
+# Every render is the continuous boot-to-shutdown timeline (the lossless
+# whole-segment stream-copy path was dropped with the flag that gated it):
+# the health log's boot..last-heartbeat span (fallback: footage/fix
+# evidence), covered piece by piece per camera — real segments trimmed to
+# the window (sub-second exact) alternating with generated black
+# "No Signal" filler — and GPS trouble labeled "GPS Error"/"GPS No
+# Signal". Always a re-encode; near-transparent x264 settings (CRF 18)
+# keep the loss on 2 Mbps dashcam source visually negligible.
 
 def cam_segments_abs(data, session, cam):
     """Sorted [(path, start_epoch, duration)]; start = mtime - duration
@@ -502,12 +452,12 @@ def timeline_pieces(segs, lo, hi):
     return pieces
 
 
-def build_timeline_filter(pieces, idx0, w, h, label, no_signal):
+def build_timeline_filter(pieces, idx0, w, h, label):
     """One camera's pieces -> (ffmpeg input args, filter lines, next input
     index). Real segments become file inputs starting at index idx0; gaps
-    are lavfi color sources generated inside the graph (drawtext uses the
-    fontconfig default font). Everything is normalized to w×h @
-    TIMELINE_FPS yuv420p so the final concat cannot mismatch."""
+    are "No Signal" lavfi color sources generated inside the graph
+    (drawtext uses the fontconfig default font). Everything is normalized
+    to w×h @ TIMELINE_FPS yuv420p so the final concat cannot mismatch."""
     inputs, lines, parts = [], [], []
     i = idx0
     for k, piece in enumerate(pieces):
@@ -522,10 +472,9 @@ def build_timeline_filter(pieces, idx0, w, h, label, no_signal):
             i += 1
         else:
             src = ("color=black:size=%dx%d:rate=%d:duration=%.3f"
-                   % (w, h, TIMELINE_FPS, piece[1]))
-            if no_signal:
-                src += (",drawtext=text='No Signal':fontcolor=white:"
-                        "fontsize=%d:x=(w-text_w)/2:y=(h-text_h)/2" % (h // 9))
+                   ",drawtext=text='No Signal':fontcolor=white:"
+                   "fontsize=%d:x=(w-text_w)/2:y=(h-text_h)/2"
+                   % (w, h, TIMELINE_FPS, piece[1], h // 9))
             lines.append(src + ",format=yuv420p[%s]" % out)
         parts.append("[%s]" % out)
     lines.append("%sconcat=n=%d:v=1:a=0[%s]"
@@ -586,7 +535,7 @@ def write_timeline_ass(fixes, health, lo, hi, shift, units, annotate, tmpdir):
     return path
 
 
-def render_timeline(args):
+def cmd_render(args):
     data, session = args.data, args.drive
     both = args.camera.startswith("both-")
     if both:
@@ -603,16 +552,14 @@ def render_timeline(args):
     # boot..last-heartbeat is the "system boot to shutdown" span)
     starts = [s[0][1] for s in segs.values() if s]
     ends = [s[-1][1] + s[-1][2] for s in segs.values() if s]
-    if args.continuous:
-        if fixes:
-            starts.append(fixes[0][0])
-            ends.append(fixes[-1][0])
-        if health:
-            starts.append(health["start"])
-            ends.append(health["end"])
+    if fixes:
+        starts.append(fixes[0][0])
+        ends.append(fixes[-1][0])
+    if health:
+        starts.append(health["start"])
+        ends.append(health["end"])
     if not starts:
-        die("no footage%s for drive %s"
-            % ("/health evidence" if args.continuous else "", session))
+        die("no footage/health evidence for drive %s" % session)
     t0, t1 = min(starts), max(ends)
 
     lo = t0 + parse_hms(getattr(args, "from")) if getattr(args, "from") else t0
@@ -634,8 +581,7 @@ def render_timeline(args):
         if not pieces:              # window inside an absorbed sliver
             pieces = [("gap", hi - lo)]
         n_fill += sum(1 for p in pieces if p[0] == "gap")
-        ins, lines, idx = build_timeline_filter(
-            pieces, idx, w, h, cam, args.continuous)
+        ins, lines, idx = build_timeline_filter(pieces, idx, w, h, cam)
         input_args += ins
         filter_lines += lines
 
@@ -653,19 +599,21 @@ def render_timeline(args):
         vid = cams[0]
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        if args.annotate or args.continuous:
-            shift = display_shift_secs(args, t0)
-            ass = write_timeline_ass(fixes, health, lo, hi, shift,
-                                     args.units, args.annotate, tmpdir)
-            if ass:
-                filter_lines.append("[%s]ass=%s[outv]" % (vid, ass))
-                vid = "outv"
+        shift = display_shift_secs(args, t0)
+        ass = write_timeline_ass(fixes, health, lo, hi, shift,
+                                 args.units, args.annotate, tmpdir)
+        if ass:
+            filter_lines.append("[%s]ass=%s[outv]" % (vid, ass))
+            vid = "outv"
         script = os.path.join(tmpdir, "filter.txt")
         with open(script, "w") as f:
             f.write(";\n".join(filter_lines))
+        # CRF 18 = x264's visually-lossless neighborhood — generous next
+        # to the ~2 Mbps hardware-encoded source, so the mandatory
+        # re-encode costs no quality a viewer can see.
         cmd = (["ffmpeg", "-hide_banner", "-y"] + input_args +
                ["-filter_complex_script", script, "-map", "[%s]" % vid,
-                "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+                "-c:v", "libx264", "-preset", "medium", "-crf", "18",
                 "-an", args.output])
         try:
             subprocess.run(cmd, check=True)
@@ -675,38 +623,6 @@ def render_timeline(args):
             die("ffmpeg failed (%d)" % e.returncode)
     print("wrote %s (%s span %s, %d segments, %d filler pieces)"
           % (args.output, args.camera, fmt_span(hi - lo), idx, n_fill))
-
-
-def cmd_render(args):
-    if args.continuous or args.camera.startswith("both-"):
-        return render_timeline(args)
-    picked, start0 = select_segments(args.data, args)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        lst = write_concat_list(picked, tmpdir)
-        if not args.annotate:
-            # lossless: concat-demuxer stream copy of the segment range
-            cmd = ["ffmpeg", "-hide_banner", "-y", "-f", "concat", "-safe",
-                   "0", "-i", lst, "-c", "copy", args.output]
-        else:
-            fixes = parse_rmc(nmea_path(args.data, args.drive))
-            if not fixes:
-                die("--annotate needs an NMEA log with RMC fixes")
-            clip_start = picked[0][1]
-            clip_end = picked[-1][1] + picked[-1][2]
-            shift = display_shift_secs(args, start0)
-            ass = write_ass(fixes, clip_start, clip_end, shift, args.units,
-                            tmpdir)
-            # annotation burns in -> re-encode (accepted; PLAN §3c)
-            cmd = ["ffmpeg", "-hide_banner", "-y", "-f", "concat", "-safe",
-                   "0", "-i", lst, "-vf", "ass=%s" % ass, "-c:v", "libx264",
-                   "-preset", "medium", "-crf", "23", "-an", args.output]
-        try:
-            subprocess.run(cmd, check=True)
-        except FileNotFoundError:
-            die("ffmpeg not found")
-        except subprocess.CalledProcessError as e:
-            die("ffmpeg failed (%d)" % e.returncode)
-    print("wrote %s (%d segments)" % (args.output, len(picked)))
 
 
 # ------------------------------------------------------------------- gpx --
@@ -780,21 +696,22 @@ def main():
     pc.add_argument("--units", choices=["MPH", "KMH"], default="MPH",
                     help="verbose speed/distance units (default MPH)")
 
-    pr = sub.add_parser("render", help="produce a video file from one drive")
+    pr = sub.add_parser(
+        "render",
+        help="produce a video file from one drive",
+        description="Renders the continuous boot-to-shutdown timeline: "
+                    "footage holes become black 'No Signal' filler and GPS "
+                    "trouble is labeled from the session health log. "
+                    "--from/--to count from boot.")
     pr.add_argument("--drive", required=True, metavar="SESSION")
     pr.add_argument("--camera", required=True,
                     choices=["front", "rear",
                              "both-prio-front", "both-prio-rear"],
                     help="both-prio-* composites both cameras: the prio "
                          "camera full-frame, the other picture-in-picture "
-                         "top-right (re-encode)")
+                         "top-right")
     pr.add_argument("--annotate", action="store_true",
-                    help="burn time/position/speed into the image (re-encode)")
-    pr.add_argument("--continuous", action="store_true",
-                    help="render the full boot-to-shutdown timeline: footage "
-                         "holes become black 'No Signal' filler and GPS "
-                         "trouble is labeled from the session health log "
-                         "(re-encode; --from/--to then count from boot)")
+                    help="burn time/position/speed into the image")
     pr.add_argument("--units", choices=["MPH", "KMH"], default="MPH",
                     help="annotation speed units (default MPH)")
     add_range_opts(pr)

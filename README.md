@@ -158,7 +158,10 @@ one *drive*.
 # list drives: start, duration, segment counts, GPS coverage
 cli/dashberry-cli --data ~/dashcam-copy catalog
 
-# cut a clip (lossless stream copy; --annotate burns time/position/speed)
+# render a clip — the continuous boot-to-shutdown timeline: footage holes
+# show "No Signal", GPS trouble is labeled from the health log; --annotate
+# burns time/position/speed; --camera both-prio-front adds the rear camera
+# picture-in-picture (near-transparent re-encode; --from/--to count from boot)
 cli/dashberry-cli --data ~/dashcam-copy render \
     --drive 20260721-1830-0042 --camera front \
     --from 00:12:00 --to 00:14:30 --annotate -o incident.mp4
