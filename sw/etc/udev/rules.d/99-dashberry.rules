@@ -5,3 +5,9 @@
 # product string "Piwebcam"; adjust ATTRS below to whatever your build reports.
 # The index match keeps the symlink on the capture node (UVC exposes two).
 SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0104", ATTR{index}=="0", SYMLINK+="rear-cam"
+
+# Boot spinner: start the OLED placeholder the moment the display's
+# framebuffer registers (fb number is probe order — match the driver name,
+# same rule as the panel's fb_resolve()). panel.service stops it later via
+# Conflicts=.
+SUBSYSTEM=="graphics", KERNEL=="fb[0-9]*", ATTR{name}=="ssd130x*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="spinner.service"

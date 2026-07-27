@@ -13,24 +13,27 @@ dtparam=i2c_arm=on,i2c_arm_baudrate=400000
 # --- DS3231 RTC ---
 dtoverlay=i2c-rtc,ds3231
 
-# --- 128x64 OLED Bonnet (#3531): SSD1306 at 0x3C, mainline ssd1307fb driver
-# exposes it as /dev/fbN — the number is probe order (fb0 on the bench, not
-# the fb1 the plan assumed), so the panel resolves it by driver name via
-# /sys/class/graphics/fb*/name. Overlay defaults are already 0x3C/128x64 —
-# pass no extra params. VERIFY on bench: i2cdetect shows 0x3c+0x68, dmesg
-# clean of I2C errors over the 50 cm ribbon at 400 kHz. ---
-dtoverlay=ssd1306
+# --- 128x64 OLED Bonnet (#3531): SSD1306 at 0x3C, Trixie binds the DRM
+# ssd130x driver which exposes it as /dev/fbN — the number is probe order
+# (fb0 on the bench, not the fb1 the plan assumed), so the panel resolves it
+# by driver name via /sys/class/graphics/fb*/name. "inverted" is required
+# (SETTLED on bench: without it everything renders mirrored): it sets
+# solomon,com-invdir, giving the COM-scan direction (0xC8) the bonnet is
+# built for; the overlay's base node sets no orientation properties and the
+# driver's segment-remap-on default (0xA1) covers the other axis. VERIFY on
+# bench: dmesg clean of I2C errors over the ribbon at 400 kHz. ---
+dtoverlay=ssd1306,inverted
 
 # --- no HDMI/audio needed headless; trims boot + power ---
 dtoverlay=vc4-kms-v3d
 disable_splash=1
 
 # ---------------------------------------------------------------
-# cmdline.txt notes (rev 6):
-#  - fbcon must stay OFF the OLED framebuffer. On a headless boot the OLED
-#    can be fb0 (seen on bench), which is fbcon's default target. VERIFY on
-#    bench: check `cat /sys/class/graphics/fb*/name`, then `con2fbmap 1` /
-#    garbage on the OLED; mitigation: fbcon=map:N pointing at a non-OLED fb
-#    (or vc4's fb if one exists).
+# cmdline.txt notes:
+#  - `fbcon=map:9` is appended by dashberry-install (SETTLED on bench: the
+#    OLED enumerates as fb0, fbcon's default target — boot tty text and a
+#    blinking cursor land on the panel otherwise). fb9 never exists, so
+#    fbcon binds nothing, on any probe order; the OLED's only writers are
+#    spinner.service (from udev fb-add) and the panel (Conflicts= handoff).
 #  - No consoleblank needed: the panel blanks itself (AUTO-BLANK, PLAN §3b).
 # ---------------------------------------------------------------

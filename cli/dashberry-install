@@ -98,7 +98,7 @@ case $ROOT_GIB in *[!0-9]*|'') die "--root-size requires a whole number of GiB" 
 # 8 GiB OS means a 16 GB card in practice.
 MIN_DEV_BYTES=$((512 * 1024 * 1024 + ROOT_GIB * 1024 * 1024 * 1024 + MIN_DATA_BYTES))
 if [ "$DEBUG" = 1 ]; then
-    case $USERSPEC in *:*) ;; *) die "--debug requires NAME:PASS (the ssh login)" ;; esac
+    case $USERSPEC in *:*) ;; *) die "--debug requires NAME:PASS)" ;; esac
     need openssl
 fi
 if [ -n "$WIFISPEC" ]; then
@@ -111,7 +111,7 @@ if [ -n "$WIFISPEC" ]; then
         die "--wifi PSK must be a 8-63 char passphrase or 64 hex digits"
     [ -n "$WIFI_CC" ] || \
         die "--wifi needs --wifi-country CC"
-    case $WIFI_CC in [A-Za-z][A-Za-z]) ;; *) die "--wifi-country wants a two-letter code" ;; esac
+    case $WIFI_CC in [A-Za-z][A-Za-z]) ;; *) die "--wifi-country requires a two-letter code" ;; esac
     WIFI_CC=$(printf '%s' "$WIFI_CC" | tr '[:lower:]' '[:upper:]')
     FIRSTBOOT_WIFI=1
 elif [ -n "$WIFI_CC" ]; then
@@ -168,17 +168,17 @@ echo
 echo "    image : $IMG"
 echo "    layout: boot | OS ${ROOT_GIB} GiB$( [ $DEBUG = 0 ] && echo ' (read-only)' ) | /data"
 if [ "$DEBUG" = 1 ]; then
-    echo "    mode  : DEBUG — writable OS, ssh user '${USERSPEC%%:*}', journal kept"
+    echo "    mode  : debug"
 else
-    echo "    mode  : PRODUCTION — read-only OS, no user, no ssh (sealed)"
+    echo "    mode  : production"
 fi
 [ "$BYPASS_TIME" = 1 ] && echo "    bypass: TIME"
 [ "$BYPASS_REAR" = 1 ] && echo "    bypass: REAR"
 if [ "$FIRSTBOOT_WIFI" = 1 ]; then
     if [ "$DEBUG" = 1 ]; then
-        echo "    wifi  : '$WIFI_SSID' ($WIFI_CC) (kept — debug card)"
+        echo "    wifi  : '$WIFI_SSID' ($WIFI_CC)"
     else
-        echo "    wifi  : '$WIFI_SSID' ($WIFI_CC) (first boot only, then wiped)"
+        echo "    wifi  : '$WIFI_SSID' ($WIFI_CC)"
     fi
 fi
 echo
@@ -322,6 +322,14 @@ fi
     echo "# ===== DashBerry (added by dashberry-install) ====="
     printf '%s\n' "$snippet"
 } >> "$BOOTDIR/config.txt"
+
+info "Keeping fbcon off the OLED (cmdline fbcon=map:9)..."
+# The OLED enumerates as fb0 on a headless boot — fbcon's default target —
+# so the console would paint boot text and a blinking cursor over the
+# panel. fb9 never exists, so fbcon binds nothing regardless of probe
+# order. cmdline.txt is a single line — append to it, don't add a second.
+[ -f "$BOOTDIR/cmdline.txt" ] || die "No cmdline.txt on the boot partition"
+sed -i '1s/$/ fbcon=map:9/' "$BOOTDIR/cmdline.txt"
 
 info "Staging sw/ payload and first-boot installer..."
 mkdir -p "$MNT/opt/dashberry"

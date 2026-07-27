@@ -4,8 +4,10 @@
  * owns everything §3b demands a single owner for:
  *   - all seven bonnet inputs (joystick + buttons A/B) via the GPIO
  *     character-device v2 API, with strict wake-key absorption;
- *   - PAGE 0 / PAGE 1 rendering to the ssd1307fb framebuffer (1 bpp mmap;
- *     resolved by driver name at startup — fb number is probe order);
+ *   - PAGE 0 / PAGE 1 rendering to the OLED framebuffer, resolved by driver
+ *     name at startup (fb number is probe order) and rendered per its
+ *     reported format: 1 bpp (fbdev ssd1307fb) or 32 bpp XRGB8888 (DRM
+ *     ssd130x fbdev emulation — what Trixie's kernel binds);
  *   - AUTO-BLANK (10 s, OK state only);
  *   - health evaluation from real signals (segments growing, NMEA flowing,
  *     RTC readable, /data writable-with-space);
@@ -27,6 +29,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -89,7 +92,7 @@ static int      fb_fd = -1;
 static uint8_t *fbmem;
 static size_t   fb_size;        /* mapped length */
 static size_t   fb_screen;      /* yres * line_length, what we clear */
-static uint32_t fb_xres, fb_yres, fb_line;
+static uint32_t fb_xres, fb_yres, fb_line, fb_bpp;
 
 /* ------------------------------------------------------------ utilities - */
 
@@ -323,10 +326,11 @@ static int fb_init(void)
     fb_xres = vi.xres;
     fb_yres = vi.yres;
     fb_line = fi.line_length;
-    if (vi.bits_per_pixel != 1)
+    fb_bpp  = vi.bits_per_pixel;
+    if (fb_bpp != 1 && fb_bpp != 32)
         fprintf(stderr, "dashberry-panel: warning: %s is %u bpp, expected "
-                "1 bpp (ssd1307fb) — rendering will be wrong\n",
-                fb_dev, vi.bits_per_pixel);
+                "1 (ssd1307fb) or 32 (ssd130x fbdev emulation) — rendering "
+                "will be wrong\n", fb_dev, fb_bpp);
     fb_size = fi.smem_len;
     fb_screen = (size_t)fb_yres * fb_line;
     if (fb_screen > fb_size)
@@ -345,6 +349,15 @@ static void putpixel(int x, int y, int on)
 {
     if (x < 0 || y < 0 || (uint32_t)x >= fb_xres || (uint32_t)y >= fb_yres)
         return;                    /* clips the ±1 px burn-in shift rows */
+    if (fb_bpp == 32) {
+        /* DRM ssd130x fbdev emulation (Trixie): XRGB8888 shadow buffer the
+         * driver thresholds to mono on flush. memcpy — the mmap may not be
+         * 4-aligned per row on other emulated fbs, and this is cold code. */
+        uint32_t px = on ? 0x00FFFFFFu : 0x00000000u;
+        memcpy(fbmem + (size_t)y * fb_line + (size_t)x * 4, &px, 4);
+        return;
+    }
+    /* 1 bpp ssd1307fb path */
     uint8_t *p = fbmem + (size_t)y * fb_line + (x >> 3);
 #if FB_MSB_LEFT
     uint8_t bit = (uint8_t)(0x80u >> (x & 7));
@@ -822,6 +835,64 @@ static void render(const struct frame *f)
                      f->glyph == 'S' ? glyph_shield : glyph_wireless, f->yoff);
 }
 
+/* -------------------------------------------------------------- spinner - */
+
+/* --spinner: boot placeholder. spinner.service (pulled in by udev the
+ * moment the ssd130x framebuffer registers) runs this until panel.service
+ * starts and Conflicts= it away — with fbcon mapped off the OLED
+ * (cmdline fbcon=map:9) these two are the display's only writers ever.
+ * A 12-position ring with a 3-dot tail stepping clockwise at 10 Hz;
+ * SIGTERM clears the screen so the panel inherits a dark display. */
+
+static volatile sig_atomic_t spin_stop;
+
+static void spin_on_term(int sig)
+{
+    (void)sig;
+    spin_stop = 1;
+}
+
+static int spinner_main(void)
+{
+    /* Ring of 12 clock positions, radius 14 px: round(14*sin/cos(k*30°)),
+     * k = 0 at 12 o'clock, clockwise. Tables — no libm. */
+    static const int8_t ring_x[12] = {   0,   7,  12,  14,  12,   7,
+                                         0,  -7, -12, -14, -12,  -7 };
+    static const int8_t ring_y[12] = { -14, -12,  -7,   0,   7,  12,
+                                        14,  12,   7,   0,  -7, -12 };
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = spin_on_term;   /* no SA_RESTART: must wake nanosleep */
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
+    if (fb_init() < 0)
+        return 1;
+    /* First writer after boot: commit the modeset that powers the panel on
+     * (DRM ssd130x sends its init sequence only at pipe enable). */
+    ioctl(fb_fd, FBIOBLANK, FB_BLANK_UNBLANK);
+
+    int cx = (int)fb_xres / 2, cy = (int)fb_yres / 2;
+    int step = 0;
+    const struct timespec frame = { 0, 100000000L };   /* 10 Hz */
+    while (!spin_stop) {
+        memset(fbmem, 0, fb_screen);
+        for (int t = 0; t < 3; t++) {          /* head + 2 trailing dots */
+            int k = (step + 12 - t) % 12;
+            int x = cx + ring_x[k], y = cy + ring_y[k];
+            int lo = t ? 0 : -1, hi = t == 2 ? 0 : 1;   /* 3x3, 2x2, 1x1 */
+            for (int dy = lo; dy <= hi; dy++)
+                for (int dx = lo; dx <= hi; dx++)
+                    putpixel(x + dx, y + dy, 1);
+        }
+        step = (step + 1) % 12;
+        nanosleep(&frame, NULL);
+    }
+    memset(fbmem, 0, fb_screen);    /* hand the panel a dark screen */
+    return 0;
+}
+
 /* ----------------------------------------------------------------- GPIO - */
 
 static int gpio_init(void)
@@ -861,8 +932,11 @@ static int gpio_init(void)
 
 /* ----------------------------------------------------------------- main - */
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc > 1 && strcmp(argv[1], "--spinner") == 0)
+        return spinner_main();
+
     load_conf();
     if (fb_init() < 0)
         return 1;
