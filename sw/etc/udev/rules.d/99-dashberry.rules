@@ -5,3 +5,14 @@
 # product string "Piwebcam"; adjust ATTRS below to whatever your build reports.
 # The index match keeps the symlink on the capture node (UVC exposes two).
 SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0104", ATTR{index}=="0", SYMLINK+="rear-cam"
+
+# Stable name for the u-blox GPS puck. A replug re-enumerates ttyACM0 ->
+# ttyACM1, so the raw node must never be pinned anywhere — GPS_DEV in
+# dashberry.conf (and through it /etc/default/gpsd) points at this symlink.
+# Vendor-only match: u-blox generations differ in idProduct (7=01a7, 8=01a8,
+# 9=01a9) but all share idVendor 1546.
+# VERIFY on bench: udevadm info -a /dev/ttyACM0 | grep -i idVendor
+# The systemd tag + Wants starts gps-readd.service on every enumeration —
+# it re-asserts 5 Hz and rejoins a running gpsd after a replug (and exits
+# early at boot, where gps-rate.service and gpsd's static DEVICES take over).
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1546", SYMLINK+="gps0", TAG+="systemd", ENV{SYSTEMD_WANTS}="gps-readd.service"

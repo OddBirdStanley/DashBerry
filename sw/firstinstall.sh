@@ -84,14 +84,18 @@ install -m 644 etc/systemd/system/* /etc/systemd/system/
 install -m 644 etc/udev/rules.d/99-dashberry.rules /etc/udev/rules.d/
 install -D -m 644 etc/chrony/conf.d/gps-refclock.conf /etc/chrony/conf.d/gps-refclock.conf
 
-echo "configuring gpsd ($GPS_DEV, static, no hotplug)..."
+echo "configuring gpsd ($GPS_DEV, static, guarded hotplug)..."
 # Debian's default gpsd setup adds the device via udev hotplug: udev fires
 # gpsdctl@ttyACM0, which races gpsd.socket at boot — if /run/gpsd.sock isn't
 # up yet, gpsdctl launches its own gpsd, which then loses the bind on port
 # 2947 to the socket unit and dies ("can't bind to IPv4 port gpsd, Address
 # already in use"). The device never registers and gpsd runs with no GPS.
-# The puck is permanently attached, so hotplug buys nothing: pin DEVICES,
-# turn USBAUTO off, and mask gpsdctl@ so the racing path can't run at all.
+# So: pin DEVICES, turn USBAUTO off, and mask gpsdctl@ so the racing path
+# can't run at all. Replug (and late enumeration) is instead handled by our
+# own gps-readd.service — udev-started via 99-dashberry.rules, and it only
+# calls gpsdctl against a gpsd that is already running, so the race can't
+# come back. GPS_DEV is the udev symlink /dev/gps0, never the raw ttyACMx
+# node: a replug re-enumerates ttyACM0 -> ttyACM1.
 # -n: open the device without waiting for a client, so chrony's SHM refclock
 # gets fixes even if gps-log is down.
 cat > /etc/default/gpsd <<EOF
@@ -139,6 +143,11 @@ mkdir -p /data/front /data/rear /data/gps
 echo "enabling units..."
 systemctl daemon-reload
 udevadm control --reload
+# Reload alone doesn't re-run rules for devices that already enumerated —
+# without the trigger, /dev/gps0 (and /dev/rear-cam) would only appear on
+# the next reboot, and gpsd's DEVICES= would point at nothing until then.
+udevadm trigger --action=add --subsystem-match=tty --subsystem-match=video4linux
+udevadm settle
 enable_units="dashberry.target session.service \
     gps-rate.service front-rec.service gps-log.service panel.service \
     retention.timer"

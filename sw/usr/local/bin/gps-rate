@@ -15,9 +15,10 @@
 # Full frame: B5 62 06 08 06 00 C8 00 01 00 01 00 DE 6A
 #
 # VERIFY (bench): confirm 5 Hz NMEA cadence after a COLD power cycle (count
-# RMC sentences per second with gpspipe -r); if the puck enumerates later
-# than this unit runs, the rate silently stays 1 Hz — panel still shows GPS
-# OK, so check cadence explicitly.
+# RMC sentences per second with gpspipe -r). A puck that enumerates later
+# than this unit runs is caught by gps-readd (udev-started on every
+# enumeration), which re-runs this script — but the panel shows GPS OK at
+# 1 Hz too, so check cadence explicitly anyway.
 set -eu
 . /etc/dashberry.conf
 

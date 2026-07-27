@@ -1,0 +1,11 @@
+[Unit]
+Description=GPS puck hotplug re-add (5 Hz rate + gpsdctl add after replug)
+# Started by udev (SYSTEMD_WANTS in 99-dashberry.rules), not by the target —
+# no [Install] section on purpose. At boot, run after the oneshot rate setter
+# so two writers never interleave UBX frames on the port; After= is ordering
+# only, so a replug long after boot starts this unit alone.
+After=gps-rate.service gpsd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gps-readd

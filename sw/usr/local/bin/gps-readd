@@ -1,0 +1,33 @@
+#!/bin/sh
+# gps-readd — rejoin a (re)enumerated GPS puck to the running system.
+# udev starts this (SYSTEMD_WANTS in 99-dashberry.rules) every time a u-blox
+# tty appears. Two jobs, both no-ops at normal boot:
+#   1. re-assert the 5 Hz UBX rate: a replug power-cycles the puck, and the
+#      setting lives only in its battery-backed RAM — a cold module comes
+#      back at 1 Hz;
+#   2. hand the device back to gpsd: USBAUTO is off and gpsdctl@ is masked
+#      (firstinstall.sh — the hotplug path raced gpsd.socket at boot), so
+#      nothing else re-adds a device gpsd lost on unplug.
+# The boot race stays dead because gpsdctl is only ever invoked here against
+# a gpsd that systemd reports as already running — it can never spawn a
+# competing daemon of its own.
+set -eu
+. /etc/dashberry.conf
+
+if [ ! -c "$GPS_DEV" ]; then
+    echo "gps-readd: $GPS_DEV absent (spurious event or already unplugged again)"
+    exit 0
+fi
+
+# Port is free right now: gpsd dropped the device on unplug (or, at boot,
+# hasn't claimed it yet), so the UBX write cannot collide with a claim.
+# After=gps-rate.service in the unit serializes against the boot-time writer.
+/usr/local/bin/gps-rate
+
+if systemctl is-active --quiet gpsd.service; then
+    gpsdctl add "$GPS_DEV" \
+        || echo "gps-readd: gpsdctl add $GPS_DEV failed (already registered?)" >&2
+    echo "gps-readd: re-added $GPS_DEV to gpsd"
+else
+    echo "gps-readd: gpsd not running — boot path (static DEVICES) will claim $GPS_DEV"
+fi
