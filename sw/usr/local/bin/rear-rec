@@ -22,6 +22,10 @@ START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.mp4$/ { if ($1 + 1 > s)
 # bitrate/period set via extra-controls and an explicit level in caps —
 # names below are the bookworm-era ones; confirm on trixie (kernel 6.12)
 # with `v4l2-ctl -d /dev/video11 -L`.
+# muxer= / sink= (not muxer-properties, which splitmuxsink silently ignores
+# unless async-finalize=true — the fragment-duration was never applied through
+# it): fragmented MP4 for power-cut recovery, unbuffered filesink so completed
+# fragments reach the card instead of dying in a 64 KB stdio buffer.
 gst-launch-1.0 -e v4l2src device="$REAR_CAM_DEV" \
     ! "image/jpeg,width=$REAR_W,height=$REAR_H,framerate=$REAR_FPS/1" \
     ! v4l2jpegdec \
@@ -31,4 +35,5 @@ gst-launch-1.0 -e v4l2src device="$REAR_CAM_DEV" \
     ! splitmuxsink location="$OUT/%05d.mp4" \
         start-index="$START_INDEX" \
         max-size-time="$SEGMENT_NS" \
-        muxer-properties="properties,fragment-duration=$FRAGMENT_MS"
+        muxer="mp4mux fragment-duration=$FRAGMENT_MS" \
+        sink="filesink buffer-mode=unbuffered"

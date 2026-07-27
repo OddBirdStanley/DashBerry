@@ -69,8 +69,11 @@ until apt-get update; do
     fi
     sleep 15
 done
+# Full rpicam-apps (not -lite): front-rec needs the libav encoder wrapper
+# (--codec libav --libav-format mpegts) so PTS/DTS travel in-band down the
+# pipe — the lite build is compiled without libav.
 apt-get install -y --no-install-recommends \
-    rpicam-apps-lite gstreamer1.0-tools gstreamer1.0-plugins-good \
+    rpicam-apps gstreamer1.0-tools gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad gpsd gpsd-clients chrony gcc make
 
 echo "building panel daemon..."
