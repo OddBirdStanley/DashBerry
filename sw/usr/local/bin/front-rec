@@ -13,9 +13,13 @@ mkdir -p "$OUT"
 
 # Restart-in-same-session: resume the %05d counter one past the highest
 # existing segment so filenames never collide (splitmuxsink start-index).
-# VERIFY on bench: kill/restart mid-session, confirm no overwrite and a
-# clean, gap-free index sequence.
 START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.mp4$/ { if ($1 + 1 > s) s = $1 + 1 } END { print s + 0 }')
+
+# The previous run of THIS session may have died mid-segment (crash restart):
+# that tail file's fragments are fine but its declared duration was never
+# corrected (see below) — recover it from the sample tables before we start.
+TAIL=$(ls "$OUT" 2>/dev/null | grep -E '^[0-9]+\.mp4$' | sort -n | tail -1)
+[ -n "$TAIL" ] && mp4-set-duration "$OUT/$TAIL" scan || true
 
 # Timestamps travel IN-BAND (settled on bench, third iteration): the encoder's
 # own PTS/DTS ride the pipe inside an MPEG-TS container (--codec libav,
@@ -34,15 +38,38 @@ START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.mp4$/ { if ($1 + 1 > s)
 # playable up to its last ~1 s fragment, and the unbuffered filesink makes
 # sure completed fragments actually reach the card instead of dying in a
 # 64 KB stdio buffer.
+#
+# The -m watcher works around a GStreamer 1.26 qtmux bug (bench-verified,
+# exact same build as the Pi): with continuous input running time, each
+# segment's DECLARED duration (mvhd/mehd) is written as the muxer's absolute
+# running time — segment N claims N minutes (VLC trusts the declaration;
+# ffprobe scans and is immune), while tfdt/trun sample data is correct. A
+# fresh muxer per fragment (async-finalize) inherits the same absolute time,
+# so no splitmuxsink config avoids it. Instead: splitmuxsink posts
+# splitmuxsink-fragment-closed with the file's true duration; we patch the
+# boxes the moment each file closes. stdbuf keeps -m line-buffered so the
+# patch happens within the second, not 4 KB of messages later.
 rpicam-vid -t 0 -n \
     --width "$FRONT_W" --height "$FRONT_H" --framerate "$FRONT_FPS" \
     --bitrate "$FRONT_BITRATE" --intra "$FRONT_FPS" \
     --codec libav --libav-format mpegts -o - |
-gst-launch-1.0 -e fdsrc fd=0 \
+stdbuf -oL gst-launch-1.0 -e -m fdsrc fd=0 \
     ! tsdemux \
     ! h264parse \
     ! splitmuxsink location="$OUT/%05d.mp4" \
         start-index="$START_INDEX" \
         max-size-time="$SEGMENT_NS" \
         muxer="mp4mux fragment-duration=$FRAGMENT_MS" \
-        sink="filesink buffer-mode=unbuffered"
+        sink="filesink buffer-mode=unbuffered" |
+while IFS= read -r line; do
+    case $line in
+    *splitmuxsink-fragment-closed*)
+        loc=${line#*"location=(string)"}; loc=${loc%%,*}
+        dur=${line#*"fragment-duration=(guint64)"}; dur=${dur%%[!0-9]*}
+        mp4-set-duration "$loc" "$dur" || echo "mp4-set-duration failed: $loc" >&2
+        ;;
+    esac
+done
+# The watcher only ends when gst-launch died (EOS/EOF): report failure so
+# systemd restarts us — a clean stop SIGTERMs the whole group before this.
+exit 1

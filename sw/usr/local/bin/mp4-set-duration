@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""mp4-set-duration FILE DURATION_NS — rewrite a finished DashBerry segment's
+declared duration boxes in place.
+
+Works around a GStreamer 1.26 qtmux bug: in splitmuxsink's continuous-input
+reuse pattern, mvhd/mehd get the muxer's ABSOLUTE running time (time since
+service start) instead of this file's duration — players that trust the
+declared duration (VLC) show segment N as N minutes long. The per-sample
+data (tfdt/trun) is correct; only the declarations are wrong. front-rec and
+rear-rec call this from splitmuxsink's fragment-closed message with the
+authoritative duration.
+
+Walks the box tree properly (no byte-scanning: fourcc strings can occur
+inside mdat payload) and patches: mvhd + mehd (movie level), and tkhd +
+mdhd (every track). Exit 0 on success."""
+import sys, struct, os
+
+
+def boxes(buf, start, end):
+    """Yield (fourcc, header_size, body_start, body_end) for boxes in [start, end)."""
+    off = start
+    while off + 8 <= end:
+        size = struct.unpack_from(">I", buf, off)[0]
+        typ = bytes(buf[off + 4:off + 8])
+        hdr = 8
+        if size == 1:
+            size = struct.unpack_from(">Q", buf, off + 8)[0]
+            hdr = 16
+        elif size == 0:  # to end of enclosing box
+            size = end - off
+        if size < hdr or off + size > end:
+            break  # damaged/truncated tail — stop cleanly
+        yield typ, off, hdr, off + hdr, off + size
+        off += size
+
+
+def full_box(buf, body):
+    version = buf[body]
+    return version, body + 4  # skip version+flags
+
+
+def patch(path, dur_ns):
+    with open(path, "r+b") as f:
+        buf = bytearray(f.read())
+        moov = None
+        for typ, off, hdr, body, end in boxes(buf, 0, len(buf)):
+            if typ == b"moov":
+                moov = (body, end)
+                break
+        if moov is None:
+            raise SystemExit(f"{path}: no moov box")
+
+        writes = []  # (offset, packed bytes)
+
+        def scale(timescale):
+            return dur_ns * timescale // 1_000_000_000
+
+        mvhd_timescale = None
+        for typ, off, hdr, body, end in boxes(buf, *moov):
+            if typ == b"mvhd":
+                ver, p = full_box(buf, body)
+                if ver == 1:
+                    mvhd_timescale = struct.unpack_from(">I", buf, p + 16)[0]
+                    writes.append((p + 20, struct.pack(">Q", scale(mvhd_timescale))))
+                else:
+                    mvhd_timescale = struct.unpack_from(">I", buf, p + 8)[0]
+                    writes.append((p + 12, struct.pack(">I", scale(mvhd_timescale))))
+            elif typ == b"mvex":
+                for t2, o2, h2, b2, e2 in boxes(buf, body, end):
+                    if t2 == b"mehd":
+                        ver, p = full_box(buf, b2)
+                        if ver == 1:
+                            writes.append((p, struct.pack(">Q", scale(mvhd_timescale))))
+                        else:
+                            writes.append((p, struct.pack(">I", scale(mvhd_timescale))))
+            elif typ == b"trak":
+                for t2, o2, h2, b2, e2 in boxes(buf, body, end):
+                    if t2 == b"tkhd":
+                        # tkhd duration is in MOVIE timescale
+                        ver, p = full_box(buf, b2)
+                        if ver == 1:
+                            writes.append((p + 24, struct.pack(">Q", scale(mvhd_timescale))))
+                        else:
+                            writes.append((p + 16, struct.pack(">I", scale(mvhd_timescale))))
+                    elif t2 == b"mdia":
+                        for t3, o3, h3, b3, e3 in boxes(buf, b2, e2):
+                            if t3 == b"mdhd":
+                                ver, p = full_box(buf, b3)
+                                if ver == 1:
+                                    ts = struct.unpack_from(">I", buf, p + 16)[0]
+                                    writes.append((p + 20, struct.pack(">Q", scale(ts))))
+                                else:
+                                    ts = struct.unpack_from(">I", buf, p + 8)[0]
+                                    writes.append((p + 12, struct.pack(">I", scale(ts))))
+
+        if mvhd_timescale is None:
+            raise SystemExit(f"{path}: no mvhd box")
+        for off, data in writes:
+            f.seek(off)
+            f.write(data)
+    return len(writes)
+
+
+def scan_duration_ns(path):
+    """Sum real sample durations from the moof/traf/trun boxes — for files
+    whose fragment-closed message never fired (power cut, SIGKILL)."""
+    with open(path, "rb") as f:
+        buf = f.read()
+    mdhd_timescale = None
+    total = 0  # in mdhd timescale units
+    trex_default = None
+    for typ, off, hdr, body, end in boxes(buf, 0, len(buf)):
+        if typ == b"moov":
+            for t2, o2, h2, b2, e2 in boxes(buf, body, end):
+                if t2 == b"trak":
+                    for t3, o3, h3, b3, e3 in boxes(buf, b2, e2):
+                        if t3 == b"mdia":
+                            for t4, o4, h4, b4, e4 in boxes(buf, b3, e3):
+                                if t4 == b"mdhd" and mdhd_timescale is None:
+                                    ver, p = full_box(buf, b4)
+                                    mdhd_timescale = struct.unpack_from(
+                                        ">I", buf, p + (16 if ver == 1 else 8))[0]
+                elif t2 == b"mvex":
+                    for t3, o3, h3, b3, e3 in boxes(buf, b2, e2):
+                        if t3 == b"trex":
+                            trex_default = struct.unpack_from(">I", buf, b3 + 16)[0]
+        elif typ == b"moof":
+            for t2, o2, h2, b2, e2 in boxes(buf, body, end):
+                if t2 != b"traf":
+                    continue
+                tfhd_default = None
+                for t3, o3, h3, b3, e3 in boxes(buf, b2, e2):
+                    if t3 == b"tfhd":
+                        flags = struct.unpack_from(">I", buf, b3)[0] & 0xFFFFFF
+                        p = b3 + 8  # version/flags + track_ID
+                        if flags & 0x1:
+                            p += 8
+                        if flags & 0x2:
+                            p += 4
+                        if flags & 0x8:
+                            tfhd_default = struct.unpack_from(">I", buf, p)[0]
+                    elif t3 == b"trun":
+                        flags = struct.unpack_from(">I", buf, b3)[0] & 0xFFFFFF
+                        count = struct.unpack_from(">I", buf, b3 + 4)[0]
+                        p = b3 + 8
+                        if flags & 0x1:
+                            p += 4
+                        if flags & 0x4:
+                            p += 4
+                        if flags & 0x100:
+                            step = 4 * (
+                                1 + bool(flags & 0x200) + bool(flags & 0x400)
+                                + bool(flags & 0x800))
+                            for _ in range(count):
+                                if p + 4 > e3:
+                                    break  # truncated trun
+                                total += struct.unpack_from(">I", buf, p)[0]
+                                p += step
+                        else:
+                            dflt = tfhd_default or trex_default or 0
+                            total += count * dflt
+    if not mdhd_timescale or not total:
+        raise SystemExit(f"{path}: nothing to scan (timescale {mdhd_timescale}, total {total})")
+    return total * 1_000_000_000 // mdhd_timescale
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: mp4-set-duration FILE {DURATION_NS|scan}")
+    dur = scan_duration_ns(sys.argv[1]) if sys.argv[2] == "scan" else int(sys.argv[2])
+    n = patch(sys.argv[1], dur)
+    print(f"{os.path.basename(sys.argv[1])}: patched {n} duration fields to {dur / 1e9:.3f}s")
