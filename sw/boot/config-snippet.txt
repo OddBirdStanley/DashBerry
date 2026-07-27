@@ -33,7 +33,7 @@ disable_splash=1
 #  - `fbcon=map:9` is appended by dashberry-install (SETTLED on bench: the
 #    OLED enumerates as fb0, fbcon's default target — boot tty text and a
 #    blinking cursor land on the panel otherwise). fb9 never exists, so
-#    fbcon binds nothing, on any probe order; the OLED's only writers are
-#    spinner.service (from udev fb-add) and the panel (Conflicts= handoff).
+#    fbcon binds nothing, on any probe order; the OLED's only writer is
+#    the panel daemon.
 #  - No consoleblank needed: the panel blanks itself (AUTO-BLANK, PLAN §3b).
 # ---------------------------------------------------------------

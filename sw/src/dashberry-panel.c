@@ -29,7 +29,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -835,64 +834,6 @@ static void render(const struct frame *f)
                      f->glyph == 'S' ? glyph_shield : glyph_wireless, f->yoff);
 }
 
-/* -------------------------------------------------------------- spinner - */
-
-/* --spinner: boot placeholder. spinner.service (pulled in by udev the
- * moment the ssd130x framebuffer registers) runs this until panel.service
- * starts and Conflicts= it away — with fbcon mapped off the OLED
- * (cmdline fbcon=map:9) these two are the display's only writers ever.
- * A 12-position ring with a 3-dot tail stepping clockwise at 10 Hz;
- * SIGTERM clears the screen so the panel inherits a dark display. */
-
-static volatile sig_atomic_t spin_stop;
-
-static void spin_on_term(int sig)
-{
-    (void)sig;
-    spin_stop = 1;
-}
-
-static int spinner_main(void)
-{
-    /* Ring of 12 clock positions, radius 14 px: round(14*sin/cos(k*30°)),
-     * k = 0 at 12 o'clock, clockwise. Tables — no libm. */
-    static const int8_t ring_x[12] = {   0,   7,  12,  14,  12,   7,
-                                         0,  -7, -12, -14, -12,  -7 };
-    static const int8_t ring_y[12] = { -14, -12,  -7,   0,   7,  12,
-                                        14,  12,   7,   0,  -7, -12 };
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = spin_on_term;   /* no SA_RESTART: must wake nanosleep */
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
-
-    if (fb_init() < 0)
-        return 1;
-    /* First writer after boot: commit the modeset that powers the panel on
-     * (DRM ssd130x sends its init sequence only at pipe enable). */
-    ioctl(fb_fd, FBIOBLANK, FB_BLANK_UNBLANK);
-
-    int cx = (int)fb_xres / 2, cy = (int)fb_yres / 2;
-    int step = 0;
-    const struct timespec frame = { 0, 100000000L };   /* 10 Hz */
-    while (!spin_stop) {
-        memset(fbmem, 0, fb_screen);
-        for (int t = 0; t < 3; t++) {          /* head + 2 trailing dots */
-            int k = (step + 12 - t) % 12;
-            int x = cx + ring_x[k], y = cy + ring_y[k];
-            int lo = t ? 0 : -1, hi = t == 2 ? 0 : 1;   /* 3x3, 2x2, 1x1 */
-            for (int dy = lo; dy <= hi; dy++)
-                for (int dx = lo; dx <= hi; dx++)
-                    putpixel(x + dx, y + dy, 1);
-        }
-        step = (step + 1) % 12;
-        nanosleep(&frame, NULL);
-    }
-    memset(fbmem, 0, fb_screen);    /* hand the panel a dark screen */
-    return 0;
-}
-
 /* ----------------------------------------------------------------- GPIO - */
 
 static int gpio_init(void)
@@ -932,11 +873,8 @@ static int gpio_init(void)
 
 /* ----------------------------------------------------------------- main - */
 
-int main(int argc, char **argv)
+int main(void)
 {
-    if (argc > 1 && strcmp(argv[1], "--spinner") == 0)
-        return spinner_main();
-
     load_conf();
     if (fb_init() < 0)
         return 1;
