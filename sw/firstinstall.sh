@@ -93,6 +93,29 @@ if [ "$BYPASS_TIME" = "1" ]; then
     printf 'makestep 1 -1\n' >> /etc/chrony/conf.d/gps-refclock.conf
 fi
 
+echo "fetching accurate time..."
+# This is the last moment the card is guaranteed online: a production card
+# boots read-only with no network, and the GPS refclock ships noselect — so
+# the DS3231 as set HERE is the wall-clock truth for the card's whole life.
+# A fresh (or long-unpowered) DS3231 reads an arbitrary time; nothing else
+# ever corrects it. chronyd has been running since the apt step on the stock
+# Debian pool config (makestep 1 3 → it steps the clock in its first
+# updates); wait for that, then burn the result into the RTC.
+if chronyc waitsync 12 0.5 >/dev/null 2>&1; then
+    if [ "$BYPASS_TIME" = 1 ]; then
+        echo "clock synced: $(date -u '+%F %T') UTC (no RTC to write)"
+    elif hwclock -w; then
+        echo "clock synced: $(date -u '+%F %T') UTC written to the DS3231"
+    else
+        echo "WARNING: NTP synced but writing the DS3231 failed (hwclock -w);" >&2
+        echo "         check the i2c-rtc overlay / wiring before deploying." >&2
+    fi
+else
+    echo "WARNING: no NTP sync after 2 min — system (and RTC) time may be" >&2
+    echo "         wrong. Fix before deploying:" >&2
+    echo "         date -u -s 'YYYY-mm-dd HH:MM:SS' && hwclock -w" >&2
+fi
+
 mkdir -p /data/front /data/rear /data/gps
 
 echo "enabling units..."
