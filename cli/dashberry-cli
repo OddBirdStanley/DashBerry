@@ -9,9 +9,20 @@ may be Python). firstinstall.sh deliberately does not install it.
 Stdlib only; ffmpeg/ffprobe are invoked as subprocesses for all heavy lifting.
 
 Subcommands:
-  catalog  one line per DRIVE (= per-boot session directory)
-  render   cut/concat (optionally GPS-annotated) video from one drive
+  catalog  one line per DRIVE (= per-boot session directory); --verbose adds
+           distance / average / top speed and button-B event markers
+  render   cut/concat (optionally GPS-annotated) video from one drive;
+           --camera both-prio-* composites the other camera picture-in-
+           picture; --continuous renders the whole boot-to-shutdown
+           timeline with black "No Signal" filler and health-log overlays
   gpx      GPX 1.0 track (native <speed>, m/s) from the session NMEA log
+
+The health log (/data/health/<session>/<session>.log, written by
+dashberry-panel — format in IMPL.md) is what makes --continuous honest:
+its first/last records bound the session, its gps/gpsfix records become
+"GPS Error" / "GPS No Signal" overlays, and its event records are the
+button-B markers. Sessions predating the health log degrade gracefully
+(footage evidence bounds the timeline, fix holes stand in for NOFIX).
 
 Time alignment note (RENDER): a segment file's mtime is when it was LAST
 written, i.e. the segment's END. Segment start = mtime - duration(ffprobe).
@@ -20,6 +31,7 @@ Getting this wrong shifts every annotation by one segment length.
 
 import argparse
 import datetime as dt
+import math
 import os
 import subprocess
 import sys
@@ -28,6 +40,13 @@ import tempfile
 KNOTS_TO_MPH = 1.15078
 KNOTS_TO_KMH = 1.852
 KNOTS_TO_MS = 0.514444
+
+TIMELINE_FPS = 30       # timeline renders normalize both cameras to this
+PIP_FRAC = 0.28         # PiP window width as a fraction of the main width
+PIP_MARGIN = 16         # PiP inset from the top/right edges, px
+GAP_MIN = 1.0           # timeline holes shorter than this are scheduling
+                        # jitter (mtime granularity), absorbed not rendered
+CAM_FALLBACK_WH = {"front": (1920, 1080), "rear": (1280, 720)}
 
 
 # --------------------------------------------------------------- helpers --
@@ -105,6 +124,90 @@ def parse_rmc(path):
     return fixes
 
 
+def health_path(data, session):
+    d = os.path.join(data, "health", session)
+    if not os.path.isdir(d):
+        return None
+    for e in sorted(os.listdir(d)):
+        if e.endswith(".log"):
+            return os.path.join(d, e)
+    return None
+
+
+def parse_health(path):
+    """Parse the panel's per-session health log (format: IMPL.md — lines of
+    '<epoch> boot' / '<epoch> <comp> <OK|ERR>' / '<epoch> gpsfix <FIX|NOFIX>'
+    / '<epoch> event' / '<epoch> hb'). Returns None if absent/unreadable,
+    else a dict:
+      start, end   first/last record epoch (boot .. last heartbeat)
+      err          {comp: [(t0, t1), ...]} ERR spans (open spans end at end)
+      nofix        [(t0, t1), ...] spans without a GPS fix
+      events       [epoch, ...] button-B markers
+    Tolerates the duplicate initial-state dumps a mid-session log reopen
+    produces (same-state records are ignored)."""
+    if not path:
+        return None
+    err, open_err = {}, {}
+    nofix, nofix_open = [], None
+    events = []
+    start = end = None
+    try:
+        f = open(path, "r", errors="replace")
+    except OSError:
+        return None
+    with f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 2 or not parts[0].isdigit():
+                continue
+            t = int(parts[0])
+            if start is None:
+                start = t
+            end = t
+            kind = parts[1]
+            if kind == "event":
+                events.append(t)
+            elif kind == "gpsfix" and len(parts) >= 3:
+                if parts[2] == "NOFIX" and nofix_open is None:
+                    nofix_open = t
+                elif parts[2] == "FIX" and nofix_open is not None:
+                    nofix.append((nofix_open, t))
+                    nofix_open = None
+            elif len(parts) >= 3 and parts[2] in ("OK", "ERR"):
+                if parts[2] == "ERR" and kind not in open_err:
+                    open_err[kind] = t
+                elif parts[2] == "OK" and kind in open_err:
+                    err.setdefault(kind, []).append((open_err.pop(kind), t))
+    if start is None:
+        return None
+    for comp, t0 in open_err.items():
+        err.setdefault(comp, []).append((t0, end))
+    if nofix_open is not None:
+        nofix.append((nofix_open, end))
+    return {"start": start, "end": end, "err": err, "nofix": nofix,
+            "events": events}
+
+
+def spans_subtract(spans, minus):
+    """Subtract the 'minus' intervals from 'spans'; drops slivers < 0.2 s."""
+    out = []
+    for a, b in spans:
+        cur = [(a, b)]
+        for ma, mb in minus:
+            nxt = []
+            for x, y in cur:
+                if mb <= x or ma >= y:
+                    nxt.append((x, y))
+                    continue
+                if x < ma:
+                    nxt.append((x, ma))
+                if mb < y:
+                    nxt.append((mb, y))
+            cur = nxt
+        out += cur
+    return [(a, b) for a, b in out if b - a > 0.2]
+
+
 def ffprobe_duration(path):
     try:
         out = subprocess.run(
@@ -112,6 +215,18 @@ def ffprobe_duration(path):
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, check=True).stdout.strip()
         return float(out)
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+        die("ffprobe failed on %s (is ffmpeg installed?)" % path)
+
+
+def ffprobe_wh(path):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", path],
+            capture_output=True, text=True, check=True).stdout.strip()
+        w, h = out.split(",")
+        return int(w), int(h)
     except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
         die("ffprobe failed on %s (is ffmpeg installed?)" % path)
 
@@ -154,6 +269,62 @@ def drive_start(data, session):
 
 # --------------------------------------------------------------- catalog --
 
+def haversine_m(lat1, lon1, lat2, lon2):
+    r1, r2 = math.radians(lat1), math.radians(lat2)
+    a = (math.sin(math.radians(lat2 - lat1) / 2) ** 2 +
+         math.cos(r1) * math.cos(r2) *
+         math.sin(math.radians(lon2 - lon1) / 2) ** 2)
+    return 2 * 6371000.0 * math.asin(math.sqrt(a))
+
+
+def drive_stats(fixes):
+    """(distance_m, moving_secs, top_knots) over the RMC timeline. Gated
+    against GPS junk: fix pairs more than 10 s apart (tunnel / log gap) or
+    implying > 250 km/h are skipped; 'moving' means > 2 knots."""
+    dist = moving = top = 0.0
+    for (t0, la0, lo0, _), (t1, la1, lo1, k1) in zip(fixes, fixes[1:]):
+        span = t1 - t0
+        if span <= 0 or span > 10:
+            continue
+        d = haversine_m(la0, lo0, la1, lo1)
+        if d / span > 250 / 3.6:
+            continue
+        dist += d
+        if k1 > 2.0:
+            moving += span
+            if k1 > top:
+                top = k1
+    return dist, moving, top
+
+
+def catalog_verbose(data, session, fixes, units):
+    ind = " " * 4
+    if fixes:
+        dist_m, moving_s, top_kn = drive_stats(fixes)
+        if units == "KMH":
+            dist_s = "%.1f km" % (dist_m / 1000.0)
+            avg = dist_m / moving_s * 3.6 if moving_s else 0.0
+            top = top_kn * KNOTS_TO_KMH
+        else:
+            dist_s = "%.1f mi" % (dist_m / 1609.344)
+            avg = dist_m / moving_s * 2.236936 if moving_s else 0.0
+            top = top_kn * KNOTS_TO_MPH
+        print("%sdistance %s   avg %d %s moving   top %d %s"
+              % (ind, dist_s, round(avg), units, round(top), units))
+    else:
+        print("%sno GPS fixes" % ind)
+    health = parse_health(health_path(data, session))
+    if health is None:
+        return                      # session predates the health log
+    if health["events"]:
+        marks = ", ".join("+%s" % fmt_span(max(0, e - health["start"]))
+                          for e in health["events"])
+        print("%sevents %d   (%s from boot)"
+              % (ind, len(health["events"]), marks))
+    else:
+        print("%sevents 0" % ind)
+
+
 def cmd_catalog(args):
     data = args.data
     sess = sessions(data)
@@ -187,6 +358,8 @@ def cmd_catalog(args):
             gps = "none"
         print("%-20s %-19s %9s %6d %6d  %s" %
               (s, start_s, dur, len(front), len(rear), gps))
+        if args.verbose:
+            catalog_verbose(data, s, fixes, args.units)
 
 
 # ---------------------------------------------------------------- render --
@@ -284,7 +457,229 @@ def display_shift_secs(args, start0):
     return shift
 
 
+# ------------------------------------------------- render: timeline mode --
+# Used for --continuous and for --camera both-prio-* (PiP needs the two
+# cameras on one absolute clock, so it is timeline-based even without
+# --continuous). Wall-clock timeline covered piece by piece: real segments
+# (trimmed to the window — sub-second exact, unlike the whole-segment
+# stream-copy path) alternating with generated black filler; --continuous
+# extends the timeline to the health log's boot..last-heartbeat span and
+# labels filler "No Signal" / GPS trouble "GPS Error"/"GPS No Signal".
+
+def cam_segments_abs(data, session, cam):
+    """Sorted [(path, start_epoch, duration)]; start = mtime - duration
+    (mtime is the segment END — see module docstring)."""
+    out = []
+    for path, mtime in segments(data, session, cam):
+        dur = ffprobe_duration(path)
+        out.append((path, mtime - dur, dur))
+    out.sort(key=lambda s: s[1])
+    return out
+
+
+def timeline_pieces(segs, lo, hi):
+    """Cover [lo, hi] with ('seg', path, in_offset, take) and ('gap', dur)
+    pieces. Holes shorter than GAP_MIN are mtime jitter: absorbed (the
+    timeline drifts by that amount) rather than rendered as flicker
+    filler; overlaps trim the head of the later segment."""
+    pieces = []
+    cursor = lo
+    for path, start, dur in segs:
+        end = start + dur
+        if end <= cursor or start >= hi:
+            continue
+        if start - cursor >= GAP_MIN:
+            pieces.append(("gap", start - cursor))
+            cursor = start
+        in_off = max(0.0, cursor - start)
+        take = min(end, hi) - (start + in_off)
+        if take <= 0:
+            continue
+        pieces.append(("seg", path, in_off, take))
+        cursor = start + in_off + take
+    if hi - cursor >= GAP_MIN:
+        pieces.append(("gap", hi - cursor))
+    return pieces
+
+
+def build_timeline_filter(pieces, idx0, w, h, label, no_signal):
+    """One camera's pieces -> (ffmpeg input args, filter lines, next input
+    index). Real segments become file inputs starting at index idx0; gaps
+    are lavfi color sources generated inside the graph (drawtext uses the
+    fontconfig default font). Everything is normalized to w×h @
+    TIMELINE_FPS yuv420p so the final concat cannot mismatch."""
+    inputs, lines, parts = [], [], []
+    i = idx0
+    for k, piece in enumerate(pieces):
+        out = "%s%d" % (label, k)
+        if piece[0] == "seg":
+            _, path, in_off, take = piece
+            inputs += ["-i", path]
+            lines.append(
+                "[%d:v]trim=start=%.3f:duration=%.3f,setpts=PTS-STARTPTS,"
+                "fps=%d,scale=%d:%d,setsar=1,format=yuv420p[%s]"
+                % (i, in_off, take, TIMELINE_FPS, w, h, out))
+            i += 1
+        else:
+            src = ("color=black:size=%dx%d:rate=%d:duration=%.3f"
+                   % (w, h, TIMELINE_FPS, piece[1]))
+            if no_signal:
+                src += (",drawtext=text='No Signal':fontcolor=white:"
+                        "fontsize=%d:x=(w-text_w)/2:y=(h-text_h)/2" % (h // 9))
+            lines.append(src + ",format=yuv420p[%s]" % out)
+        parts.append("[%s]" % out)
+    lines.append("%sconcat=n=%d:v=1:a=0[%s]"
+                 % ("".join(parts), len(pieces), label))
+    return inputs, lines, i
+
+
+def write_timeline_ass(fixes, health, lo, hi, shift, units, annotate, tmpdir):
+    """.ass overlay for a timeline render, or None if there is nothing to
+    say. With annotate: one event per fix, as in write_ass, but capped at
+    2 s so a stale data line never lingers into a GPS hole. GPS trouble
+    labels: health-log gps ERR spans read "GPS Error", no-fix spans "GPS
+    No Signal" (ERR wins where they overlap — a dead gpsd also drops the
+    fix). Without a health log, holes > 2 s in the RMC timeline stand in
+    for the no-fix spans."""
+    factor, label = ((KNOTS_TO_KMH, "KMH") if units == "KMH"
+                     else (KNOTS_TO_MPH, "MPH"))
+    if health:
+        err = [(max(a, lo), min(b, hi))
+               for a, b in health["err"].get("gps", []) if b > lo and a < hi]
+        nofix = [(max(a, lo), min(b, hi))
+                 for a, b in health["nofix"] if b > lo and a < hi]
+    else:
+        err = []
+        nofix = []
+        cursor = lo
+        for t in (f[0] for f in fixes if lo <= f[0] <= hi):
+            if t - cursor > 2:
+                nofix.append((cursor, t))
+            cursor = t
+        if hi - cursor > 2:
+            nofix.append((cursor, hi))
+    nofix = spans_subtract(nofix, err)
+    lines = []
+    if annotate:
+        sel = [f for f in fixes if lo - 1 <= f[0] <= hi + 1]
+        for i, (t, lat, lon, knots) in enumerate(sel):
+            start = t - lo
+            end = (sel[i + 1][0] - lo) if i + 1 < len(sel) else start + 0.5
+            end = min(end, start + 2.0)
+            shown = dt.datetime.fromtimestamp(t + shift, dt.timezone.utc)
+            lines.append((start, end, "%s  %.5f,%.5f  %d %s" % (
+                shown.strftime("%Y-%m-%d %H:%M:%S"), lat, lon,
+                int(knots * factor + 0.5), label)))
+    for a, b in err:
+        lines.append((a - lo, b - lo, "GPS Error"))
+    for a, b in nofix:
+        lines.append((a - lo, b - lo, "GPS No Signal"))
+    if not lines:
+        return None
+    lines.sort()
+    path = os.path.join(tmpdir, "overlay.ass")
+    with open(path, "w") as f:
+        f.write(ASS_HEADER)
+        for a, b, text in lines:
+            f.write("Dialogue: 0,%s,%s,gps,%s\n"
+                    % (ass_time(a), ass_time(b), text))
+    return path
+
+
+def render_timeline(args):
+    data, session = args.data, args.drive
+    both = args.camera.startswith("both-")
+    if both:
+        main_cam = "front" if args.camera == "both-prio-front" else "rear"
+        cams = [main_cam, "rear" if main_cam == "front" else "front"]
+    else:
+        cams = [args.camera]
+
+    segs = {c: cam_segments_abs(data, session, c) for c in cams}
+    fixes = parse_rmc(nmea_path(data, session))
+    health = parse_health(health_path(data, session))
+
+    # timeline bounds: every timing evidence there is (health log first —
+    # boot..last-heartbeat is the "system boot to shutdown" span)
+    starts = [s[0][1] for s in segs.values() if s]
+    ends = [s[-1][1] + s[-1][2] for s in segs.values() if s]
+    if args.continuous:
+        if fixes:
+            starts.append(fixes[0][0])
+            ends.append(fixes[-1][0])
+        if health:
+            starts.append(health["start"])
+            ends.append(health["end"])
+    if not starts:
+        die("no footage%s for drive %s"
+            % ("/health evidence" if args.continuous else "", session))
+    t0, t1 = min(starts), max(ends)
+
+    lo = t0 + parse_hms(getattr(args, "from")) if getattr(args, "from") else t0
+    hi = t0 + parse_hms(args.to) if args.to else t1
+    lo, hi = max(lo, t0), min(hi, t1)
+    if hi <= lo:
+        die("requested range is empty")
+
+    def cam_wh(cam):
+        return (ffprobe_wh(segs[cam][0][0]) if segs[cam]
+                else CAM_FALLBACK_WH[cam])
+
+    input_args, filter_lines = [], []
+    idx = 0
+    n_fill = 0
+    for cam in cams:
+        w, h = cam_wh(cam)
+        pieces = timeline_pieces(segs[cam], lo, hi)
+        if not pieces:              # window inside an absorbed sliver
+            pieces = [("gap", hi - lo)]
+        n_fill += sum(1 for p in pieces if p[0] == "gap")
+        ins, lines, idx = build_timeline_filter(
+            pieces, idx, w, h, cam, args.continuous)
+        input_args += ins
+        filter_lines += lines
+
+    if both:
+        mw, _ = cam_wh(cams[0])
+        pw, ph = cam_wh(cams[1])
+        pip_w = int(mw * PIP_FRAC) // 2 * 2
+        pip_h = int(pip_w * ph / pw) // 2 * 2
+        filter_lines.append("[%s]scale=%d:%d[pip]"
+                            % (cams[1], pip_w, pip_h))
+        filter_lines.append("[%s][pip]overlay=W-w-%d:%d[vid]"
+                            % (cams[0], PIP_MARGIN, PIP_MARGIN))
+        vid = "vid"
+    else:
+        vid = cams[0]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        if args.annotate or args.continuous:
+            shift = display_shift_secs(args, t0)
+            ass = write_timeline_ass(fixes, health, lo, hi, shift,
+                                     args.units, args.annotate, tmpdir)
+            if ass:
+                filter_lines.append("[%s]ass=%s[outv]" % (vid, ass))
+                vid = "outv"
+        script = os.path.join(tmpdir, "filter.txt")
+        with open(script, "w") as f:
+            f.write(";\n".join(filter_lines))
+        cmd = (["ffmpeg", "-hide_banner", "-y"] + input_args +
+               ["-filter_complex_script", script, "-map", "[%s]" % vid,
+                "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+                "-an", args.output])
+        try:
+            subprocess.run(cmd, check=True)
+        except FileNotFoundError:
+            die("ffmpeg not found")
+        except subprocess.CalledProcessError as e:
+            die("ffmpeg failed (%d)" % e.returncode)
+    print("wrote %s (%s span %s, %d segments, %d filler pieces)"
+          % (args.output, args.camera, fmt_span(hi - lo), idx, n_fill))
+
+
 def cmd_render(args):
+    if args.continuous or args.camera.startswith("both-"):
+        return render_timeline(args)
     picked, start0 = select_segments(args.data, args)
     with tempfile.TemporaryDirectory() as tmpdir:
         lst = write_concat_list(picked, tmpdir)
@@ -378,13 +773,28 @@ def main():
                     help="path to a copy of /data")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("catalog", help="print drive session info")
+    pc = sub.add_parser("catalog", help="print drive session info")
+    pc.add_argument("-v", "--verbose", action="store_true",
+                    help="add per-drive distance / avg / top speed (from the "
+                         "NMEA log) and button-B event markers (health log)")
+    pc.add_argument("--units", choices=["MPH", "KMH"], default="MPH",
+                    help="verbose speed/distance units (default MPH)")
 
     pr = sub.add_parser("render", help="produce a video file from one drive")
     pr.add_argument("--drive", required=True, metavar="SESSION")
-    pr.add_argument("--camera", required=True, choices=["front", "rear"])
+    pr.add_argument("--camera", required=True,
+                    choices=["front", "rear",
+                             "both-prio-front", "both-prio-rear"],
+                    help="both-prio-* composites both cameras: the prio "
+                         "camera full-frame, the other picture-in-picture "
+                         "top-right (re-encode)")
     pr.add_argument("--annotate", action="store_true",
                     help="burn time/position/speed into the image (re-encode)")
+    pr.add_argument("--continuous", action="store_true",
+                    help="render the full boot-to-shutdown timeline: footage "
+                         "holes become black 'No Signal' filler and GPS "
+                         "trouble is labeled from the session health log "
+                         "(re-encode; --from/--to then count from boot)")
     pr.add_argument("--units", choices=["MPH", "KMH"], default="MPH",
                     help="annotation speed units (default MPH)")
     add_range_opts(pr)
