@@ -6,8 +6,11 @@
 # here) and a target block device, and produces a card that boots straight
 # into a self-installing DashBerry:
 #
-#   1. flashes the image — after a typed confirmation; the device is WIPED;
-#   2. grows the OS partition to a fixed working size (default 4 GiB) instead
+#   1. wipes the old partition signatures and table (wipefs on every old
+#      partition node, then the disk — incl. fs superblocks inside old
+#      partitions and a stale backup GPT, none of which dd reaches) and
+#      flashes the image — after a typed confirmation; the device is WIPED;
+#   2. grows the OS partition to a fixed working size (default 8 GiB) instead
 #      of letting first boot swallow the card — this is the volume that ends
 #      up READ-ONLY (overlayfs, enabled at the end of the first-boot install);
 #   3. creates the writable /data partition (ext4, rest of the card) and
@@ -15,11 +18,16 @@
 #   4. merges boot/config-snippet.txt into config.txt;
 #   5. stages sw/ at /opt/dashberry/sw and enables a oneshot first-boot
 #      service that installs packages, builds dashberry-panel, enables the
-#      units, flips the OS read-only, and reboots (sw/firstinstall.sh);
-#   6. (--wifi) stages a first-boot-ONLY Wi-Fi profile plus the regulatory
-#      domain that stock Pi OS (Trixie) needs before it will unblock wlan, so
-#      boot 2 can run without Ethernet — firstinstall wipes every trace of
-#      it before the overlay freezes the OS and RF lockdown arms.
+#      units, and reboots (sw/firstinstall.sh). Without --debug the card is
+#      PRODUCTION: the OS flips read-only, no user account or ssh exists,
+#      and every network credential is wiped — sealed; archive by pulling
+#      the card. With --debug NAME:PASS it is a DEBUG card: writable OS,
+#      ssh + that user, journal kept and persistent;
+#   6. (--wifi) stages a first-boot Wi-Fi profile plus the regulatory
+#      domain that stock Pi OS (Trixie) needs before it will unblock wlan,
+#      so boot 2 can run without Ethernet. PRODUCTION wipes every trace of
+#      it before the overlay freezes the OS; DEBUG keeps the profile so the
+#      card rejoins the LAN on every boot.
 #
 # The stock image's own auto-expand is left in place and self-disarms: it
 # refuses to grow a root partition that is not the last one, and /data is.
@@ -30,52 +38,37 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-usage: sudo dashberry-install [options] <image> <device>
+Usage: sudo dashberry-install [options] <image> <device>
 
-  <image>   Raspberry Pi OS Lite (64-bit) image, ALREADY DOWNLOADED —
-            .img, .img.xz, .img.gz or .zip. This tool never downloads.
-  <device>  target block device (whole disk, e.g. /dev/sdb or /dev/mmcblk0).
-            Must be 8 GB or bigger. ALL DATA ON IT WILL BE ERASED.
+  <image>   Raspberry Pi OS Lite (64-bit) image
+  <device>  target block device (at least 16GB; ALL DATA ON IT WILL BE ERASED.)
 
-options:
-  --bypass-time     no DS3231 fitted: skip the RTC overlay, let chrony trust
-                    GPS for wall time, and drop TIME from the panel health
-                    model (never shown on the OLED error screen)
-  --bypass-rear     no rear camera: rear-rec is not enabled and REAR is
-                    dropped from the panel health model (never on the error
-                    screen)
-  --root-size GIB   OS (read-only) partition size in GiB (default 4)
-  --writable        skip the read-only overlay step — for bench iteration;
-                    enable later with: sudo raspi-config nonint do_overlayfs 0
-  --user NAME:PASS  create the first-boot user via userconf.txt (headless
-                    setup; note the password is visible in shell history)
-  --ssh             enable ssh from first boot
-  --wifi SSID:PSK   run the first boot over Wi-Fi instead of Ethernet: a
-                    NetworkManager profile is staged for boots 1-2 only and
-                    firstinstall wipes it (profile, leases, logs) before RF
-                    lockdown arms. Needs a NetworkManager image — Trixie
-                    Lite is one (anything bookworm+ works, bullseye is not);
-                    SSID must not contain ':'; PSK visible in shell history
-  --wifi-country CC two-letter regulatory domain (required with --wifi —
-                    without one the stock image keeps wlan rfkill-blocked)
-  -h, --help        this text
+Options:
+  --bypass-time     ignore DS3231 from system requirement and use GPS for time calibration
+  --bypass-rear     ignore rear camera from system requirement
+  --root-size GIB   OS partition size in GiB (default: 8)
+  --debug NAME:PASS build a DEBUG card: writable OS, ssh with this user,
+                    journal kept + persistent, Wi-Fi profile kept.
+                    Without it the card is PRODUCTION: read-only OS, no
+                    user, no ssh, all network credentials wiped (sealed)
+  --wifi SSID:PSK   run the first boot over Wi-Fi instead of Ethernet
+                    (PRODUCTION erases it at the end; DEBUG keeps it)
+  --wifi-country CC required to configure --wifi
+  -h, --help        display this help
 EOF
 }
 
-die()  { echo "dashberry-install: error: $*" >&2; exit 1; }
+die()  { echo "Fatal Error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
-need() { command -v "$1" >/dev/null 2>&1 || die "missing tool: $1"; }
+need() { command -v "$1" >/dev/null 2>&1 || die "Missing tool: $1"; }
 
-# "8 GB" cards are ~7.9e9 real bytes; below this is not an 8 GB device.
-MIN_DEV_BYTES=7700000000
 MIN_DATA_BYTES=$((1024 * 1024 * 1024))    # refuse a /data smaller than 1 GiB
 
 BYPASS_TIME=0
 BYPASS_REAR=0
-ROOT_GIB=4
-READONLY=1
+ROOT_GIB=8
+DEBUG=0
 USERSPEC=
-WANT_SSH=0
 WIFISPEC=
 WIFI_CC=
 WIFI_SSID=
@@ -88,56 +81,58 @@ while [ $# -gt 0 ]; do
         --bypass-time) BYPASS_TIME=1 ;;
         --bypass-rear) BYPASS_REAR=1 ;;
         --root-size)   shift; ROOT_GIB=${1:-} ;;
-        --writable)    READONLY=0 ;;
-        --user)        shift; USERSPEC=${1:-} ;;
-        --ssh)         WANT_SSH=1 ;;
+        --debug)       shift; DEBUG=1; USERSPEC=${1:-} ;;
         --wifi)        shift; WIFISPEC=${1:-} ;;
         --wifi-country) shift; WIFI_CC=${1:-} ;;
         -h|--help)     usage; exit 0 ;;
-        -*)            die "unknown option: $1 (see --help)" ;;
+        -*)            die "Unknown option: $1 (see --help)" ;;
         *)             if   [ -z "$IMG" ]; then IMG=$1
                        elif [ -z "$DEV" ]; then DEV=$1
-                       else die "too many arguments (see --help)"; fi ;;
+                       else die "Too many arguments (see --help)"; fi ;;
     esac
     shift
 done
 
 [ -n "$IMG" ] && [ -n "$DEV" ] || { usage >&2; exit 1; }
-[ "$(id -u)" = 0 ] || die "run as root (flashing and mounting need it)"
-case $ROOT_GIB in *[!0-9]*|'') die "--root-size wants a whole number of GiB" ;; esac
-[ "$ROOT_GIB" -ge 3 ] || die "--root-size below 3 GiB cannot hold the OS"
-if [ -n "$USERSPEC" ]; then
-    case $USERSPEC in *:*) ;; *) die "--user wants NAME:PASS" ;; esac
+[ "$(id -u)" = 0 ] || die "Run this script as root"
+case $ROOT_GIB in *[!0-9]*|'') die "--root-size requires a whole number of GiB" ;; esac
+[ "$ROOT_GIB" -ge 8 ] || die "--root-size must be at least 8GiB"
+# The device must hold boot (512 MiB) + the OS + a useful /data — checked
+# up front because the wipe below is the point of no return. The default
+# 8 GiB OS means a 16 GB card in practice.
+MIN_DEV_BYTES=$((512 * 1024 * 1024 + ROOT_GIB * 1024 * 1024 * 1024 + MIN_DATA_BYTES))
+if [ "$DEBUG" = 1 ]; then
+    case $USERSPEC in *:*) ;; *) die "--debug requires NAME:PASS (the ssh login)" ;; esac
     need openssl
 fi
 if [ -n "$WIFISPEC" ]; then
-    case $WIFISPEC in *:*) ;; *) die "--wifi wants SSID:PSK" ;; esac
+    case $WIFISPEC in *:*) ;; *) die "--wifi requires SSID:PSK" ;; esac
     WIFI_SSID=${WIFISPEC%%:*}          # split at the FIRST ':' — the PSK may
     WIFI_PSK=${WIFISPEC#*:}            # contain colons, the SSID may not
     [ -n "$WIFI_SSID" ] && [ "${#WIFI_SSID}" -le 32 ] || \
-        die "--wifi SSID must be 1-32 characters (and must not contain ':')"
+        die "--wifi SSID must be 1-32 characters and must not contain :"
     [ "${#WIFI_PSK}" -ge 8 ] && [ "${#WIFI_PSK}" -le 64 ] || \
-        die "--wifi PSK must be a 8-63 char passphrase (or 64 hex digits)"
+        die "--wifi PSK must be a 8-63 char passphrase or 64 hex digits"
     [ -n "$WIFI_CC" ] || \
-        die "--wifi needs --wifi-country CC (stock Pi OS keeps wlan blocked without a regulatory domain)"
-    case $WIFI_CC in [A-Za-z][A-Za-z]) ;; *) die "--wifi-country wants a two-letter code (e.g. JP, CA)" ;; esac
+        die "--wifi needs --wifi-country CC"
+    case $WIFI_CC in [A-Za-z][A-Za-z]) ;; *) die "--wifi-country wants a two-letter code" ;; esac
     WIFI_CC=$(printf '%s' "$WIFI_CC" | tr '[:lower:]' '[:upper:]')
     FIRSTBOOT_WIFI=1
 elif [ -n "$WIFI_CC" ]; then
-    die "--wifi-country does nothing without --wifi"
+    die "--wifi-country should only be used with --wifi"
 fi
 
 for t in dd sfdisk partprobe blkid mkfs.ext4 e2fsck resize2fs lsblk \
-         blockdev udevadm findmnt mktemp awk sed tr; do need "$t"; done
+         blockdev udevadm findmnt mktemp awk sed tr wipefs; do need "$t"; done
 
 # --- image: must already exist locally; pick the decompressor by suffix ----
-[ -f "$IMG" ] || die "image not found: $IMG (download it first — this tool does not)"
+[ -f "$IMG" ] || die "Image not found: $IMG"
 case $IMG in
     *.img) DECOMP=cat ;;
     *.xz)  DECOMP=xz;    need xz ;;
     *.gz)  DECOMP=gzip ;;
     *.zip) DECOMP=unzip; need unzip ;;
-    *)     die "unrecognized image format (want .img, .img.xz, .img.gz or .zip): $IMG" ;;
+    *)     die "Unrecognized image format (not in: .img, .img.xz, .img.gz or .zip): $IMG" ;;
 esac
 decompress() {
     case $DECOMP in
@@ -148,27 +143,25 @@ decompress() {
     esac
 }
 
-# --- device: whole disk, not the system disk, unmounted, >= 8 GB -----------
+# --- device: whole disk, not the system disk, unmounted, big enough --------
 [ -b "$DEV" ] || die "$DEV is not a block device"
 devname=$(basename "$(readlink -f "$DEV")")
-[ -e "/sys/block/$devname" ] || die "$DEV looks like a partition — pass the whole disk"
+[ -e "/sys/block/$devname" ] || die "$DEV looks like a partition, use the whole disk"
 
 rootsrc=$(findmnt -no SOURCE / 2>/dev/null || true)
 rootdisk=$(lsblk -no PKNAME "$rootsrc" 2>/dev/null | head -n1 || true)
-[ "$rootdisk" != "$devname" ] || die "refusing: $DEV holds the running system"
+[ "$rootdisk" != "$devname" ] || die "Refusing: $DEV holds the running system"
 
 if lsblk -no MOUNTPOINT "$DEV" 2>/dev/null | grep -q .; then
-    lsblk -o NAME,SIZE,MOUNTPOINT "$DEV" >&2
-    die "$DEV has mounted partitions — unmount them first (a mounted disk is often the wrong disk)"
+    die "$DEV has mounted partitions"
 fi
 
 devbytes=$(blockdev --getsize64 "$DEV")
 [ "$devbytes" -ge "$MIN_DEV_BYTES" ] || \
-    die "$DEV is $((devbytes / 1000000000)) GB — DashBerry needs a device of 8 GB or bigger"
+    die "$DEV is $((devbytes / 1000000000)) GB (boot + ${ROOT_GIB} GiB OS + 1 GiB /data needs at least $(((MIN_DEV_BYTES + 999999999) / 1000000000)) GB)"
 
 # --- the point of no return: a typed confirmation, nothing softer ----------
-[ -t 0 ] || die "no terminal to confirm on — this tool never wipes a disk unattended"
-echo
+[ -t 0 ] || die "This script must be run on a visual terminal"
 echo "################################################################"
 echo "#                          WARNING                             #"
 echo "#   ALL DATA ON THE DEVICE BELOW WILL BE PERMANENTLY ERASED    #"
@@ -177,17 +170,44 @@ echo
 lsblk -o NAME,MODEL,SIZE,TYPE,MOUNTPOINT "$DEV" | sed 's/^/    /'
 echo
 echo "    image : $IMG"
-echo "    layout: p1 boot (from image) | p2 OS ${ROOT_GIB} GiB$( [ $READONLY = 1 ] && echo ' (read-only after install)' ) | p3 /data (rest)"
-[ "$BYPASS_TIME" = 1 ] && echo "    bypass: TIME (no DS3231 — GPS disciplines the clock)"
-[ "$BYPASS_REAR" = 1 ] && echo "    bypass: REAR (no rear camera)"
-[ "$FIRSTBOOT_WIFI" = 1 ] && echo "    wifi  : first boot joins '$WIFI_SSID' ($WIFI_CC) — wiped before RF lockdown"
+echo "    layout: boot | OS ${ROOT_GIB} GiB$( [ $DEBUG = 0 ] && echo ' (read-only)' ) | /data"
+if [ "$DEBUG" = 1 ]; then
+    echo "    mode  : DEBUG — writable OS, ssh user '${USERSPEC%%:*}', journal kept"
+else
+    echo "    mode  : PRODUCTION — read-only OS, no user, no ssh (sealed)"
+fi
+[ "$BYPASS_TIME" = 1 ] && echo "    bypass: TIME"
+[ "$BYPASS_REAR" = 1 ] && echo "    bypass: REAR"
+if [ "$FIRSTBOOT_WIFI" = 1 ]; then
+    if [ "$DEBUG" = 1 ]; then
+        echo "    wifi  : '$WIFI_SSID' ($WIFI_CC) (kept — debug card)"
+    else
+        echo "    wifi  : '$WIFI_SSID' ($WIFI_CC) (first boot only, then wiped)"
+    fi
+fi
 echo
-printf 'Type the device path (%s) to continue, anything else aborts: ' "$DEV"
+printf 'Type the device path (%s) to continue: ' "$DEV"
 read -r answer
-[ "$answer" = "$DEV" ] || die "aborted — nothing was written"
+[ "$answer" = "$DEV" ] || die "Aborted"
+
+# --- wipe: start from a clean device, not whatever the card held -----------
+info "Wiping the old partition signatures and table on $DEV..."
+# dd below only overwrites the image's length: a previous GPT keeps its
+# backup table at the END of the disk, and old filesystem superblocks (a
+# previous card's /data ext4, say) sit INSIDE the old partitions, where a
+# whole-disk wipefs never probes — sfdisk then warns "contains a ext4
+# signature" when a new partition lands on the same offset. So wipe each
+# partition through its node while the old table still provides them, THEN
+# the table itself (MBR, GPT primary+backup).
+while read -r part; do
+    if [ -b "$part" ]; then wipefs -a -q "$part"; fi
+done < <(lsblk -nro TYPE,PATH "$DEV" | awk '$1 == "part" {print $2}')
+wipefs -a -q "$DEV"
+partprobe "$DEV" 2>/dev/null || true
+udevadm settle
 
 # --- flash -----------------------------------------------------------------
-info "flashing $IMG onto $DEV..."
+info "Flashing $IMG onto $DEV..."
 decompress | dd of="$DEV" bs=4M iflag=fullblock conv=fsync status=progress
 sync
 partprobe "$DEV"
@@ -204,20 +224,20 @@ wait_part() {
         [ -b "$1" ] && return 0
         sleep 0.5
     done
-    die "partition $1 never appeared after flashing"
+    die "Partition $1 never appeared after flashing"
 }
 wait_part "$BOOTP"
 wait_part "$ROOTP"
 
-[ "$(blkid -o value -s TYPE "$BOOTP")" = vfat ] || die "$BOOTP is not vfat — not a Raspberry Pi OS image?"
-[ "$(blkid -o value -s TYPE "$ROOTP")" = ext4 ] || die "$ROOTP is not ext4 — not a Raspberry Pi OS image?"
-[ ! -b "$DATAP" ] || die "image already carries a 3rd partition — expected a stock 2-partition Pi OS image"
+[ "$(blkid -o value -s TYPE "$BOOTP")" = vfat ] || die "$BOOTP is not vfat"
+[ "$(blkid -o value -s TYPE "$ROOTP")" = ext4 ] || die "$ROOTP is not ext4"
+[ ! -b "$DATAP" ] || die "Image already carries a 3rd partition (expected a stock 2-partition Pi OS image)"
 
 # --- partitions: right-size the (to-be-read-only) OS, add /data ------------
 root_bytes=$((ROOT_GIB * 1024 * 1024 * 1024))
 cur_bytes=$(blockdev --getsize64 "$ROOTP")
 if [ "$cur_bytes" -lt "$root_bytes" ]; then
-    info "growing OS partition to ${ROOT_GIB} GiB..."
+    info "Growing OS partition to ${ROOT_GIB} GiB..."
     echo ", ${ROOT_GIB}GiB" | sfdisk -q -N 2 "$DEV"
     partprobe "$DEV"
     udevadm settle
@@ -226,24 +246,34 @@ if [ "$cur_bytes" -lt "$root_bytes" ]; then
     [ "$rc" -le 2 ] || die "e2fsck on $ROOTP failed (exit $rc)"
     resize2fs "$ROOTP"
 else
-    info "image OS partition already >= ${ROOT_GIB} GiB — keeping its size"
+    info "Image OS partition already >= ${ROOT_GIB} GiB"
 fi
 
-info "creating /data partition (rest of the device)..."
-echo ",,L" | sfdisk -q -a "$DEV"
+info "Creating /data partition..."
+# The flashed image can leave a small free gap BEFORE the boot partition
+# (bootfs starts at 4 MiB), and sfdisk with no start sector appends into the
+# first free area — i.e. that gap, yielding a few-MiB /data. Start explicitly
+# on the first 1 MiB boundary after the OS partition instead.
+root_end=$(sfdisk -l -o Device,End "$DEV" | awk -v p="$ROOTP" '$1 == p {print $2}')
+case $root_end in *[!0-9]*|'') die "Could not read the end sector of $ROOTP" ;; esac
+data_start=$(( (root_end / 2048 + 1) * 2048 ))
+# --wipe-partitions: erase any stale fs signature where the new partition
+# lands (belt-and-braces to the pre-dd wipe — covers cards whose old table
+# was already gone, leaving signatures with no node to wipe them through)
+echo "${data_start},,L" | sfdisk -q --wipe-partitions always -a "$DEV"
 partprobe "$DEV"
 udevadm settle
 wait_part "$DATAP"
 [ "$(blockdev --getsize64 "$DATAP")" -ge "$MIN_DATA_BYTES" ] || \
-    die "/data would be under 1 GiB — lower --root-size or use a bigger card"
+    die "/data would be under 1 GiB, lower --root-size or use a bigger card"
 mkfs.ext4 -q -F -L dashberry-data "$DATAP"
 DATA_PARTUUID=$(blkid -o value -s PARTUUID "$DATAP")
-[ -n "$DATA_PARTUUID" ] || die "could not read PARTUUID of $DATAP"
+[ -n "$DATA_PARTUUID" ] || die "Could not read PARTUUID of $DATAP"
 
-info "creating /data directory skeleton..."
+info "Creating /data directory skeleton..."
 DMNT=$(mktemp -d)
 mount "$DATAP" "$DMNT"
-mkdir -p "$DMNT/front" "$DMNT/rear" "$DMNT/gps" "$DMNT/rf"
+mkdir -p "$DMNT/front" "$DMNT/rear" "$DMNT/gps"
 umount "$DMNT"
 rmdir "$DMNT"
 
@@ -272,9 +302,9 @@ mount "$BOOTP" "$BOOTDIR"
 # bail before customizing a card that could never bring the profile up
 # (bullseye and older run dhcpcd/wpa_supplicant)
 [ "$FIRSTBOOT_WIFI" = 0 ] || [ -d "$MNT/etc/NetworkManager" ] || \
-    die "--wifi needs a NetworkManager image (Raspberry Pi OS Trixie Lite)"
+    die "--wifi needs a NetworkManager image"
 
-info "appending /data to fstab (PARTUUID=$DATA_PARTUUID)..."
+info "Appending /data to fstab (PARTUUID=$DATA_PARTUUID)..."
 mkdir -p "$MNT/data"
 cat >> "$MNT/etc/fstab" <<EOF
 # DashBerry footage partition (dashberry-install; options per etc/fstab.snippet
@@ -282,7 +312,7 @@ cat >> "$MNT/etc/fstab" <<EOF
 PARTUUID=$DATA_PARTUUID  /data  ext4  defaults,noatime,data=ordered,commit=1,nofail  0  2
 EOF
 
-info "merging boot/config-snippet.txt into config.txt..."
+info "Merging boot/config-snippet.txt into config.txt..."
 # The snippet's directives sit between its header block (ends at the first
 # blank line) and the dashes-only separator (the cmdline.txt notes below that
 # are documentation, not directives).
@@ -297,18 +327,22 @@ fi
     printf '%s\n' "$snippet"
 } >> "$BOOTDIR/config.txt"
 
-info "staging sw/ payload and first-boot installer..."
+info "Staging sw/ payload and first-boot installer..."
 mkdir -p "$MNT/opt/dashberry"
 cp -a "$SWDIR" "$MNT/opt/dashberry/sw"
-# Bypass flags ride in the payload's conf — the one the firstinstall step
-# installs to /etc — so the panel and firstinstall read the same truth.
+# Bypass and mode flags ride in the payload's conf — the one the
+# firstinstall step installs to /etc — so the panel (which bakes the
+# shield/wireless glyph off DEBUG) and firstinstall read the same truth.
 if [ "$BYPASS_TIME" = 1 ]; then
     sed -i 's/^BYPASS_TIME=0/BYPASS_TIME=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
 fi
 if [ "$BYPASS_REAR" = 1 ]; then
     sed -i 's/^BYPASS_REAR=0/BYPASS_REAR=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
 fi
-printf 'READONLY=%s\nFIRSTBOOT_WIFI=%s\n' "$READONLY" "$FIRSTBOOT_WIFI" \
+if [ "$DEBUG" = 1 ]; then
+    sed -i 's/^DEBUG=0/DEBUG=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
+fi
+printf 'FIRSTBOOT_WIFI=%s\n' "$FIRSTBOOT_WIFI" \
     > "$MNT/opt/dashberry/install-opts"
 
 cat > "$MNT/etc/systemd/system/dashberry-firstinstall.service" <<'EOF'
@@ -332,17 +366,17 @@ mkdir -p "$MNT/etc/systemd/system/multi-user.target.wants"
 ln -sf /etc/systemd/system/dashberry-firstinstall.service \
     "$MNT/etc/systemd/system/multi-user.target.wants/dashberry-firstinstall.service"
 
-if [ -n "$USERSPEC" ]; then
-    info "writing userconf.txt (first-boot user '${USERSPEC%%:*}')..."
+# PRODUCTION cards get neither a user nor sshd: with no account to log
+# into and no listener, the sealed card's only interface is the OLED and
+# pulling the card itself.
+if [ "$DEBUG" = 1 ]; then
+    info "Debug card: user '${USERSPEC%%:*}' + ssh..."
     printf '%s:%s\n' "${USERSPEC%%:*}" \
         "$(openssl passwd -6 "${USERSPEC#*:}")" > "$BOOTDIR/userconf.txt"
-fi
-if [ "$WANT_SSH" = 1 ]; then
-    info "enabling ssh..."
     : > "$BOOTDIR/ssh"
 fi
 if [ "$FIRSTBOOT_WIFI" = 1 ]; then
-    info "staging first-boot Wi-Fi '$WIFI_SSID' (firstinstall wipes it)..."
+    info "Staging first-boot Wi-Fi '$WIFI_SSID'..."
     NMFILE="$MNT/etc/NetworkManager/system-connections/dashberry-firstboot.nmconnection"
     mkdir -p "${NMFILE%/*}"
     # printf, not a heredoc: the PSK must land byte-for-byte ($, \, %s-safe);
@@ -362,9 +396,9 @@ if [ "$FIRSTBOOT_WIFI" = 1 ]; then
     # Stock Pi OS (since bullseye, still true on trixie) keeps wlan
     # rfkill-blocked until a regulatory domain is set; the kernel cmdline is
     # the offline way to provide one. cmdline.txt is a single line — append
-    # to it, don't add a second. firstinstall removes the token again during
-    # the credential wipe.
-    [ -f "$BOOTDIR/cmdline.txt" ] || die "no cmdline.txt on the boot partition?"
+    # to it, don't add a second. On a production card firstinstall removes
+    # the token again during the credential wipe; a debug card keeps it.
+    [ -f "$BOOTDIR/cmdline.txt" ] || die "No cmdline.txt on the boot partition"
     sed -i "1s/\$/ cfg80211.ieee80211_regdom=$WIFI_CC/" "$BOOTDIR/cmdline.txt"
 fi
 
@@ -375,19 +409,7 @@ trap - EXIT
 # --- done ------------------------------------------------------------------
 echo
 if [ "$FIRSTBOOT_WIFI" = 1 ]; then
-    info "card ready. Insert it and power the Pi (first boot joins Wi-Fi '$WIFI_SSID')"
-    echo "    (setup-only network: firstinstall wipes the profile, leases and"
-    echo "     logs before the OS locks read-only)."
+    info "Card ready."
 else
-    info "card ready. Insert it and power the Pi WITH ETHERNET CONNECTED"
-    echo "    (first boot needs apt; Wi-Fi is rfkill-blocked by design)."
+    info "Card ready. First boot requires Ethernet connection."
 fi
-echo
-echo "    boot 1: Pi OS housekeeping (its auto-expand self-disarms: root is"
-echo "            no longer the last partition), reboots"
-echo "    boot 2: dashberry-firstinstall — apt packages, builds"
-echo "            dashberry-panel, enables units$( [ "$FIRSTBOOT_WIFI" = 1 ] && echo ', wipes the Wi-Fi traces' )$( [ "$READONLY" = 1 ] && echo ', flips the OS read-only' ) — reboots"
-echo "    boot 3: recording; radios come up BLOCKED (fresh card, fail-closed)"
-echo
-echo "    progress: journalctl -u dashberry-firstinstall (or the console)"
-echo "    then: work the VERIFY table in sw/README.md (bench checks)"

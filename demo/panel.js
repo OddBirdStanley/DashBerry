@@ -2,26 +2,23 @@
  * for the browser demo/visualizer. NOT part of the Pi runtime.
  *
  * Porting rule: everything above the hardware line — the §3b UI state
- * machine (PAGE 0/1, AUTO-BLANK, strict wake-key absorption, A-hold RF
- * toggle with persist-before-unblock ordering, burn-in shift), the health
- * model, compose()/render(), the embedded font and RF glyphs — is ported
+ * machine (PAGE 0/1, AUTO-BLANK, strict wake-key absorption, burn-in
+ * shift), the health model, compose()/render(), the embedded font and the
+ * install-mode glyphs (shield = production, wireless = debug — baked from
+ * DEBUG in dashberry.conf, no runtime RF state) — is ported
  * statement-for-statement from the C. Everything below it (fb1 mmap,
- * gpiochip v2, gpsd socket + NMEA parse, statvfs, rfkill sysfs, fsync
- * persist chain, sd_notify) is replaced by an injected `hw` object the
- * harness simulates. If this file and the C disagree about behavior, the
- * C is the bug's home or this port is wrong — diff them.
+ * gpiochip v2, gpsd socket + NMEA parse, statvfs, sd_notify) is replaced
+ * by an injected `hw` object the harness simulates. If this file and the
+ * C disagree about behavior, the C is the bug's home or this port is
+ * wrong — diff them.
  *
  * hw contract (all required):
  *   now()                    -> monotonic ms (CLOCK_MONOTONIC stand-in)
- *   armHold(cb), disarmHold()   2 s one-shot (timerfd stand-in)
  *   frontNewestMtimeMs()     -> ms of newest front segment write, 0 = none
  *   rearNewestMtimeMs()      -> ms of newest rear segment write, 0 = none
  *   rtcOk()                  -> bool (rtc0/since_epoch readable)
  *   statvfs()                -> null (/data not mounted) or
  *                               { rw, freePct, fsErrors }
- *   rfSoftBlocked()          -> bool (rfkill wlan soft state; true on error)
- *   rfkill(verb, what)          side effect only ("block"/"unblock")
- *   rfPersist(ch)            -> bool ('0'/'1' atomic write success)
  *   present(view)               render sink: { blanked, fb (Uint8Array) }
  *   notify(msg)                 sd_notify stand-in ("READY=1"/"WATCHDOG=1")
  *   log(msg)                    stderr stand-in
@@ -36,7 +33,6 @@ const PANEL = (() => {
 const TICK_MS       = 200;      /* repaint/watchdog tick: 5 Hz cap (§3b) */
 const HEALTH_TICKS  = 5;        /* health re-eval every 1 s */
 const BLANK_MS      = 10000;    /* AUTO-BLANK after 10 s without keys */
-const HOLD_MS       = 2000;     /* button A hold for RF toggle */
 const STALE_MS      = 10000;    /* segment considered stalled after this */
 const GPS_SILENT_MS = 5000;     /* NMEA silence -> GPS ERR */
 const BURN_STEP_MS  = 60000;    /* PAGE 0 pixel-shift cadence */
@@ -148,8 +144,9 @@ const FONT8X8 = [
   [0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00], // ~
 ];
 
-/* Hand-drawn 8x16 RF glyphs (bit 0 = leftmost, NOT doubled). Wireless is
- * the user drawing in DashBerry/wireless_glyph.txt ('x' = lit). */
+/* Hand-drawn 8x16 install-mode glyphs (bit 0 = leftmost, NOT doubled):
+ * shield = production (sealed), wireless = debug — the user drawing in
+ * DashBerry/wireless_glyph.txt ('x' = lit). Fixed per card, not runtime. */
 const GLYPH_WIRELESS = [0x3C, 0x42, 0x81, 0x81, 0x3C, 0x42, 0x81, 0x81,
                         0x3C, 0x42, 0x81, 0x99, 0x24, 0x00, 0x18, 0x18];
 const GLYPH_SHIELD  = [0x3E, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
@@ -176,6 +173,7 @@ function create(hw) {
     /* conf (load_conf) */
     let speed_factor = 1.15078;    /* knots -> mph (default) */
     let speed_unit   = "MPH";
+    let debug_card   = false;      /* DEBUG=1 -> wireless glyph; else shield */
 
     /* gpsd client state the UI consumes. The demo has no socket: the
      * harness calls gpsFix()/gpsNoFix() at 5 Hz, which land exactly where
@@ -185,13 +183,6 @@ function create(hw) {
     const health = { front: false, rear: false, gpsok: false,
                      timeok: false, storage: false };
     let df_pct = 0;                /* free space %, for the PAGE 1 DF line */
-    let rf_blocked = true;         /* wifi soft-block, fail-closed default */
-
-    const keys = {
-        a_down: false,
-        a_absorbed: false, /* press was a wake: must release before a hold arms */
-        a_fired: false,    /* toggle already fired during this press */
-    };
 
     const ui = {
         error: false,              /* any health state ERR */
@@ -219,7 +210,6 @@ function create(hw) {
                        (now - gps.last_nmea_ms) <= GPS_SILENT_MS;
         health.timeok = hw.rtcOk();
         health.storage = storage_ok();
-        rf_blocked = hw.rfSoftBlocked();
     }
 
     /* Storage OK: /data mounted rw, free > 0, no accumulated fs errors.
@@ -244,32 +234,6 @@ function create(hw) {
                  health.timeok && health.storage);
     }
 
-    /* -------------------------------------------------------- RF kill -- */
-
-    /* Ordering invariants (PLAN §3, unchanged since rev 4):
-     *   -> OFF: block FIRST (dark ASAP), then persist; a failed persist errs
-     *           dark at next boot anyway — the fail-closed side.
-     *   -> ON:  persist FIRST, unblock ONLY if the persist fully succeeded —
-     *           the radios are never live in a state the disk doesn't
-     *           reflect. */
-    function rf_toggle() {
-        if (!hw.rfSoftBlocked()) {
-            hw.rfkill("block", "wifi");
-            hw.rfkill("block", "bluetooth");
-            if (!hw.rfPersist('0'))
-                hw.log("dashberry-panel: warning: could not persist RF OFF " +
-                       "(next boot fails closed anyway)");
-        } else {
-            if (hw.rfPersist('1')) {
-                hw.rfkill("unblock", "wifi");
-                hw.rfkill("unblock", "bluetooth");
-            } else {
-                hw.log("dashberry-panel: RF stays OFF: state persist failed");
-            }
-        }
-        rf_blocked = hw.rfSoftBlocked();
-    }
-
     /* ---------------------------------------------------------- input -- */
 
     function wake(now) {
@@ -288,34 +252,8 @@ function create(hw) {
         if (key < 0)
             return;
 
-        if (key === KEY.A) {
-            if (press) {
-                keys.a_down = true;
-                keys.a_fired = false;
-                if (!ui.error && ui.blanked) {
-                    /* Wake press is ABSORBED — strictly (§3b): it must not
-                     * count toward a hold. Release, then a fresh 2 s hold,
-                     * is required. */
-                    keys.a_absorbed = true;
-                    wake(now);
-                } else {
-                    if (!ui.error)
-                        ui.last_key_ms = now;
-                    hw.armHold(hold_expired);
-                }
-            } else {
-                keys.a_down = false;
-                keys.a_absorbed = false;
-                hw.disarmHold();
-                if (!ui.error)
-                    ui.last_key_ms = now;
-            }
-            return;
-        }
-
-        /* B / joystick */
         if (ui.error)
-            return;                /* ERROR accepts only the A-hold */
+            return;                /* PAGE 0 is static: all input ignored */
         if (!press) {
             ui.last_key_ms = now;
             return;
@@ -329,15 +267,7 @@ function create(hw) {
             ui.page_idx = (ui.page_idx + NPAGES - 1) % NPAGES;
         else if (key === KEY.RIGHT)
             ui.page_idx = (ui.page_idx + 1) % NPAGES;
-        /* B, UP, DOWN, CENTER: reserved — wake/reset-timer only */
-    }
-
-    /* A-hold expiry: 2 s of continuous, non-absorbed hold. */
-    function hold_expired() {
-        if (keys.a_down && !keys.a_absorbed && !keys.a_fired) {
-            rf_toggle();
-            keys.a_fired = true;
-        }
+        /* A, B, UP, DOWN, CENTER: reserved — wake/reset-timer only */
     }
 
     /* ------------------------------------------------------- rendering -- */
@@ -350,7 +280,7 @@ function create(hw) {
             f.blanked = true;      /* blank hides everything, glyph included */
             return f;
         }
-        f.glyph = rf_blocked ? 'S' : 'W';
+        f.glyph = debug_card ? 'W' : 'S';  /* install mode, fixed per card */
 
         if (ui.error) {
             /* PAGE 0 — static, only failing groups, empty lines omitted */
@@ -449,7 +379,7 @@ function create(hw) {
     /* ----------------------------------------------------------- main -- */
 
     /* main() before the loop: conf, first health pass, honest boot state. */
-    function boot(units) {
+    function boot(units, debug) {
         if (units === "KMH") {     /* load_conf() */
             speed_factor = 1.852;
             speed_unit = "KMH";
@@ -457,6 +387,7 @@ function create(hw) {
             speed_factor = 1.15078;
             speed_unit = "MPH";
         }
+        debug_card = !!debug;      /* DEBUG= in dashberry.conf */
         const now = hw.now();
         ui.page_idx = 0;
         ui.last_key_ms = now;
@@ -541,8 +472,7 @@ function create(hw) {
                 blank_in_ms: ui.error || ui.blanked ? null :
                              Math.max(0, BLANK_MS - (hw.now() - ui.last_key_ms)),
                 health: { ...health },
-                rf_blocked,
-                keys: { ...keys },
+                debug_card,
                 gps: { ...gps },
                 df_pct,
                 repaints, watchdog_pets,
@@ -552,7 +482,7 @@ function create(hw) {
 }
 
 return { create, KEY, KEY_GPIO, XRES, YRES, COLS, ROWS,
-         TICK_MS, HOLD_MS, BLANK_MS, STALE_MS, GPS_SILENT_MS,
+         TICK_MS, BLANK_MS, STALE_MS, GPS_SILENT_MS,
          FONT8X8 };            /* exported so logic-test.js can decode fb */
 
 })();

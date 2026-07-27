@@ -108,7 +108,7 @@
   </div>
 
   <div class="card">
-    <h2>OLED Bonnet inputs (hold A ≈ 2 s = RF kill)</h2>
+    <h2>OLED Bonnet inputs</h2>
     <div id="bonnet">
       <div id="joy">
         <div></div><div class="key" data-key="UP">▲</div><div></div>
@@ -121,7 +121,7 @@
       <div class="key ab" data-key="B">B</div>
     </div>
     <div id="keyhints">keyboard: arrows = joystick · Enter = center ·
-      A / B keys · hold works for the 2 s RF toggle</div>
+      A / B keys (all reserved: wake / reset the blank timer)</div>
   </div>
 
   <div class="card" style="flex:1">
@@ -166,17 +166,17 @@
     </div>
 
     <div class="grp">
-      <label class="row"><input type="checkbox" id="persistfail">
-        RF state persist FAILS (demo the fail-closed ordering)</label>
       <label class="row"><input type="checkbox" id="fastburn">
         test aid: burn-in shift every 3 s instead of 60 s</label>
     </div>
 
     <div class="grp">
       UNITS <select id="units"><option>MPH</option><option>KMH</option></select>
+      <label class="row"><input type="checkbox" id="debugcard">
+        DEBUG=1 card (wireless glyph; unchecked = production, shield)</label>
       <button class="act" id="restart">restart panel daemon</button>
       <span style="color:var(--dim);font-size:11.5px">(conf is read at boot,
-        as in the C; rfkill state survives the restart)</span>
+        as in the C)</span>
     </div>
   </div>
 
@@ -199,7 +199,6 @@ const $ = (id) => document.getElementById(id);
 
 const sim = {
     frontLast: 0, rearLast: 0,
-    rfSoftBlocked: true,           /* rf-state oneshot booted us dark */
     lat: 43.61871, lon: -116.21460, heading: 1.1,
 };
 
@@ -214,13 +213,8 @@ function logLine(msg, hi) {
     logEl.scrollTop = logEl.scrollHeight;
 }
 
-let holdTimer = null;
-
 const hw = {
     now: () => performance.now(),
-    armHold: (cb) => { clearTimeout(holdTimer);
-                       holdTimer = setTimeout(cb, PANEL.HOLD_MS); },
-    disarmHold: () => clearTimeout(holdTimer),
     frontNewestMtimeMs: () => sim.frontLast,
     rearNewestMtimeMs: () => sim.rearLast,
     rtcOk: () => $("rtc").checked,
@@ -229,19 +223,6 @@ const hw = {
         const pct = parseFloat($("free").value);
         return { rw: $("rw").checked, freePct: pct,
                  fsErrors: $("fserr").checked };
-    },
-    rfSoftBlocked: () => sim.rfSoftBlocked,
-    rfkill: (verb, what) => {
-        logLine(`exec: rfkill ${verb} ${what}`, true);
-        if (what === "wifi") sim.rfSoftBlocked = (verb === "block");
-    },
-    rfPersist: (ch) => {
-        if ($("persistfail").checked) {
-            logLine(`persist /data/rf/state <- '${ch}'  ** FAILED **`, true);
-            return false;
-        }
-        logLine(`persist /data/rf/state <- '${ch}' (tmp,fsync,rename,fsync)`);
-        return true;
     },
     present: (view) => blit(view),
     notify: (msg) => { if (msg === "READY=1") logLine("sd_notify: READY=1"); },
@@ -342,9 +323,6 @@ setInterval(() => {
         if (s.blanked !== prev.blanked)
             logLine(s.blanked ? "AUTO-BLANK: display off"
                               : "wake (key absorbed, PAGE 1)");
-        if (s.rf_blocked !== prev.rf_blocked)
-            logLine(s.rf_blocked ? "RF: BLOCKED (shield)"
-                                 : "RF: LIVE (wireless)", true);
     }
     prev = s;
 
@@ -352,13 +330,12 @@ setInterval(() => {
     $("bigstate").innerHTML =
         `<span class="pill ${s.error ? "off" : "on"}">${s.error ? "ERROR — PAGE 0" : "OK — PAGE " + s.page}</span>` +
         `<span class="pill ${s.blanked ? "off" : "on"}">${s.blanked ? "BLANKED" : "SCREEN ON"}</span>` +
-        `<span class="pill ${s.rf_blocked ? "on" : "off"}">${s.rf_blocked ? "RF BLOCKED 🛡" : "RF LIVE 📡"}</span>`;
+        `<span class="pill ${s.debug_card ? "off" : "on"}">${s.debug_card ? "DEBUG 📡" : "PRODUCTION 🛡"}</span>`;
     $("healthpills").innerHTML =
         ["front", "rear", "gpsok", "timeok", "storage"].map(k =>
             `<span class="pill ${s.health[k] ? "on" : "off"}">${k}</span>`
         ).join("");
     $("kv").innerHTML = [
-        ["A key", `down=${s.keys.a_down} absorbed=${s.keys.a_absorbed} fired=${s.keys.a_fired}`],
         ["gps", s.gps.have_fix
             ? `${s.gps.lat.toFixed(5)}, ${s.gps.lon.toFixed(5)} @ ${s.gps.knots.toFixed(1)} kn`
             : "no fix"],
@@ -382,12 +359,14 @@ $("fastburn").addEventListener("change", () =>
 function bootPanel() {
     panel = PANEL.create(hw);
     panel.setBurnStepMs($("fastburn").checked ? 3000 : 60000);
-    panel.boot($("units").value);
+    panel.boot($("units").value, $("debugcard").checked);
     prev = null;
-    logLine(`dashberry-panel booted (UNITS=${$("units").value}); ` +
+    logLine(`dashberry-panel booted (UNITS=${$("units").value}, ` +
+            `DEBUG=${$("debugcard").checked ? 1 : 0}); ` +
             `health must prove itself — expect a moment of PAGE 0`, true);
 }
 $("restart").addEventListener("click", bootPanel);
+$("debugcard").addEventListener("change", bootPanel);
 bootPanel();
 </script>
 </body>

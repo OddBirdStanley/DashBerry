@@ -6,11 +6,13 @@
  *     character-device v2 API, with strict wake-key absorption;
  *   - PAGE 0 / PAGE 1 rendering to /dev/fb1 (ssd1307fb, 1 bpp mmap);
  *   - AUTO-BLANK (10 s, OK state only);
- *   - the runtime half of the RF kill (button A ~2 s hold), with
- *     persist-before-unblock ordering (fail-closed);
  *   - health evaluation from real signals (segments growing, NMEA flowing,
  *     RTC readable, /data writable-with-space);
  *   - systemd watchdog liveness (hand-rolled sd_notify, Type=notify).
+ *
+ * The bottom-right glyph cell reports the INSTALL MODE, baked at build of
+ * the card (DEBUG in /etc/dashberry.conf): shield = production (sealed),
+ * wireless = debug (radios/ssh live). There is no runtime RF toggling.
  *
  * No libgpiod, no libsystemd, no libm. Portable POSIX + Linux UAPI headers.
  * Build: cc -std=c11 -Wall -Wextra -O2 -o dashberry-panel dashberry-panel.c
@@ -41,7 +43,6 @@
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/un.h>
-#include <sys/wait.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -58,9 +59,6 @@
 #define FRONT_BASE    "/data/front"
 #define REAR_BASE     "/data/rear"
 #define DATA_MNT      "/data"
-#define RF_DIR        "/data/rf"
-#define RF_STATE      "/data/rf/state"
-#define RF_TMP        "/data/rf/.state.tmp"
 #define RTC_EPOCH     "/sys/class/rtc/rtc0/since_epoch"
 
 /* --------------------------------------------------------------- timing - */
@@ -68,7 +66,6 @@
 #define TICK_MS          200      /* repaint/watchdog tick: 5 Hz cap (§3b) */
 #define HEALTH_TICKS     5        /* health re-eval every 1 s */
 #define BLANK_MS         10000    /* AUTO-BLANK after 10 s without keys */
-#define HOLD_SECS        2        /* button A hold for RF toggle */
 #define STALE_SECS       10       /* segment considered stalled after this */
 #define GPS_SILENT_MS    5000     /* NMEA silence -> GPS ERR */
 #define GPS_BACKOFF_MAX  10000    /* gpsd reconnect backoff ceiling (ms) */
@@ -114,21 +111,6 @@ static int read_small(const char *path, char *buf, size_t len)
         return -1;
     buf[n] = '\0';
     return (int)n;
-}
-
-static int run_cmd(const char *a0, const char *a1, const char *a2)
-{
-    pid_t pid = fork();
-    if (pid < 0)
-        return -1;
-    if (pid == 0) {
-        execlp(a0, a0, a1, a2, (char *)NULL);
-        _exit(127);
-    }
-    int st;
-    if (waitpid(pid, &st, 0) < 0)
-        return -1;
-    return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
 }
 
 /* ---------------------------------------------------- sd_notify (inline) - */
@@ -267,10 +249,11 @@ static const uint8_t font8x8[95][8] = {
     {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, /* ~   */
 };
 
-/* Hand-drawn 8x16 RF glyphs (bit 0 = leftmost, one byte per pixel row —
- * NOT doubled). Wireless = radios live — user drawing, source of truth
- * DashBerry/wireless_glyph.txt ('x' = lit); shield = radios blocked (the
- * fail-closed default face). VERIFY-visual: legibility + orientation. */
+/* Hand-drawn 8x16 mode glyphs (bit 0 = leftmost, one byte per pixel row —
+ * NOT doubled). The cell reports the INSTALL MODE, fixed for the card's
+ * lifetime: wireless = DEBUG build (radios/ssh live) — user drawing,
+ * source of truth DashBerry/wireless_glyph.txt ('x' = lit); shield =
+ * PRODUCTION build (sealed). VERIFY-visual: legibility + orientation. */
 static const uint8_t glyph_wireless[16] = {
     0x3C, 0x42, 0x81, 0x81, 0x3C, 0x42, 0x81, 0x81,
     0x3C, 0x42, 0x81, 0x99, 0x24, 0x00, 0x18, 0x18,
@@ -366,12 +349,14 @@ static double      speed_factor = 1.15078;   /* knots -> mph (default) */
 static const char *speed_unit   = "MPH";
 static bool        bypass_time;    /* BYPASS_TIME=1: installed without DS3231 */
 static bool        bypass_rear;    /* BYPASS_REAR=1: installed without rear cam */
+static bool        debug_card;     /* DEBUG=1: debug build — wireless glyph;
+                                      default 0 = production — shield glyph */
 
 static void load_conf(void)
 {
     FILE *f = fopen(CONF_PATH, "r");
     if (!f)
-        return;                    /* defaults stand */
+        return;                    /* defaults stand (production face) */
     char line[256];
     while (fgets(line, sizeof line, f)) {
         if (strncmp(line, "UNITS=", 6) == 0) {
@@ -386,6 +371,8 @@ static void load_conf(void)
             bypass_time = line[12] == '1';
         } else if (strncmp(line, "BYPASS_REAR=", 12) == 0) {
             bypass_rear = line[12] == '1';
+        } else if (strncmp(line, "DEBUG=", 6) == 0) {
+            debug_card = line[6] == '1';
         }
     }
     fclose(f);
@@ -537,7 +524,6 @@ static struct {
 } health = { false, false, false, false, false };
 
 static double df_pct;              /* free space %, for the PAGE 1 DF line */
-static bool   rf_blocked = true;   /* wifi soft-block, fail-closed default */
 
 static time_t newest_mp4_mtime(const char *base, const char *session)
 {
@@ -562,32 +548,6 @@ static time_t newest_mp4_mtime(const char *base, const char *session)
     }
     closedir(d);
     return newest;
-}
-
-static bool wifi_soft_blocked(void)
-{
-    DIR *d = opendir("/sys/class/rfkill");
-    if (!d)
-        return true;               /* cannot tell -> present the dark face */
-    bool blocked = true;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (strncmp(e->d_name, "rfkill", 6) != 0)
-            continue;
-        char p[288], buf[32];
-        snprintf(p, sizeof p, "/sys/class/rfkill/%s/type", e->d_name);
-        if (read_small(p, buf, sizeof buf) <= 0)
-            continue;
-        if (strncmp(buf, "wlan", 4) != 0)
-            continue;
-        snprintf(p, sizeof p, "/sys/class/rfkill/%s/soft", e->d_name);
-        if (read_small(p, buf, sizeof buf) <= 0)
-            break;
-        blocked = (buf[0] == '1');
-        break;
-    }
-    closedir(d);
-    return blocked;
 }
 
 static bool rtc_ok(void)
@@ -673,7 +633,6 @@ static void eval_health(int64_t now)
                    (now - gps.last_nmea_ms) <= GPS_SILENT_MS;
     health.timeok = bypass_time || rtc_ok();
     health.storage = storage_ok();
-    rf_blocked = wifi_soft_blocked();
 }
 
 static bool system_err(void)
@@ -682,70 +641,11 @@ static bool system_err(void)
              health.timeok && health.storage);
 }
 
-/* -------------------------------------------------------------- RF kill - */
-
-/* Atomic persist of the 1-byte RF state: write tmp -> fsync file -> rename
- * -> fsync dir. All four must succeed before the caller may unblock. */
-static bool rf_persist(char v)
-{
-    mkdir(RF_DIR, 0755);           /* EEXIST is fine */
-    int fd = open(RF_TMP, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd < 0)
-        return false;
-    bool ok = write(fd, &v, 1) == 1 && fsync(fd) == 0;
-    close(fd);
-    if (!ok) {
-        unlink(RF_TMP);
-        return false;
-    }
-    if (rename(RF_TMP, RF_STATE) != 0) {
-        unlink(RF_TMP);
-        return false;
-    }
-    int dfd = open(RF_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (dfd < 0)
-        return false;
-    ok = fsync(dfd) == 0;
-    close(dfd);
-    return ok;
-}
-
-/* Ordering invariants (PLAN §3, unchanged since rev 4):
- *   -> OFF: block FIRST (dark ASAP), then persist; a failed persist errs
- *           dark at next boot anyway — the fail-closed side.
- *   -> ON:  persist FIRST, unblock ONLY if the persist fully succeeded —
- *           the radios are never live in a state the disk doesn't reflect. */
-static void rf_toggle(void)
-{
-    if (!wifi_soft_blocked()) {
-        run_cmd("rfkill", "block", "wifi");
-        run_cmd("rfkill", "block", "bluetooth");
-        if (!rf_persist('0'))
-            fprintf(stderr, "dashberry-panel: warning: could not persist RF "
-                            "OFF (next boot fails closed anyway)\n");
-    } else {
-        if (rf_persist('1')) {
-            run_cmd("rfkill", "unblock", "wifi");
-            run_cmd("rfkill", "unblock", "bluetooth");
-        } else {
-            fprintf(stderr, "dashberry-panel: RF stays OFF: state persist "
-                            "failed\n");
-        }
-    }
-    rf_blocked = wifi_soft_blocked();
-}
-
 /* ------------------------------------------------------------- UI state - */
 
 enum key { KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_CENTER, KEY_A, KEY_B,
            KEY_COUNT };
 static const uint32_t key_gpio[KEY_COUNT] = { 17, 22, 27, 23, 4, 5, 6 };
-
-static struct {
-    bool a_down;
-    bool a_absorbed;   /* press was a wake: must release before a hold arms */
-    bool a_fired;      /* toggle already fired during this press */
-} keys;
 
 static const int pages[] = { 1 };  /* PAGE 1 is the only designed page today */
 #define NPAGES ((int)(sizeof pages / sizeof pages[0]))
@@ -760,23 +660,6 @@ static struct {
 } ui;
 
 static const int burn_offsets[4] = { 0, 1, 0, -1 };
-
-static int hold_fd = -1;
-
-static void arm_hold(void)
-{
-    struct itimerspec its;
-    memset(&its, 0, sizeof its);
-    its.it_value.tv_sec = HOLD_SECS;
-    timerfd_settime(hold_fd, 0, &its, NULL);
-}
-
-static void disarm_hold(void)
-{
-    struct itimerspec its;
-    memset(&its, 0, sizeof its);
-    timerfd_settime(hold_fd, 0, &its, NULL);
-}
 
 static void wake(int64_t now)
 {
@@ -796,33 +679,8 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
     if (key < 0)
         return;
 
-    if (key == KEY_A) {
-        if (press) {
-            keys.a_down = true;
-            keys.a_fired = false;
-            if (!ui.error && ui.blanked) {
-                /* Wake press is ABSORBED — strictly (§3b): it must not count
-                 * toward a hold. Release, then a fresh 2 s hold, is required. */
-                keys.a_absorbed = true;
-                wake(now);
-            } else {
-                if (!ui.error)
-                    ui.last_key_ms = now;
-                arm_hold();
-            }
-        } else {
-            keys.a_down = false;
-            keys.a_absorbed = false;
-            disarm_hold();
-            if (!ui.error)
-                ui.last_key_ms = now;
-        }
-        return;
-    }
-
-    /* B / joystick */
     if (ui.error)
-        return;                    /* ERROR accepts only the A-hold */
+        return;                    /* PAGE 0 is static: all input ignored */
     if (!press) {
         ui.last_key_ms = now;
         return;
@@ -836,7 +694,7 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
         ui.page_idx = (ui.page_idx + NPAGES - 1) % NPAGES;
     else if (key == KEY_RIGHT)
         ui.page_idx = (ui.page_idx + 1) % NPAGES;
-    /* B, UP, DOWN, CENTER: reserved — wake/reset-timer only */
+    /* A, B, UP, DOWN, CENTER: reserved — wake/reset-timer only */
 }
 
 /* ------------------------------------------------------------ rendering - */
@@ -844,7 +702,7 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
 struct frame {
     bool blanked;
     int  yoff;
-    char glyph;                    /* 'W' wireless, 'S' shield */
+    char glyph;                    /* 'W' wireless (debug), 'S' shield (prod) */
     char rows[ROWS][COLS + 1];
 };
 
@@ -856,7 +714,7 @@ static void compose(struct frame *f)
         f->blanked = true;         /* blank hides everything, glyph included */
         return;
     }
-    f->glyph = rf_blocked ? 'S' : 'W';
+    f->glyph = debug_card ? 'W' : 'S';   /* install mode, fixed per card */
 
     if (ui.error) {
         /* PAGE 0 — static, only failing groups, empty lines omitted */
@@ -972,8 +830,7 @@ int main(void)
         return 1;
 
     int tick_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    hold_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    if (tick_fd < 0 || hold_fd < 0) {
+    if (tick_fd < 0) {
         fprintf(stderr, "dashberry-panel: timerfd: %s\n", strerror(errno));
         return 1;
     }
@@ -999,14 +856,12 @@ int main(void)
     int subtick = 0;
 
     for (;;) {
-        struct pollfd pfd[4];
+        struct pollfd pfd[3];
         int n = 0;
         int i_gpio = n;
         pfd[n++] = (struct pollfd){ .fd = gpio_fd, .events = POLLIN };
         int i_tick = n;
         pfd[n++] = (struct pollfd){ .fd = tick_fd, .events = POLLIN };
-        int i_hold = n;
-        pfd[n++] = (struct pollfd){ .fd = hold_fd, .events = POLLIN };
         int i_gps = -1;
         if (gps.fd >= 0) {
             i_gps = n;
@@ -1035,16 +890,6 @@ int main(void)
                     (const struct gpio_v2_line_event *)((char *)ev + k);
                 handle_key(e->offset,
                            e->id == GPIO_V2_LINE_EVENT_RISING_EDGE, now);
-            }
-        }
-
-        /* --- A-hold expiry: 2 s of continuous, non-absorbed hold --- */
-        if (pfd[i_hold].revents & POLLIN) {
-            uint64_t exp;
-            if (read(hold_fd, &exp, sizeof exp) == sizeof exp &&
-                keys.a_down && !keys.a_absorbed && !keys.a_fired) {
-                rf_toggle();
-                keys.a_fired = true;
             }
         }
 

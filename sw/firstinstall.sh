@@ -10,12 +10,14 @@
 # merge boot/config-snippet.txt and etc/fstab.snippet by hand).
 #
 # Options come from two places, both written by dashberry-install:
-#   - BYPASS_TIME / BYPASS_REAR in ./etc/dashberry.conf (the copy installed
-#     to /etc below — panel and installer read the same truth);
-#   - READONLY in ../install-opts (enable the overlayfs at the end);
+#   - BYPASS_TIME / BYPASS_REAR / DEBUG in ./etc/dashberry.conf (the copy
+#     installed to /etc below — panel and installer read the same truth).
+#     DEBUG=0 is a PRODUCTION card: the OS goes read-only (overlayfs) and
+#     every Wi-Fi trace (profile, leases, regdom token, journal) is wiped.
+#     DEBUG=1 is a DEBUG card: writable OS, Wi-Fi profile and journal kept,
+#     and the journal made persistent (/var/log/journal);
 #   - FIRSTBOOT_WIFI in ../install-opts (this boot runs over a staged Wi-Fi
-#     profile instead of Ethernet; every trace of it is wiped below, before
-#     the overlay can freeze it into the read-only OS).
+#     profile instead of Ethernet).
 #
 # dashberry-cli (../cli) is PC-side and is deliberately NOT installed here —
 # it never ships on the image (PLAN §3c).
@@ -29,7 +31,7 @@ FROM_UNIT=0
 
 BYPASS_TIME=0
 BYPASS_REAR=0
-READONLY=0
+DEBUG=0
 FIRSTBOOT_WIFI=0
 . ./etc/dashberry.conf
 [ -f ../install-opts ] && . ../install-opts
@@ -39,12 +41,11 @@ CMDLINE=/boot/firmware/cmdline.txt
 
 if [ "$FIRSTBOOT_WIFI" = 1 ]; then
     echo "first-boot Wi-Fi: unblocking and waiting for the network..."
-    # rf-state.service is not enabled yet (that happens below), so nothing
-    # re-blocks the radio this boot. The cmdline regdom staged by
-    # dashberry-install should already have left wlan unblocked (VERIFY on
-    # bench: Trixie honors cfg80211.ieee80211_regdom headless — known good
-    # on bookworm, unconfirmed on trixie); these are belt-and-braces —
-    # rfkill may not exist on the stock image yet.
+    # The cmdline regdom staged by dashberry-install should already have
+    # left wlan unblocked (VERIFY on bench: Trixie honors
+    # cfg80211.ieee80211_regdom headless — known good on bookworm,
+    # unconfirmed on trixie); these are belt-and-braces — rfkill may not
+    # exist on the stock image yet.
     rfkill unblock wifi 2>/dev/null || true
     nmcli radio wifi on 2>/dev/null || true
     nm-online -q -t 90 || echo "network not online yet — apt will retry" >&2
@@ -61,7 +62,7 @@ until apt-get update; do
             echo "reboot to retry, or run /opt/dashberry/sw/firstinstall.sh by hand." >&2
         else
             echo "apt-get update keeps failing — is Ethernet connected?" >&2
-            echo "(Wi-Fi is rfkill-blocked by design; fix the network and reboot" >&2
+            echo "(no Wi-Fi is configured on this card; fix the network and reboot" >&2
             echo " to retry, or run /opt/dashberry/sw/firstinstall.sh by hand.)" >&2
         fi
         exit 1
@@ -70,7 +71,7 @@ until apt-get update; do
 done
 apt-get install -y --no-install-recommends \
     rpicam-apps-lite gstreamer1.0-tools gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad gpsd gpsd-clients rfkill chrony gcc make
+    gstreamer1.0-plugins-bad gpsd gpsd-clients chrony gcc make
 
 echo "building panel daemon..."
 make -C src
@@ -92,12 +93,12 @@ if [ "$BYPASS_TIME" = "1" ]; then
     printf 'makestep 1 -1\n' >> /etc/chrony/conf.d/gps-refclock.conf
 fi
 
-mkdir -p /data/front /data/rear /data/gps /data/rf
+mkdir -p /data/front /data/rear /data/gps
 
 echo "enabling units..."
 systemctl daemon-reload
 udevadm control --reload
-enable_units="dashberry.target rf-state.service session.service \
+enable_units="dashberry.target session.service \
     gps-rate.service front-rec.service gps-log.service panel.service \
     retention.timer"
 if [ "$BYPASS_REAR" = "1" ]; then
@@ -108,23 +109,31 @@ fi
 # shellcheck disable=SC2086 — word splitting is the point
 systemctl enable $enable_units
 
-if [ "$FIRSTBOOT_WIFI" = 1 ]; then
-    echo "wiping first-boot Wi-Fi traces..."
+if [ "$DEBUG" = 1 ]; then
+    # DEBUG card: keep the Wi-Fi profile (the card rejoins the LAN every
+    # boot), keep the journal, and make it persistent — /var/log/journal
+    # existing flips journald's Storage=auto to disk from the next boot,
+    # so crash-window logs survive a power cut on the writable OS.
+    echo "debug card: keeping Wi-Fi + journal; enabling persistent journal..."
+    mkdir -p /var/log/journal
+else
+    echo "production card: wiping first-boot Wi-Fi traces..."
     # Must happen BEFORE the overlay flip: anything left now is frozen into
     # the read-only OS forever. Wiped: the NM profile (holds the plaintext
     # PSK), DHCP leases and the seen-bssids cache, the cmdline regdom token,
-    # and the journal (NM logs the SSID). nmcli radio wifi off additionally
-    # persists WirelessEnabled=false into NetworkManager.state. From the
-    # next boot rf-state fails closed as on any fresh card (/data/rf empty).
+    # and — on a Wi-Fi install — the journal (NM logs the SSID; the PSK
+    # never reaches it). nmcli radio wifi off additionally persists
+    # WirelessEnabled=false into NetworkManager.state, so a production card
+    # never scans or associates again.
     nmcli radio wifi off 2>/dev/null || true
     rm -f /etc/NetworkManager/system-connections/dashberry-firstboot.nmconnection
     rm -f /var/lib/NetworkManager/*.lease
     rm -f /var/lib/NetworkManager/seen-bssids
     sed -i 's/ cfg80211\.ieee80211_regdom=[A-Za-z][A-Za-z]//g' "$CMDLINE"
-    journalctl --rotate --vacuum-time=1s >/dev/null 2>&1 || true
-fi
+    if [ "$FIRSTBOOT_WIFI" = 1 ]; then
+        journalctl --rotate --vacuum-time=1s >/dev/null 2>&1 || true
+    fi
 
-if [ "$READONLY" = "1" ]; then
     echo "enabling the read-only OS overlay..."
     # VERIFY (bench): nonint do_overlayfs works headless — 0 = enable in
     # raspi-config's convention; takes effect at the next boot.

@@ -2,9 +2,8 @@
  * Run: node logic-test.js
  *
  * Virtual clock + simulated hardware; time only moves through advance(),
- * which steps in 200 ms ticks and fires the A-hold timer in order, so
- * every timing rule (10 s blank, 2 s hold, 10 s stale, 5 s GPS silence)
- * is exercised deterministically.
+ * which steps in 200 ms ticks, so every timing rule (10 s blank, 10 s
+ * stale, 5 s GPS silence) is exercised deterministically.
  */
 
 "use strict";
@@ -22,36 +21,18 @@ const sim = {
     lat: -30.123456, lon: 111.222222, knots: 78.3,
     rtcOk: true,
     mounted: true, rw: true, freePct: 90.1, fsErrors: false,
-    rfSoftBlocked: true,           /* fail-closed boot default */
-    persistFail: false,
-    logs: [], rfkillCalls: [], persisted: [],
+    logs: [],
     presented: null,
 };
 
-let holdCb = null, holdAt = Infinity;
-
 const hw = {
     now: () => vt.now,
-    armHold: (cb) => { holdCb = cb; holdAt = vt.now + PANEL.HOLD_MS; },
-    disarmHold: () => { holdCb = null; holdAt = Infinity; },
     frontNewestMtimeMs: () => sim.frontLast,
     rearNewestMtimeMs: () => sim.rearLast,
     rtcOk: () => sim.rtcOk,
     statvfs: () => sim.mounted
         ? { rw: sim.rw, freePct: sim.freePct, fsErrors: sim.fsErrors }
         : null,
-    rfSoftBlocked: () => sim.rfSoftBlocked,
-    rfkill: (verb, what) => {
-        sim.rfkillCalls.push(`${verb} ${what}`);
-        if (what === "wifi")
-            sim.rfSoftBlocked = (verb === "block");
-    },
-    rfPersist: (ch) => {
-        if (sim.persistFail)
-            return false;
-        sim.persisted.push(ch);
-        return true;
-    },
     present: (view) => { sim.presented = { blanked: view.blanked,
                                            fb: Uint8Array.from(view.fb) }; },
     notify: () => {},
@@ -61,17 +42,11 @@ const hw = {
 const panel = PANEL.create(hw);
 
 /* Step virtual time in 200 ms ticks, feeding writers/GPS like the real
- * services would, firing the hold timer at its exact deadline. */
+ * services would. */
 function advance(ms) {
     const end = vt.now + ms;
     while (vt.now < end) {
         vt.now = Math.min(vt.now + PANEL.TICK_MS, end);
-        if (holdCb && vt.now >= holdAt) {
-            const cb = holdCb;
-            holdCb = null;
-            holdAt = Infinity;
-            cb();
-        }
         if (sim.frontWriting) sim.frontLast = vt.now;
         if (sim.rearWriting)  sim.rearLast = vt.now;
         if (sim.gpsDelivering) {
@@ -169,9 +144,9 @@ ok(s.error === false, "1 s in: all signals proven -> OK");
 ok(s.page === 1, "OK state shows PAGE 1");
 ok(s.health.front && s.health.rear && s.health.gpsok && s.health.timeok &&
    s.health.storage, "all five health states ON");
-ok(s.rf_blocked === true, "RF fail-closed default: blocked");
+ok(s.debug_card === false, "boot without DEBUG=1 is a production card");
 ok(glyphCellPixels().join("") === expectedGlyphPixels('S').join(""),
-   "reserved cell (row 3, col 15) shows the shield glyph");
+   "reserved cell (row 3, col 15) shows the shield glyph (production)");
 
 /* Formatting, decoded from the rendered framebuffer: 5-decimal coords,
  * rounded SPD, and values aligned at column 4 — 3-char labels take one
@@ -202,52 +177,15 @@ ok(panel.state().blanked === false, "wake reset the 10 s timer");
 advance(1200);
 ok(panel.state().blanked === true, "…and blanks again 10 s after the key");
 
-/* Strict absorption of A: wake press must NOT count toward the hold. */
+/* Strict absorption of A: pressed while blanked it wakes, nothing more —
+ * button A is a plain reserved key now (no hold, no toggle). */
 press(PANEL.KEY.A);                /* wakes, absorbed */
-advance(3000);                     /* held well past 2 s */
+advance(3000);                     /* held well past any old hold window */
 s = panel.state();
 ok(s.blanked === false, "A pressed while blanked wakes");
-ok(s.rf_blocked === true, "absorbed A press never fires the RF toggle");
+ok(glyphCellPixels().join("") === expectedGlyphPixels('S').join(""),
+   "holding A changes nothing: glyph still the shield");
 release(PANEL.KEY.A);
-
-/* A fresh 2 s hold from awake DOES toggle: blocked -> unblocked, and the
- * persist happens BEFORE the unblock (persist-then-unblock ordering). */
-sim.rfkillCalls.length = 0;
-sim.persisted.length = 0;
-press(PANEL.KEY.A);
-advance(2200);
-s = panel.state();
-ok(s.rf_blocked === false, "fresh 2 s A-hold unblocks RF");
-ok(sim.persisted[0] === '1' && sim.rfkillCalls[0] === "unblock wifi",
-   "ON path: persist '1' strictly before rfkill unblock");
-advance(1000);
-ok(panel.state().rf_blocked === false, "continued hold does not re-toggle (a_fired)");
-release(PANEL.KEY.A);
-ok(glyphCellPixels().join("") === expectedGlyphPixels('W').join(""),
-   "reserved cell now shows the wireless glyph (per wireless_glyph.txt)");
-
-/* OFF path: block first, then persist. */
-sim.rfkillCalls.length = 0;
-sim.persisted.length = 0;
-press(PANEL.KEY.A);
-advance(2200);
-release(PANEL.KEY.A);
-s = panel.state();
-ok(s.rf_blocked === true, "next hold re-blocks");
-ok(sim.rfkillCalls[0] === "block wifi" && sim.persisted[0] === '0',
-   "OFF path: rfkill block strictly before persist '0'");
-
-/* Fail-closed: with the persist failing, RF must refuse to come up. */
-sim.persistFail = true;
-sim.logs.length = 0;
-press(PANEL.KEY.A);
-advance(2200);
-release(PANEL.KEY.A);
-s = panel.state();
-ok(s.rf_blocked === true, "persist failure -> radios stay dark");
-ok(sim.logs.some(m => m.includes("persist failed")),
-   "…and the refusal is logged");
-sim.persistFail = false;
 
 /* PAGE 0 assembly: kill front cam -> stale after 10 s, error line FRONT. */
 sim.frontWriting = false;
@@ -266,14 +204,14 @@ s = panel.state();
 ok(!s.health.front && !s.health.rear && !s.health.gpsok,
    "front+rear stale, GPS silent 5 s -> three ERRs");
 
-/* ERROR page: joystick/B are dead; only the A-hold works. */
+/* ERROR page: all input is dead — A included. */
 press(PANEL.KEY.RIGHT); release(PANEL.KEY.RIGHT);
 press(PANEL.KEY.B); release(PANEL.KEY.B);
 ok(panel.state().page === 0, "PAGE 0 ignores joystick/B");
 press(PANEL.KEY.A);
 advance(2200);
 release(PANEL.KEY.A);
-ok(panel.state().rf_blocked === false, "PAGE 0 still honors the A-hold");
+ok(panel.state().page === 0, "PAGE 0 ignores A too (no toggle exists)");
 
 /* Storage: full -> its own line. */
 sim.freePct = 0;
@@ -305,6 +243,17 @@ advance(1400);
 s = panel.state();
 ok(s.error === false, "no-fix is NOT a GPS ERR (sentences still flowing)");
 ok(s.gps.have_fix === false, "…but PAGE 1 will show LAT/LON/SPD ---");
+
+/* DEBUG card: boot with DEBUG=1 -> wireless glyph, fixed for the card's
+ * lifetime (install mode is conf-baked, there is no runtime RF state). */
+{
+    const dbg = PANEL.create(hw);
+    dbg.boot("MPH", true);
+    dbg.tick();                    /* first paint (PAGE 0: nothing proven) */
+    ok(dbg.state().debug_card === true, "DEBUG=1 boot is a debug card");
+    ok(glyphCellPixels().join("") === expectedGlyphPixels('W').join(""),
+       "debug card shows the wireless glyph (per wireless_glyph.txt)");
+}
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 process.exit(failures ? 1 : 0);
