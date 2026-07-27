@@ -84,6 +84,24 @@ install -m 644 etc/systemd/system/* /etc/systemd/system/
 install -m 644 etc/udev/rules.d/99-dashberry.rules /etc/udev/rules.d/
 install -D -m 644 etc/chrony/conf.d/gps-refclock.conf /etc/chrony/conf.d/gps-refclock.conf
 
+echo "configuring gpsd ($GPS_DEV, static, no hotplug)..."
+# Debian's default gpsd setup adds the device via udev hotplug: udev fires
+# gpsdctl@ttyACM0, which races gpsd.socket at boot — if /run/gpsd.sock isn't
+# up yet, gpsdctl launches its own gpsd, which then loses the bind on port
+# 2947 to the socket unit and dies ("can't bind to IPv4 port gpsd, Address
+# already in use"). The device never registers and gpsd runs with no GPS.
+# The puck is permanently attached, so hotplug buys nothing: pin DEVICES,
+# turn USBAUTO off, and mask gpsdctl@ so the racing path can't run at all.
+# -n: open the device without waiting for a client, so chrony's SHM refclock
+# gets fixes even if gps-log is down.
+cat > /etc/default/gpsd <<EOF
+# written by DashBerry firstinstall.sh — static device, no USB hotplug
+DEVICES="$GPS_DEV"
+GPSD_OPTIONS="-n"
+USBAUTO="false"
+EOF
+systemctl mask gpsdctl@.service
+
 if [ "$BYPASS_TIME" = "1" ]; then
     # No DS3231: GPS is the only wall-clock source, so the refclock must be
     # trusted (drop noselect) and chrony must be allowed to step the clock at
