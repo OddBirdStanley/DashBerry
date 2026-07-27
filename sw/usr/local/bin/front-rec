@@ -22,7 +22,12 @@ rpicam-vid -t 0 -n \
     --width "$FRONT_W" --height "$FRONT_H" --framerate "$FRONT_FPS" \
     --bitrate "$FRONT_BITRATE" --inline --intra "$FRONT_FPS" \
     --codec h264 -o - |
-gst-launch-1.0 -e fdsrc fd=0 \
+# do-timestamp: the pipe carries a bare H.264 elementary stream (no PTS);
+# mp4mux refuses untimestamped buffers ("Could not multiplex stream" on the
+# first one) and splitmuxsink can't cut 60 s segments without running time.
+# Read-arrival stamping adds a few ms pipe jitter per frame — fine here,
+# GPS correlation runs off file mtimes, not sample times.
+gst-launch-1.0 -e fdsrc fd=0 do-timestamp=true \
     ! h264parse \
     ! splitmuxsink location="$OUT/%05d.mp4" \
         start-index="$START_INDEX" \
