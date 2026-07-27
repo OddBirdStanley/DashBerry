@@ -36,8 +36,14 @@ rpicam-vid -t 0 -n \
 #    encoder emits no B-frames, so effectively PTS = DTS.
 # Read-arrival stamping adds a few ms pipe jitter per frame — fine here,
 # GPS correlation runs off file mtimes, not sample times.
+# The caps must be FULLY fixed, width/height included: fdsrc's template is
+# ANY, so basesrc skips negotiation and pushes the first buffer with no caps
+# event. capsfilter then has to derive output caps from filter ∩ downstream,
+# and mp4mux's pad template contributes width/height ranges [16,MAX] — an
+# unfixed result aborts the pipeline before preroll ("Filter caps do not
+# completely specify the output format").
 gst-launch-1.0 -e fdsrc fd=0 do-timestamp=true \
-    ! video/x-h264,stream-format=byte-stream,framerate="$FRONT_FPS"/1 \
+    ! video/x-h264,stream-format=byte-stream,width="$FRONT_W",height="$FRONT_H",framerate="$FRONT_FPS"/1 \
     ! h264parse \
     ! h264timestamper \
     ! splitmuxsink location="$OUT/%05d.mp4" \
