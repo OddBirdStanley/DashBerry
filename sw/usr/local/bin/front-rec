@@ -22,13 +22,24 @@ rpicam-vid -t 0 -n \
     --width "$FRONT_W" --height "$FRONT_H" --framerate "$FRONT_FPS" \
     --bitrate "$FRONT_BITRATE" --inline --intra "$FRONT_FPS" \
     --codec h264 -o - |
-# do-timestamp: the pipe carries a bare H.264 elementary stream (no PTS);
-# mp4mux refuses untimestamped buffers ("Could not multiplex stream" on the
-# first one) and splitmuxsink can't cut 60 s segments without running time.
+# Timestamping, two stages (SETTLED on bench, second iteration): the pipe
+# carries a bare H.264 elementary stream with no timestamps.
+#  - fdsrc do-timestamp stamps each pipe chunk with its arrival time. Alone
+#    that is NOT enough: h264parse re-frames chunks into access units and
+#    only an AU that starts a fresh chunk inherits its timestamp — when two
+#    frames start inside one chunk the second stays PTS-less (h264parse
+#    interpolates DTS but never PTS, B-frame reordering could invalidate
+#    it) and mp4mux aborts on it ("Buffer has no PTS", ~1 s in on bench).
+#  - the framerate cap hands h264parse a frame duration so DTS interpolation
+#    covers every AU, and h264timestamper (plugins-bad, same package as
+#    h264parse) derives the missing PTS from DTS + picture order — the HW
+#    encoder emits no B-frames, so effectively PTS = DTS.
 # Read-arrival stamping adds a few ms pipe jitter per frame — fine here,
 # GPS correlation runs off file mtimes, not sample times.
 gst-launch-1.0 -e fdsrc fd=0 do-timestamp=true \
+    ! video/x-h264,stream-format=byte-stream,framerate="$FRONT_FPS"/1 \
     ! h264parse \
+    ! h264timestamper \
     ! splitmuxsink location="$OUT/%05d.mp4" \
         start-index="$START_INDEX" \
         max-size-time="$SEGMENT_NS" \
