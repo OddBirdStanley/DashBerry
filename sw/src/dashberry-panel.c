@@ -4,7 +4,8 @@
  * owns everything §3b demands a single owner for:
  *   - all seven bonnet inputs (joystick + buttons A/B) via the GPIO
  *     character-device v2 API, with strict wake-key absorption;
- *   - PAGE 0 / PAGE 1 rendering to /dev/fb1 (ssd1307fb, 1 bpp mmap);
+ *   - PAGE 0 / PAGE 1 rendering to the ssd1307fb framebuffer (1 bpp mmap;
+ *     resolved by driver name at startup — fb number is probe order);
  *   - AUTO-BLANK (10 s, OK state only);
  *   - health evaluation from real signals (segments growing, NMEA flowing,
  *     RTC readable, /data writable-with-space);
@@ -52,7 +53,7 @@
 
 /* ---------------------------------------------------------------- paths - */
 
-#define FB_DEV        "/dev/fb1"
+#define FB_DRIVER     "ssd130"  /* /sys/class/graphics/fbN/name prefix */
 #define GPIO_DEV      "/dev/gpiochip0"
 #define CONF_PATH     "/etc/dashberry.conf"
 #define SESSION_PATH  "/run/dashberry/session"
@@ -265,14 +266,52 @@ static const uint8_t glyph_shield[16] = {
 
 /* ---------------------------------------------------------- framebuffer - */
 
+static char fb_dev[NAME_MAX + 8];   /* "/dev/fbN", filled by fb_resolve() */
+
+/* Find the OLED framebuffer by driver name, not number: fb enumeration is
+ * probe order, so the ssd1307fb node is /dev/fb1 when vc4 registered first
+ * but /dev/fb0 on a headless boot (or when I2C probes first). Matches the
+ * first /sys/class/graphics/fbN whose "name" starts with FB_DRIVER
+ * ("ssd130" covers the ssd1306 overlay's ssd1307fb driver). */
+static int fb_resolve(void)
+{
+    DIR *d = opendir("/sys/class/graphics");
+    if (!d) {
+        fprintf(stderr, "dashberry-panel: opendir /sys/class/graphics: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, "fb", 2) != 0 ||
+            !isdigit((unsigned char)e->d_name[2]))
+            continue;
+        char path[PATH_MAX], name[64];
+        snprintf(path, sizeof path, "/sys/class/graphics/%s/name", e->d_name);
+        if (read_small(path, name, sizeof name) < 0)
+            continue;
+        if (strncmp(name, FB_DRIVER, strlen(FB_DRIVER)) == 0) {
+            snprintf(fb_dev, sizeof fb_dev, "/dev/%s", e->d_name);
+            closedir(d);
+            return 0;
+        }
+    }
+    closedir(d);
+    fprintf(stderr, "dashberry-panel: no framebuffer named '" FB_DRIVER
+            "*' in /sys/class/graphics — is the ssd1306 overlay loaded?\n");
+    return -1;
+}
+
 static int fb_init(void)
 {
     struct fb_var_screeninfo vi;
     struct fb_fix_screeninfo fi;
 
-    fb_fd = open(FB_DEV, O_RDWR | O_CLOEXEC);
+    if (fb_resolve() < 0)
+        return -1;
+    fb_fd = open(fb_dev, O_RDWR | O_CLOEXEC);
     if (fb_fd < 0) {
-        fprintf(stderr, "dashberry-panel: open %s: %s\n", FB_DEV,
+        fprintf(stderr, "dashberry-panel: open %s: %s\n", fb_dev,
                 strerror(errno));
         return -1;
     }
@@ -287,7 +326,7 @@ static int fb_init(void)
     if (vi.bits_per_pixel != 1)
         fprintf(stderr, "dashberry-panel: warning: %s is %u bpp, expected "
                 "1 bpp (ssd1307fb) — rendering will be wrong\n",
-                FB_DEV, vi.bits_per_pixel);
+                fb_dev, vi.bits_per_pixel);
     fb_size = fi.smem_len;
     fb_screen = (size_t)fb_yres * fb_line;
     if (fb_screen > fb_size)
@@ -297,6 +336,8 @@ static int fb_init(void)
         fprintf(stderr, "dashberry-panel: mmap: %s\n", strerror(errno));
         return -1;
     }
+    fprintf(stderr, "dashberry-panel: display %s %ux%u @ %u bpp\n",
+            fb_dev, fb_xres, fb_yres, vi.bits_per_pixel);
     return 0;
 }
 
