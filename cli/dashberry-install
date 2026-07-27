@@ -47,12 +47,8 @@ Options:
   --bypass-time     ignore DS3231 from system requirement and use GPS for time calibration
   --bypass-rear     ignore rear camera from system requirement
   --root-size GIB   OS partition size in GiB (default: 8)
-  --debug NAME:PASS build a DEBUG card: writable OS, ssh with this user,
-                    journal kept + persistent, Wi-Fi profile kept.
-                    Without it the card is PRODUCTION: read-only OS, no
-                    user, no ssh, all network credentials wiped (sealed)
+  --debug NAME:PASS build a debug card; without it the card has no wireless capabilities
   --wifi SSID:PSK   run the first boot over Wi-Fi instead of Ethernet
-                    (PRODUCTION erases it at the end; DEBUG keeps it)
   --wifi-country CC required to configure --wifi
   -h, --help        display this help
 EOF
@@ -330,6 +326,9 @@ fi
 info "Staging sw/ payload and first-boot installer..."
 mkdir -p "$MNT/opt/dashberry"
 cp -a "$SWDIR" "$MNT/opt/dashberry/sw"
+# Docs stay on the PC — the payload ships code only (README.md is
+# gitignored dev documentation, not part of the runtime).
+rm -f "$MNT/opt/dashberry/sw/README.md"
 # Bypass and mode flags ride in the payload's conf — the one the
 # firstinstall step installs to /etc — so the panel (which bakes the
 # shield/wireless glyph off DEBUG) and firstinstall read the same truth.
