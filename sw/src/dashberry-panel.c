@@ -463,7 +463,13 @@ static void gps_drop(int64_t now)
 
 static void gps_on_connected(int64_t now)
 {
-    static const char watch[] = "?WATCH={\"enable\":true,\"raw\":1}\n";
+    /* nmea:true, NOT raw:1. raw passes the device's byte stream verbatim —
+     * if the puck ever ends up in UBX binary mode (gpsd protocol-switches it
+     * after sniffing a stray UBX ACK, see gps-rate), a raw watcher starves
+     * of $-sentences while every nmea watcher still sees clean pseudo-NMEA.
+     * nmea:true is protocol-agnostic: real NMEA passed through, pseudo-NMEA
+     * synthesized when the device speaks binary. */
+    static const char watch[] = "?WATCH={\"enable\":true,\"nmea\":true}\n";
     if (send(gps.fd, watch, sizeof watch - 1, MSG_NOSIGNAL) < 0) {
         gps_drop(now);
         return;

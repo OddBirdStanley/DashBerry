@@ -32,4 +32,12 @@ fi
 stty -F "$GPS_DEV" raw -echo 2>/dev/null || true
 
 printf '\265\142\006\010\006\000\310\000\001\000\001\000\336\152' > "$GPS_DEV"
-echo "gps-rate: sent UBX CFG-RATE (5 Hz) to $GPS_DEV"
+
+# Consume the UBX ACK-ACK the receiver answers with. Left unread it sits in
+# the tty buffer, and the next opener (gpsd) sniffs binary UBX as the first
+# bytes on the line — gpsd then identifies the puck as a binary u-blox and
+# protocol-switches it, killing the raw NMEA stream the archive (and any
+# raw watcher) depends on. One second also swallows a few NMEA sentences;
+# harmless, gpsd re-syncs on the next sentence boundary.
+timeout 1 cat "$GPS_DEV" > /dev/null 2>&1 || true
+echo "gps-rate: sent UBX CFG-RATE (5 Hz) to $GPS_DEV, drained ACK"

@@ -69,11 +69,8 @@ until apt-get update; do
     fi
     sleep 15
 done
-# Full rpicam-apps (not -lite): front-rec needs the libav encoder wrapper
-# (--codec libav --libav-format mpegts) so PTS/DTS travel in-band down the
-# pipe — the lite build is compiled without libav.
 apt-get install -y --no-install-recommends \
-    rpicam-apps gstreamer1.0-tools gstreamer1.0-plugins-good \
+    rpicam-apps-lite gstreamer1.0-tools gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad gpsd gpsd-clients chrony gcc make
 
 echo "building panel daemon..."
@@ -101,10 +98,16 @@ echo "configuring gpsd ($GPS_DEV, static, guarded hotplug)..."
 # node: a replug re-enumerates ttyACM0 -> ttyACM1.
 # -n: open the device without waiting for a client, so chrony's SHM refclock
 # gets fixes even if gps-log is down.
+# -b: broken-device-safety (read-only) — gpsd must never reconfigure the
+# puck. Without it, one stray UBX byte on the line at open (e.g. an unread
+# CFG ACK) makes gpsd identify the puck as binary u-blox and switch it out
+# of NMEA — then the .nmea archive silently becomes gpsd pseudo-NMEA and
+# raw watchers starve. DashBerry owns the receiver config (gps-rate); gpsd
+# just reads.
 cat > /etc/default/gpsd <<EOF
 # written by DashBerry firstinstall.sh — static device, no USB hotplug
 DEVICES="$GPS_DEV"
-GPSD_OPTIONS="-n"
+GPSD_OPTIONS="-n -b"
 USBAUTO="false"
 EOF
 systemctl mask gpsdctl@.service
