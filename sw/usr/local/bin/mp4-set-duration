@@ -95,10 +95,18 @@ def patch(path, dur_ns):
 
         if mvhd_timescale is None:
             raise SystemExit(f"{path}: no mvhd box")
+        # Already-correct fields are left unwritten: the recorders' startup
+        # tail re-scan hits a correct file on every service restart, and a
+        # rewrite would bump its mtime — which the panel reads as
+        # "recording alive" (newest-segment mtime vs STALE_SECS), so a
+        # crash-looping recorder would pin its health OK forever.
+        patched = 0
         for off, data in writes:
-            f.seek(off)
-            f.write(data)
-    return len(writes)
+            if buf[off:off + len(data)] != data:
+                f.seek(off)
+                f.write(data)
+                patched += 1
+    return patched
 
 
 def scan_duration_ns(path):
