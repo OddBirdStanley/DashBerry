@@ -25,6 +25,9 @@ no account, no companion app, and no telemetry.
 - **OLED status panel** — 128×64 glance display that reports what actually
   matters — footage really accumulating, GPS really flowing — rather than
   whether software claims to be running; auto-blanks when all is well
+- **One-button event marking** — holding B for ~2 s stamps the drive's
+  health log and flashes a confirmation, so an incident can be found later
+  without scrubbing hours of footage
 - **Sealed production install** — the shipped card has no Wi-Fi
   credentials, no login account and no ssh; its only interfaces are the
   OLED panel and physically pulling the card. A separate DEBUG install
@@ -44,14 +47,23 @@ partitioned into a read-only OS volume and a `/data` footage volume. Power
 comes from an ignition-switched 12 V→5 V buck converter, with separate
 branches for the Pi and each camera.
 
-One session directory per ignition cycle groups video segments and the NMEA
-log into a "drive", consumed offline by the PC-side CLI.
+One session directory per ignition cycle groups the video segments, the
+NMEA log and the panel's health log into a "drive", consumed offline by the
+PC-side CLI.
+
+## Repository
+
+| Path | Contents |
+|---|---|
+| `sw/` | everything that ships on the card: recorder scripts, systemd units, config snippets, and `dashberry-panel` (the one compiled C program) |
+| `cli/` | PC-side tools — `dashberry-install` (card builder) and `dashberry-cli` (catalog/render/gpx); neither is ever installed on the card |
+| `demo/` | browser visualizer of the panel's UI state machine, for exercising the interaction spec without hardware |
 
 ## Hardware
 
 ### Required
 
-| Component | Reference |
+| Component | Notes |
 |---|---|
 | Raspberry Pi 4 (2 GB) | used units work fine |
 | Passive aluminum case for Pi 4 | Flirc / Argon NEO |
@@ -71,7 +83,7 @@ log into a "drive", consumed offline by the PC-side CLI.
 
 ### Rear camera stack (omit with `--bypass-rear`)
 
-| Component | Reference |
+| Component | Notes |
 |---|---|
 | Raspberry Pi Zero W | runs [showmewebcam](https://github.com/showmewebcam/showmewebcam) (open firmware, UVC gadget) |
 | IMX219 wide camera module | standard Zero-footprint board |
@@ -83,12 +95,18 @@ log into a "drive", consumed offline by the PC-side CLI.
 
 ### Recommended
 
-| Component | Purpose |
+| Component | Notes |
 |---|---|
 | DS3231 RTC module + coin cell | correct timestamps from boot until GPS lock; omit with `--bypass-time` (GPS then disciplines the clock) |
 
-Tools: multimeter or test light, plastic trim tools, fish
-tape, wire strippers/crimper.
+### Tools
+
+| Tool | Notes |
+|---|---|
+| Multimeter or test light | identifying an ignition-switched circuit |
+| Plastic trim tools | panel and pillar removal |
+| Fish tape | routing behind trim |
+| Wire strippers / crimper | 18 AWG runs and ring terminal |
 
 ## Installation
 
@@ -121,17 +139,18 @@ explicitly confirmed. This one command turns the stock image into a
 finished DashBerry card: a small OS partition that ends up locked
 read-only, with all remaining space becoming the `/data` footage partition.
 Plug the card into the Pi with Ethernet connected (or none at all if you
-staged `--wifi`); the first boot completes setup on its own and reboots. From then on the system records on every
-ignition — no keyboard, monitor, or manual configuration is ever needed.
+staged `--wifi`); the first boot completes setup on its own and reboots.
+From then on the system records on every ignition — no keyboard, monitor,
+or manual configuration is ever needed.
 
-| Option | Description |
+| Option | Effect |
 |---|---|
-| `--bypass-rear` | Install without the rear camera; the panel will never flag it as missing. |
-| `--bypass-time` | Install without the DS3231 RTC; the clock is set from GPS after each boot instead. |
-| `--root-size N` | OS partition size in GiB (default: 8, minimum 8). |
-| `--debug NAME:PASS` | Build a DEBUG card: writable OS, SSH with this user, journal kept and persistent, `--wifi` profile kept. Without it the card is PRODUCTION: read-only OS, no user, no SSH, all network credentials wiped (sealed). |
-| `--wifi SSID:PSK` | Run the first boot over Wi-Fi instead of Ethernet. On a production card it is setup-only — the installer wipes the profile, DHCP leases and logs before the OS locks read-only; a debug card keeps it and rejoins the LAN every boot. |
-| `--wifi-country CC` | Two-letter regulatory domain, required with `--wifi` (a stock image keeps Wi-Fi blocked without one). |
+| `--bypass-rear` | install without the rear camera; the panel never flags it as missing |
+| `--bypass-time` | install without the DS3231 RTC; the clock is set from GPS after each boot instead |
+| `--root-size N` | OS partition size in GiB (default 8, minimum 8) |
+| `--debug NAME:PASS` | build a DEBUG card — writable OS, SSH with this user, journal kept and persistent, `--wifi` profile kept; without it the card is PRODUCTION — read-only OS, no user, no SSH, all network credentials wiped (sealed) |
+| `--wifi SSID:PSK` | run the first boot over Wi-Fi instead of Ethernet; setup-only on a production card (the installer wipes the profile, DHCP leases and logs before the OS locks read-only), kept on a debug card, which rejoins the LAN every boot |
+| `--wifi-country CC` | two-letter regulatory domain, required with `--wifi` (a stock image keeps Wi-Fi blocked without one) |
 
 Both bypass options default to off; the default mode is PRODUCTION.
 
@@ -143,8 +162,11 @@ Operation is hands-off: ignition on → recording within ~20 s; ignition off →
 hard power cut, absorbed by design. The panel shows live
 latitude/longitude/speed/free-space when healthy, blanks after 10 s, and
 switches to a static error screen (`FRONT`, `REAR`, `GPS`, `TIME`,
-`SD FULL`) when a component fails. The bottom-right glyph shows the
-install mode: shield = production (sealed), wireless = debug card.
+`SD FULL`) when a component fails. LEFT/RIGHT cycle to a second page with
+SoC temperature and firmware power status; holding B for ~2 s marks the
+moment as an event, on any screen the panel is currently showing. The
+bottom-right glyph shows the install mode: shield = production (sealed),
+wireless = debug card.
 
 To archive footage, pull the card and copy `/data`. The read-only OS makes
 removal safe at any time.
@@ -158,6 +180,9 @@ one *drive*.
 # list drives: start, duration, segment counts, GPS coverage
 cli/dashberry-cli --data ~/dashcam-copy catalog
 
+# add distance, average/top speed and the event markers you pressed B for
+cli/dashberry-cli --data ~/dashcam-copy catalog --verbose
+
 # render a clip — the continuous boot-to-shutdown timeline: footage holes
 # show "No Signal", GPS trouble is labeled from the health log; --annotate
 # burns time/position/speed; --camera both-prio-front adds the rear camera
@@ -170,6 +195,11 @@ cli/dashberry-cli --data ~/dashcam-copy render \
 cli/dashberry-cli --data ~/dashcam-copy gpx \
     --drive 20260721-1830-0042 -o track.gpx
 ```
+
+Times are relative to the drive's start throughout; `render` and `gpx` take
+`--anchor` (assert the true wall-clock start, repairing a wrong-RTC drive)
+and `--tz-offset` to display local time instead. `--units MPH|KMH` selects
+the speed units shown by `catalog --verbose` and `render --annotate`.
 
 Requires Python 3 and `ffmpeg`/`ffprobe`.
 
