@@ -200,8 +200,8 @@ Everything happens on the panel; nothing is stored.
 4. The screen returns to the normal display. The glyph tells you whether it
    worked — waves for connected, a bare antenna for not.
 
-**LEFT** (on the list) or **B** (anywhere) backs out; so does ten seconds
-of not touching it — and **backing out switches the radios off again**,
+**LEFT** (once the list is up) or **B** (anywhere, including while it is
+still scanning) backs out; so does ten seconds of not touching it — and **backing out switches the radios off again**,
 so walking away mid-way leaves the card dark rather than transmitting.
 The radios only stay on once an attempt has actually been made, and a
 5 second hold turns them off from there. A reboot does it for you too: the

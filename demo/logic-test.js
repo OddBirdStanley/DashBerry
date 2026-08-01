@@ -457,6 +457,16 @@ ok(jstate().screen === "JW-1" && jstate().jw.scanning === true,
 ok(decodeRowGlyphs(1) === " SCANNING...",
    `JW-1 shows SCANNING... on line 2, indented one (got "${decodeRowGlyphs(1)}")`);
 ok(decodeRowGlyphs(0) === "", "…and line 1 is empty while it scans");
+
+/* The joystick is inert while the scan runs: there is no list to navigate
+ * and nothing to back out to, so LEFT must not offer a fake cancel. */
+jtap(PANEL.KEY.LEFT);
+jadvance(200);
+ok(jstate().screen === "JW-1" && jstate().jw.scanning === true,
+   "LEFT during the scan does nothing — no dishonest exit");
+jtap(PANEL.KEY.RIGHT);
+jadvance(200);
+ok(jstate().screen === "JW-1", "…and RIGHT cannot open JW-2 with no list yet");
 jrelease(PANEL.KEY.A);
 
 /* Scan lands: sorted alphabetically, deduped, truncated + LDOTS. */
@@ -718,6 +728,26 @@ ok(js.error === true && js.screen === "PAGE",
    "a health fault drops JW-1 for PAGE 0");
 ok(js.rf_state === "killed",
    "…and that exit kills the radios too (a faulted card joins nothing)");
+
+/* …but button B still gets you out of a running scan — the joystick being
+ * inert must not become a trap — and that exit still takes the radios. */
+{
+    jadvance(1600);                /* let the forced fault above clear —
+                                      PAGE 0 swallows the A hold entirely */
+    ok(jstate().error === false, "recovered from the forced fault");
+    jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
+    jadvance(400);                 /* scan takes 2 s: still running */
+    ok(jstate().screen === "JW-1" && jstate().jw.scanning === true,
+       "a scan is in flight");
+    const before = sim.events;
+    jpress(PANEL.KEY.B); jadvance(200); jrelease(PANEL.KEY.B);
+    jadvance(200);
+    ok(jstate().screen === "PAGE", "button B exits mid-scan");
+    ok(sim.events === before, "…still marking no EVENT");
+    jadvance(5000);                /* cancel, then the owed down */
+    ok(jstate().rf_state === "killed",
+       "…and a cancelled scan does not stall the kill behind it");
+}
 
 /* Getting the radios down is retried, not fired once and assumed: it is the
  * privacy-preserving direction, so "probably off" is not good enough. */

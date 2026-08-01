@@ -1553,6 +1553,14 @@ static void jw_key(int key, bool press, int64_t now)
         return;
 
     if (ui.screen == SCR_JW1) {
+        /* While the scan runs there is no list to navigate and nothing to
+         * back out to, so the whole joystick is inert — LEFT included.
+         * Offering an exit here would be a lie: the screen says SCANNING
+         * and the scan is what the card is actually doing. Button B is
+         * still the way out (and the idle timeout, and a fault), which is
+         * why the cancel path in jw_exit() still has to work. */
+        if (jw.scanning)
+            return;
         if (key == KEY_UP && jw.sel > 0)
             jw.sel--;
         else if (key == KEY_DOWN && jw.sel + 1 < jw.n)

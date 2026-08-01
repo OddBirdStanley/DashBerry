@@ -618,6 +618,12 @@ function create(hw) {
             return;
 
         if (ui.screen === SCR.JW1) {
+            /* While the scan runs there is no list to navigate and nothing
+             * to back out to, so the whole joystick is inert — LEFT
+             * included. Offering an exit here would be a lie. Button B is
+             * still the way out (and the idle timeout, and a fault). */
+            if (jw.scanning)
+                return;
             if (key === KEY.UP && jw.sel > 0)
                 jw.sel--;
             else if (key === KEY.DOWN && jw.sel + 1 < jw.ssid.length)
