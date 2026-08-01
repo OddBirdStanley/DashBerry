@@ -201,10 +201,12 @@ Everything happens on the panel; nothing is stored.
    worked — waves for connected, a bare antenna for not.
 
 **LEFT** (on the list) or **B** (anywhere) backs out; so does ten seconds
-of not touching it. Hold **A** for 5 seconds again to switch the radios
-back off, and note that a reboot does that for you: the passphrase you
-typed was never written to the read-only OS, so the card always comes back
-up dark.
+of not touching it — and **backing out switches the radios off again**,
+so walking away mid-way leaves the card dark rather than transmitting.
+The radios only stay on once an attempt has actually been made, and a
+5 second hold turns them off from there. A reboot does it for you too: the
+passphrase you typed was never written to the read-only OS, so the card
+always comes back up dark.
 
 ### Processing footage
 

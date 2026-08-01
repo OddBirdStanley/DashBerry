@@ -289,6 +289,7 @@ function create(hw) {
         a_fired: false,            /* this hold already fired its action */
         flash_until_ms: 0,         /* EVENT confirmation visible until */
         flash: "",
+        rf_kill_pending: false,    /* a JW exit owes an rf-ctl down */
     };
 
     /* JOIN WIFI screen state. jw.psk is the only secret the panel holds;
@@ -385,13 +386,23 @@ function create(hw) {
         jw.scan_failed = false;
     }
 
-    /* user = a key press asked for this (so the page gets its full 10 s);
+    /* Leaving JW-1/JW-2 without completing a join takes the radios back
+     * down with it: arming was a means to an end, and a user who backed
+     * out (or walked away, or whose card faulted mid-flow) never asked for
+     * a card that keeps transmitting. The one path that does NOT come
+     * through here is a finished connection attempt — there RF must
+     * survive, or the glyph could not tell "failed" from "switched off".
+     *
+     * user = a key press asked for this (so the page gets its full 10 s);
      * the idle timeout leaves last_key_ms alone and PAGE 1 blanks at once. */
     function jw_exit(now, user) {
         /* The C SIGKILLs an unreaped scan child; dropping the handle is
          * the same thing here — its result is discarded either way. */
         if (job.kind === RFJ.SCAN)
             job = { kind: RFJ.NONE, h: null, deadline_ms: 0 };
+        /* Deferred, not spawned here: a scan may still hold the one job
+         * slot. The tick drains this within 200 ms. */
+        ui.rf_kill_pending = true;
         ui.screen = SCR.PAGE;
         ui.page_idx = 0;
         ui.a_down_ms = 0;
@@ -462,14 +473,26 @@ function create(hw) {
         rf_job_done(now);
     }
 
+    /* Run the `down` a JW exit owed us, once the job slot is free.
+     * Unconditional on rf_state: it is the fail-safe direction, and a
+     * stale "already killed" reading must never leave a radio up. */
+    function rf_kill_drain(now) {
+        if (!ui.rf_kill_pending || job.kind !== RFJ.NONE)
+            return;
+        if (rf_spawn(RFJ.DOWN, "down", null, now, RFDOWN_TO_MS))
+            ui.rf_kill_pending = false;
+    }
+
     /* 5 s button-A hold on a page: RF-KILLED -> radios on + JW-1, else kill. */
     function rf_toggle(now) {
         if (job.kind !== RFJ.NONE)
             return;
         if (rf_state !== "killed") {
+            ui.rf_kill_pending = false;
             rf_spawn(RFJ.DOWN, "down", null, now, RFDOWN_TO_MS);
             return;
         }
+        ui.rf_kill_pending = false;   /* arming supersedes an owed kill */
         jw_clear();
         ui.screen = SCR.JW1;
         ui.blanked = false;
@@ -886,6 +909,7 @@ function create(hw) {
         ui.last_key_ms = now;
         ui.burn_last_ms = now;
         job = { kind: RFJ.NONE, h: null, deadline_ms: 0 };
+        ui.rf_kill_pending = false;
         jw_clear();
         eval_health(now);
         ui.error = system_err();   /* boot: honest immediate evaluation */
@@ -901,6 +925,7 @@ function create(hw) {
         watchdog_pets++;
 
         rf_job_tick(now);
+        rf_kill_drain(now);
 
         if (++subtick >= HEALTH_TICKS) {
             subtick = 0;

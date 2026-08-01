@@ -483,25 +483,20 @@ ok(decodeRowGlyphs(3) === "Zebra" && invMask(3) === "1111111111111111",
 jtap(PANEL.KEY.DOWN);
 ok(jstate().jw.sel === 4, "DOWN at the end of the list clamps");
 
-/* LEFT exits JW-1 back to the pages; RF stays enabled. */
+/* LEFT exits JW-1 back to the pages — and backing out of the flow takes
+ * the radios down with it: arming was only ever a means to joining. */
 jtap(PANEL.KEY.LEFT);
 jadvance(200);
-ok(jstate().screen === "PAGE" && jstate().rf_state === "idle",
-   "LEFT exits JW-1 and leaves RF enabled");
+ok(jstate().screen === "PAGE", "LEFT exits JW-1");
 ok(cellBits(3, 15).join(",") === PANEL.GLYPHS["RF-IDLE"].join(","),
-   "back on the pages, RF-ENABLED-but-unassociated is the bare antenna");
-
-/* A second 5 s hold kills RF (no JW-1 this time). */
-jpress(PANEL.KEY.A);
-jadvance(5200);
-jrelease(PANEL.KEY.A);
+   "…bare antenna for the moment rf-ctl down is still running");
 jadvance(2400);
-ok(jstate().screen === "PAGE" && jstate().rf_state === "killed",
-   "a 5 s A hold while RF-ENABLED kills the radios again");
+ok(jstate().rf_state === "killed",
+   "backing out of JW-1 kills the radios again (no join was completed)");
 ok(cellBits(3, 15).join(",") === PANEL.GLYPHS.SHIELD.join(","),
    "…and the glyph returns to the shield");
 
-/* Back into JW-1, then RIGHT to JW-2. */
+/* Which means one hold — not two — gets straight back to JW-1. */
 jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
 jadvance(2200);
 jtap(PANEL.KEY.DOWN); jtap(PANEL.KEY.DOWN); jtap(PANEL.KEY.DOWN);
@@ -675,10 +670,9 @@ ok(jstate().screen === "JW-1", "re-arming opens JW-1 again");
     ok(jstate().screen === "PAGE", "button B exits JW-1");
     ok(sim.events === before,
        "…and its EVENT function is absorbed while a JW screen is up");
+    jadvance(2400);
+    ok(jstate().rf_state === "killed", "a button-B exit kills the radios too");
 }
-/* B left the radios on, so the cycle is kill then re-arm again. */
-jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
-jadvance(2400);
 jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
 jadvance(2400);
 ok(jstate().screen === "JW-1", "JW-1 up once more");
@@ -686,6 +680,36 @@ jadvance(10400);                   /* no input at all */
 js = jstate();
 ok(js.screen === "PAGE" && js.blanked === true,
    "10 s without input exits the JW screens and the page blanks at once");
+jadvance(2400);
+ok(js.blanked && jstate().rf_state === "killed",
+   "…and the idle exit kills the radios as well — walking away leaves it dark");
+
+/* A fault mid-flow is an exit too, and takes the radios with it.
+ * The screen is blanked after that idle exit, so the wake press is
+ * absorbed first (§3b) — the hold has to start from an awake screen. */
+jtap(PANEL.KEY.CENTER);
+jadvance(200);
+ok(jstate().blanked === false, "woken, ready to hold A again");
+jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
+jadvance(2400);
+ok(jstate().screen === "JW-1" && jstate().rf_state === "idle",
+   "armed once more, JW-1 up");
+sim.frontLast = 0;                 /* stop proving the front recorder */
+{
+    const end = vt.now + 12000;    /* jadvance, minus the writer feed */
+    while (vt.now < end) {
+        vt.now = Math.min(vt.now + PANEL.TICK_MS, end);
+        sim.rearLast = vt.now;
+        jp.gpsFix(sim.lat, sim.lon, sim.knots);
+        runRfJobs();
+        jp.tick();
+    }
+}
+js = jstate();
+ok(js.error === true && js.screen === "PAGE",
+   "a health fault drops JW-1 for PAGE 0");
+ok(js.rf_state === "killed",
+   "…and that exit kills the radios too (a faulted card joins nothing)");
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 process.exit(failures ? 1 : 0);

@@ -1064,6 +1064,7 @@ static struct {
     bool    a_fired;               /* this hold already fired its action */
     int64_t flash_until_ms;        /* EVENT confirmation visible until */
     char    flash[COLS + 1];       /* EVENT confirmation text */
+    bool    rf_kill_pending;       /* a JW exit owes an rf-ctl down */
 } ui;
 
 /* JOIN WIFI screen state. jw.psk is the only secret the panel holds; it is
@@ -1219,8 +1220,16 @@ static void jw_clear(void)
     jw.scan_failed = false;
 }
 
-/* user = a key press asked for this (so the page gets its full 10 s);
- * the idle timeout leaves last_key_ms alone, and PAGE 1 blanks at once. */
+/* Leaving JW-1/JW-2 without completing a join takes the radios back down
+ * with it: arming was a means to an end, and a user who backed out (or
+ * walked away, or whose card faulted mid-flow) never asked for a card that
+ * keeps transmitting. Dark is the resting state and every exit returns to
+ * it. The one path that does NOT come through here is a finished
+ * connection attempt — there RF must survive, or the glyph could not tell
+ * "failed" from "switched off".
+ *
+ * user = a key press asked for this (so the page gets its full 10 s); the
+ * idle timeout leaves last_key_ms alone, and PAGE 1 blanks at once. */
 static void jw_exit(int64_t now, bool user)
 {
     /* Only signal a child we have not reaped — past waitpid() the pid may
@@ -1228,6 +1237,10 @@ static void jw_exit(int64_t now, bool user)
      * (rf_job_done checks the screen). */
     if (job.kind == RFJ_SCAN && !job.reaped)
         kill(job.pid, SIGKILL);
+    /* Deferred, not spawned here: a scan may still be occupying the one
+     * job slot, and it has to be reaped before `down` can run. The tick
+     * drains this within 200 ms. */
+    ui.rf_kill_pending = true;
     ui.screen = SCR_PAGE;
     ui.page_idx = 0;
     ui.a_down_ms = 0;
@@ -1349,15 +1362,28 @@ static void rf_job_tick(int64_t now)
     rf_job_done(now);
 }
 
+/* Run the `down` a JW exit owed us, once the job slot is free. Unconditional
+ * on rf_state: it is the fail-safe direction, and a stale "already killed"
+ * reading must never be what leaves a radio up. */
+static void rf_kill_drain(int64_t now)
+{
+    if (!ui.rf_kill_pending || job.kind != RFJ_NONE)
+        return;
+    if (rf_spawn(RFJ_DOWN, "down", NULL, now, RFDOWN_TO_MS))
+        ui.rf_kill_pending = false;
+}
+
 /* 5 s button-A hold on a page: RF-KILLED -> radios on + JW-1, else kill. */
 static void rf_toggle(int64_t now)
 {
     if (job.kind != RFJ_NONE)
         return;
     if (rf_state != RF_KILLED) {
+        ui.rf_kill_pending = false;
         rf_spawn(RFJ_DOWN, "down", NULL, now, RFDOWN_TO_MS);
         return;
     }
+    ui.rf_kill_pending = false;    /* arming supersedes an owed kill */
     jw_clear();
     ui.screen = SCR_JW1;
     ui.blanked = false;
@@ -1917,6 +1943,7 @@ int main(void)
                 gps_try_connect(now);
 
             rf_job_tick(now);
+            rf_kill_drain(now);
 
             if (++subtick >= HEALTH_TICKS) {
                 subtick = 0;
