@@ -1613,16 +1613,18 @@ struct frame {
  * columns are cut there and marked with a single LDOTS in column 14. */
 static void compose_jw1(struct frame *f)
 {
+    /* Every full-screen status message in the UI sits on line 2 indented
+     * one column — EVENT, CONNECTING and these three read as one family. */
     if (jw.scanning) {
-        snprintf(f->rows[0], sizeof f->rows[0], "SCANNING...");
+        snprintf(f->rows[1], sizeof f->rows[1], " SCANNING...");
         return;
     }
     if (jw.scan_failed) {
-        snprintf(f->rows[0], sizeof f->rows[0], "RF ERROR");
+        snprintf(f->rows[1], sizeof f->rows[1], " RF ERROR");
         return;
     }
     if (jw.n == 0) {
-        snprintf(f->rows[0], sizeof f->rows[0], "NO NETWORKS");
+        snprintf(f->rows[1], sizeof f->rows[1], " NO NETWORKS");
         return;
     }
     for (int r = 0; r < ROWS; r++) {
@@ -1677,7 +1679,7 @@ static void compose(struct frame *f, int64_t now)
     if (now < ui.flash_until_ms) {
         /* EVENT confirmation — a deliberate 2 s full-screen interruption
          * of whatever page is up (PAGE 0 returns right after) */
-        snprintf(f->rows[1], sizeof f->rows[1], "    %.12s", ui.flash);
+        snprintf(f->rows[1], sizeof f->rows[1], " %.14s", ui.flash);
         return;
     }
 
@@ -1685,7 +1687,7 @@ static void compose(struct frame *f, int64_t now)
         /* Same full-screen shape as EVENT, but it lasts as long as the
          * association attempt does — and it outranks PAGE 0 for that
          * bounded window; the fault is still there when it returns. */
-        snprintf(f->rows[1], sizeof f->rows[1], "  CONNECTING...");
+        snprintf(f->rows[1], sizeof f->rows[1], " CONNECTING...");
         return;
     }
     if (ui.screen == SCR_JW1 || ui.screen == SCR_JW2) {

@@ -448,7 +448,9 @@ jpress(PANEL.KEY.A);
 jadvance(5200);
 ok(jstate().screen === "JW-1" && jstate().jw.scanning === true,
    "5 s A hold opens JW-1 and starts the scan");
-ok(decodeRowGlyphs(0) === "SCANNING...", "JW-1 shows SCANNING... while scanning");
+ok(decodeRowGlyphs(1) === " SCANNING...",
+   `JW-1 shows SCANNING... on line 2, indented one (got "${decodeRowGlyphs(1)}")`);
+ok(decodeRowGlyphs(0) === "", "…and line 1 is empty while it scans");
 jrelease(PANEL.KEY.A);
 
 /* Scan lands: sorted alphabetically, deduped, truncated + LDOTS. */
@@ -598,8 +600,8 @@ ok(jstate().jw.psk === "Z", "typed a wrong single-character passphrase");
 jpress(PANEL.KEY.A); jadvance(2200); jrelease(PANEL.KEY.A);   /* stage */
 jpress(PANEL.KEY.A); jadvance(2200);                          /* commit */
 ok(jstate().screen === "CONNECTING", "a second 2 s hold starts the attempt");
-ok(decodeRow(1) === "  CONNECTING...".trimEnd(),
-   `CONNECTING renders like EVENT (got "${decodeRow(1)}")`);
+ok(decodeRow(1) === " CONNECTING...",
+   `CONNECTING sits on line 2, indented one (got "${decodeRow(1)}")`);
 jrelease(PANEL.KEY.A);
 
 /* Button B is NOT absorbed while CONNECTING; button A is. */
@@ -710,6 +712,44 @@ ok(js.error === true && js.screen === "PAGE",
    "a health fault drops JW-1 for PAGE 0");
 ok(js.rf_state === "killed",
    "…and that exit kills the radios too (a faulted card joins nothing)");
+
+/* Every full-screen status message shares one shape: line 2, indented by
+ * a single column. Checked together so they cannot drift apart again. */
+{
+    const at = (fn) => { fn(); return decodeRow(1); };
+    /* EVENT, from a plain page */
+    jtap(PANEL.KEY.CENTER);
+    jadvance(200);
+    const ev = at(() => { jpress(PANEL.KEY.B); jadvance(2200);
+                          jrelease(PANEL.KEY.B); });
+    ok(ev === " EVENT", `EVENT renders " EVENT" (got "${ev}")`);
+    jadvance(2200);                /* let the flash expire */
+
+    /* NO NETWORKS, from a scan that comes back empty */
+    const savedAps = sim.aps;
+    sim.aps = [];
+    jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
+    jadvance(2400);
+    const nn = decodeRow(1);
+    ok(nn === " NO NETWORKS", `empty scan renders " NO NETWORKS" (got "${nn}")`);
+    sim.aps = savedAps;
+    jtap(PANEL.KEY.LEFT);
+    jadvance(2400);
+
+    /* RF ERROR, from a scan that fails outright */
+    sim.scanOk = false;
+    jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
+    jadvance(2400);
+    const rferr = decodeRow(1);
+    ok(rferr === " RF ERROR", `failed scan renders " RF ERROR" (got "${rferr}")`);
+    sim.scanOk = true;
+    jtap(PANEL.KEY.LEFT);
+    jadvance(2400);
+
+    ok([ev, nn, rferr, " CONNECTING...", " SCANNING..."]
+        .every(t => t.startsWith(" ") && !t.startsWith("  ")),
+       "all five status messages share the one-column indent");
+}
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 process.exit(failures ? 1 : 0);

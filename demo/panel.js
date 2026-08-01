@@ -694,9 +694,12 @@ function create(hw) {
     /* JW-1: four SSIDs, the selected one an INVERTED bar. Names wider than
      * 14 columns are cut there and marked with a single LDOTS. */
     function compose_jw1(f) {
-        if (jw.scanning)    { f.rows[0] = "SCANNING..."; return; }
-        if (jw.scan_failed) { f.rows[0] = "RF ERROR";    return; }
-        if (jw.ssid.length === 0) { f.rows[0] = "NO NETWORKS"; return; }
+        /* Every full-screen status message in the UI sits on line 2
+         * indented one column — EVENT, CONNECTING and these three read as
+         * one family. */
+        if (jw.scanning)    { f.rows[1] = " SCANNING..."; return; }
+        if (jw.scan_failed) { f.rows[1] = " RF ERROR";    return; }
+        if (jw.ssid.length === 0) { f.rows[1] = " NO NETWORKS"; return; }
         for (let r = 0; r < ROWS; r++) {
             const i = jw.top + r;
             if (i >= jw.ssid.length)
@@ -740,7 +743,7 @@ function create(hw) {
         if (hw.now() < ui.flash_until_ms) {
             /* EVENT confirmation — a deliberate 2 s full-screen
              * interruption of whatever page is up (PAGE 0 returns after) */
-            f.rows[1] = "    " + ui.flash.slice(0, 12);
+            f.rows[1] = " " + ui.flash.slice(0, 14);
             return f;
         }
 
@@ -748,7 +751,7 @@ function create(hw) {
             /* Same full-screen shape as EVENT, but it lasts as long as the
              * association attempt does — and it outranks PAGE 0 for that
              * bounded window; the fault is still there when it returns. */
-            f.rows[1] = "  CONNECTING...";
+            f.rows[1] = " CONNECTING...";
             return f;
         }
         if (ui.screen === SCR.JW1 || ui.screen === SCR.JW2) {
