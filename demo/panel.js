@@ -1,16 +1,16 @@
-/* panel.js — JavaScript port of sw/src/dashberry-panel.c (PLAN.md §3b, rev 6)
- * for the browser demo/visualizer. NOT part of the Pi runtime.
+/* panel.js — JavaScript port of sw/src/dashberry-panel.c (PLAN.md §3b/§3d,
+ * rev 8) for the browser demo/visualizer. NOT part of the Pi runtime.
  *
  * Porting rule: everything above the hardware line — the §3b UI state
  * machine (PAGE 0/1/2, AUTO-BLANK, strict wake-key absorption, burn-in
- * shift), the health model, compose()/render(), the embedded font and the
- * install-mode glyphs (shield = production, wireless = debug — baked from
- * DEBUG in dashberry.conf, no runtime RF state) — is ported
+ * shift), the button-B EVENT hold, the §3d JOIN WIFI screens (JW-1, JW-2,
+ * CONNECTING) with their holds/staging/inversion, the health model,
+ * compose()/render(), the embedded font and every 8x16 glyph — is ported
  * statement-for-statement from the C. Everything below it (fb1 mmap,
- * gpiochip v2, gpsd socket + NMEA parse, statvfs, sd_notify) is replaced
- * by an injected `hw` object the harness simulates. If this file and the
- * C disagree about behavior, the C is the bug's home or this port is
- * wrong — diff them.
+ * gpiochip v2, gpsd socket + NMEA parse, statvfs, rfkill/operstate sysfs,
+ * forking rf-ctl, sd_notify) is replaced by an injected `hw` object the
+ * harness simulates. If this file and the C disagree about behavior, the
+ * C is the bug's home or this port is wrong — diff them.
  *
  * hw contract (all required):
  *   now()                    -> monotonic ms (CLOCK_MONOTONIC stand-in)
@@ -19,8 +19,16 @@
  *   rtcOk()                  -> bool (rtc0/since_epoch readable)
  *   cpuTempMc()              -> SoC temp in millidegrees C (thermal_zone0),
  *                               null = read failure (PAGE 2 shows TMP ---)
+ *   throttled()              -> get_throttled bitmask, null = read failure
  *   statvfs()                -> null (/data not mounted) or
  *                               { rw, freePct, fsErrors }
+ *   rfState()                -> 'killed' | 'idle' | 'link' — stands in for
+ *                               the rfkill soft/hard + operstate reads
+ *   rfCtl(cmd, stdinText)    -> job handle { done, ok, out }, mutated by the
+ *                               harness when the simulated child exits;
+ *                               stands in for fork+exec of rf-ctl
+ *   logEvent()               -> bool: append an `event` record (health log);
+ *                               false = unwritable, panel flashes EVENT ERR
  *   present(view)               render sink: { blanked, fb (Uint8Array) }
  *   notify(msg)                 sd_notify stand-in ("READY=1"/"WATCHDOG=1")
  *   log(msg)                    stderr stand-in
@@ -38,11 +46,33 @@ const BLANK_MS      = 10000;    /* AUTO-BLANK after 10 s without keys */
 const STALE_MS      = 10000;    /* segment considered stalled after this */
 const GPS_SILENT_MS = 5000;     /* NMEA silence -> GPS ERR */
 const BURN_STEP_MS  = 60000;    /* PAGE 0 pixel-shift cadence */
+const EVENT_HOLD_MS = 2000;     /* button B hold to mark an EVENT */
+const EVENT_FLASH_MS= 2000;     /* EVENT confirmation screen duration */
+const RF_HOLD_MS    = 5000;     /* button A hold: arm / kill RF (JOIN WIFI) */
+const STAGE_HOLD_MS = 2000;     /* button A hold on JW-2: stage / connect */
+const JW_IDLE_MS    = 10000;    /* JW-1/JW-2 exit after this without input */
+const SCAN_TO_MS    = 25000;    /* rf-ctl scan watchdog */
+const RFDOWN_TO_MS  = 15000;    /* rf-ctl down watchdog */
+const CONNECT_TO_MS = 45000;    /* rf-ctl connect watchdog */
 
 /* -------------------------------------------------------------- display - */
 
 const XRES = 128, YRES = 64;
 const COLS = 16, ROWS = 4, CELL_W = 8, CELL_H = 16;
+
+/* Private cell codes — see the C. Characters below 0x20 never appear in
+ * real text, so they address the hand-drawn 8x16 glyphs from f.rows[]. */
+const G_LDOTS    = "\u0001";
+const G_SPACE    = "\u0002";
+const G_CAPS_OFF = "\u0003";
+const G_CAPS_ON  = "\u0004";
+const G_DEL      = "\u0005";
+
+/* JOIN WIFI sizing */
+const SSID_COLS = COLS - 2;     /* SSID field on JW-1; LDOTS follows */
+const SSID_MAX  = 32;
+const PSK_MAX   = 63;
+const MAX_SSIDS = 48;
 
 /* ----------------------------------------------------------------- font - */
 
@@ -146,13 +176,37 @@ const FONT8X8 = [
   [0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00], // ~
 ];
 
-/* Hand-drawn 8x16 install-mode glyphs (bit 0 = leftmost, NOT doubled):
- * shield = production (sealed), wireless = debug — the user drawing in
- * DashBerry/wireless_glyph.txt ('x' = lit). Fixed per card, not runtime. */
+/* Hand-drawn 8x16 glyphs (bit 0 = leftmost, NOT doubled). The bottom-right
+ * cell reports the LIVE RF STATE (rev 8): shield = RF-KILLED, rf_idle =
+ * RF-ENABLED but not associated, wireless = associated — the user drawing
+ * in DashBerry/wireless_glyph.txt ('x' = lit). */
 const GLYPH_WIRELESS = [0x3C, 0x42, 0x81, 0x81, 0x3C, 0x42, 0x81, 0x81,
                         0x3C, 0x42, 0x81, 0x99, 0x24, 0x00, 0x18, 0x18];
+const GLYPH_RF_IDLE = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                       0x3C, 0x42, 0x81, 0x99, 0x24, 0x00, 0x18, 0x18];
 const GLYPH_SHIELD  = [0x3E, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
                        0x7F, 0x3E, 0x3E, 0x1C, 0x1C, 0x08, 0x00, 0x00];
+
+/* JOIN WIFI cell glyphs. LDOTS: two 2x2 blocks on the text baseline,
+ * flush right — one character wide, so a truncated 14-column SSID plus
+ * its LDOTS still clears column 15. */
+const GLYPH_LDOTS = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                     0x00, 0x00, 0x00, 0x00, 0xD8, 0xD8, 0x00, 0x00];
+/* CAPS: a solid triangle, point down = OFF (lower case), point up = ON. */
+const GLYPH_CAPS_OFF = [0x00, 0x00, 0x00, 0x00, 0x7F, 0x7F, 0x3E, 0x3E,
+                        0x1C, 0x1C, 0x08, 0x08, 0x00, 0x00, 0x00, 0x00];
+const GLYPH_CAPS_ON  = [0x00, 0x00, 0x00, 0x00, 0x08, 0x08, 0x1C, 0x1C,
+                        0x3E, 0x3E, 0x7F, 0x7F, 0x00, 0x00, 0x00, 0x00];
+const GLYPH_SPACE = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                     0x42, 0x42, 0x7E, 0x7E, 0x00, 0x00, 0x00, 0x00];
+const GLYPH_DEL   = [0x00, 0x00, 0x00, 0x00, 0x08, 0x0C, 0x0E, 0xFF,
+                     0xFF, 0x0E, 0x0C, 0x08, 0x00, 0x00, 0x00, 0x00];
+
+const CELL_GLYPH = {
+    [G_LDOTS]: GLYPH_LDOTS,       [G_SPACE]: GLYPH_SPACE,
+    [G_CAPS_OFF]: GLYPH_CAPS_OFF, [G_CAPS_ON]: GLYPH_CAPS_ON,
+    [G_DEL]: GLYPH_DEL,
+};
 
 /* ------------------------------------------------------------- UI state - */
 
@@ -175,7 +229,13 @@ function create(hw) {
     /* conf (load_conf) */
     let speed_factor = 1.15078;    /* knots -> mph (default) */
     let speed_unit   = "MPH";
-    let debug_card   = false;      /* DEBUG=1 -> wireless glyph; else shield */
+    let rf_join      = false;      /* RF_JOIN=1: JOIN WIFI armed. 0 = the 5 s
+                                      button-A hold does nothing, as before */
+
+    /* Live RF state, read never assumed (rfkill soft/hard + operstate in
+     * the C; hw.rfState() here): 'killed' | 'idle' | 'link'. */
+    let rf_state = "killed";
+    function rf_refresh() { rf_state = hw.rfState(); }
 
     /* gpsd client state the UI consumes. The demo has no socket: the
      * harness calls gpsFix()/gpsNoFix() at 5 Hz, which land exactly where
@@ -198,13 +258,45 @@ function create(hw) {
             cpu_temp_mc = mc;
     }
 
+    /* Firmware throttle flags for the PAGE 2 PWR line — bit 0 =
+     * under-voltage NOW, bit 16 = under-voltage seen since boot.
+     * Informational like TMP, never a health state. */
+    let throttled = 0;
+    let throttled_valid = false;
+
+    function read_throttled() {
+        const t = hw.throttled();
+        throttled_valid = t !== null;
+        if (throttled_valid)
+            throttled = t;
+    }
+
+    /* Which screen owns the input. PAGE covers PAGE 0/1/2 (ui.error picks
+     * PAGE 0); the three JOIN WIFI screens are their own modes. */
+    const SCR = { PAGE: 0, JW1: 1, JW2: 2, CONN: 3 };
+
     const ui = {
         error: false,              /* any health state ERR */
+        screen: SCR.PAGE,
         page_idx: 0,
         blanked: false,
         last_key_ms: 0,
         burn_idx: 0,               /* PAGE 0 shift: 0,+1,0,-1 */
         burn_last_ms: 0,
+        b_down_ms: 0,              /* button B pressed since (0 = up) */
+        b_fired: false,            /* this hold already marked an event */
+        a_down_ms: 0,              /* button A pressed since (0 = up) */
+        a_fired: false,            /* this hold already fired its action */
+        flash_until_ms: 0,         /* EVENT confirmation visible until */
+        flash: "",
+    };
+
+    /* JOIN WIFI screen state. jw.psk is the only secret the panel holds;
+     * it is wiped on every exit and never logged or printed. */
+    const jw = {
+        ssid: [], sel: 0, top: 0,
+        scanning: false, scan_failed: false,
+        psk: "", kr: 0, kc: 0, caps: false, staged: false,
     };
 
     let burn_step_ms = BURN_STEP_MS;   /* demo aid: harness may shorten */
@@ -225,6 +317,8 @@ function create(hw) {
         health.timeok = hw.rtcOk();
         health.storage = storage_ok();
         read_cpu_temp();           /* 1 Hz, off the 5 Hz paint path */
+        read_throttled();
+        rf_refresh();              /* glyph truth, not a health state */
     }
 
     /* Storage OK: /data mounted rw, free > 0, no accumulated fs errors.
@@ -257,6 +351,253 @@ function create(hw) {
         ui.last_key_ms = now;
     }
 
+    /* ------------------------------------------------------ rf-ctl jobs -- */
+
+    /* Every radio operation is a simulated rf-ctl child polled from the
+     * tick: a scan takes seconds and an association tens of seconds, and
+     * the panel must keep painting and keep accepting the exit keys
+     * throughout. One job at a time, each with a deadline. */
+    const RFJ = { NONE: 0, SCAN: 1, DOWN: 2, CONNECT: 3 };
+    let job = { kind: RFJ.NONE, h: null, deadline_ms: 0 };
+
+    function rf_spawn(kind, cmd, stdinText, now, timeout_ms) {
+        if (job.kind !== RFJ.NONE)
+            return false;
+        const h = hw.rfCtl(cmd, stdinText);
+        if (!h)
+            return false;
+        job = { kind, h, deadline_ms: now + timeout_ms };
+        return true;
+    }
+
+    /* --------------------------------------------------------- JOIN WIFI - */
+
+    function jw_clear() {
+        jw.psk = "";               /* the secret never outlives a screen */
+        jw.ssid = [];
+        jw.sel = 0;
+        jw.top = 0;
+        jw.kr = 0;
+        jw.kc = 0;                 /* POSITION starts at 'A' */
+        jw.caps = false;
+        jw.staged = false;
+        jw.scanning = false;
+        jw.scan_failed = false;
+    }
+
+    /* user = a key press asked for this (so the page gets its full 10 s);
+     * the idle timeout leaves last_key_ms alone and PAGE 1 blanks at once. */
+    function jw_exit(now, user) {
+        /* The C SIGKILLs an unreaped scan child; dropping the handle is
+         * the same thing here — its result is discarded either way. */
+        if (job.kind === RFJ.SCAN)
+            job = { kind: RFJ.NONE, h: null, deadline_ms: 0 };
+        ui.screen = SCR.PAGE;
+        ui.page_idx = 0;
+        ui.a_down_ms = 0;
+        ui.a_fired = false;
+        jw_clear();
+        if (user)
+            ui.last_key_ms = now;
+    }
+
+    /* rf-ctl prints one SSID per line. Truncate to 32 octets, drop blanks
+     * and duplicates, then sort alphabetically (case-insensitive). */
+    function jw_take_scan(out) {
+        const seen = [];
+        for (const raw of String(out).split("\n")) {
+            const s = raw.replace(/[\r ]+$/, "").slice(0, SSID_MAX);
+            if (s && !seen.includes(s) && seen.length < MAX_SSIDS)
+                seen.push(s);
+        }
+        seen.sort((a, b) => {
+            const la = a.toLowerCase(), lb = b.toLowerCase();
+            if (la !== lb) return la < lb ? -1 : 1;
+            return a < b ? -1 : a > b ? 1 : 0;
+        });
+        jw.ssid = seen;
+        jw.sel = 0;
+        jw.top = 0;
+    }
+
+    function jw_viewport() {
+        if (jw.sel < jw.top)
+            jw.top = jw.sel;
+        if (jw.sel >= jw.top + ROWS)
+            jw.top = jw.sel - ROWS + 1;
+        if (jw.top < 0)
+            jw.top = 0;
+    }
+
+    function rf_job_done(now) {
+        const kind = job.kind;
+        const ok = !!job.h && job.h.done && job.h.ok;
+        const out = job.h ? job.h.out : "";
+        job = { kind: RFJ.NONE, h: null, deadline_ms: 0 };
+        rf_refresh();              /* the glyph must not wait for the tick */
+
+        if (kind === RFJ.SCAN && ui.screen === SCR.JW1) {
+            jw.scanning = false;
+            jw.scan_failed = !ok;
+            if (ok)
+                jw_take_scan(out);
+        } else if (kind === RFJ.CONNECT) {
+            /* Success or failure, the screen returns to PAGE 1 (or 0) and
+             * the RF glyph is the whole answer — no text hint, by design. */
+            ui.screen = SCR.PAGE;
+            ui.page_idx = 0;
+            ui.blanked = false;
+            ui.last_key_ms = now;
+            jw_clear();
+        }
+    }
+
+    function rf_job_tick(now) {
+        if (job.kind === RFJ.NONE)
+            return;
+        if (!job.h.done && now >= job.deadline_ms)
+            job.h = { done: true, ok: false, out: "" };   /* SIGKILL in the C */
+        if (!job.h.done)
+            return;
+        rf_job_done(now);
+    }
+
+    /* 5 s button-A hold on a page: RF-KILLED -> radios on + JW-1, else kill. */
+    function rf_toggle(now) {
+        if (job.kind !== RFJ.NONE)
+            return;
+        if (rf_state !== "killed") {
+            rf_spawn(RFJ.DOWN, "down", null, now, RFDOWN_TO_MS);
+            return;
+        }
+        jw_clear();
+        ui.screen = SCR.JW1;
+        ui.blanked = false;
+        ui.last_key_ms = now;
+        jw.scanning = true;
+        /* rf-ctl scan unblocks the radios itself, so the card reaches
+         * RF-ENABLED even when the scan comes back empty. */
+        if (!rf_spawn(RFJ.SCAN, "scan", null, now, SCAN_TO_MS)) {
+            jw.scanning = false;
+            jw.scan_failed = true;
+        }
+    }
+
+    function jw_connect(now) {
+        const stdinText = jw.ssid[jw.sel] + "\n" + jw.psk + "\n";
+        ui.screen = SCR.CONN;
+        ui.blanked = false;
+        ui.last_key_ms = now;
+        if (!rf_spawn(RFJ.CONNECT, "connect", stdinText, now, CONNECT_TO_MS)) {
+            ui.screen = SCR.PAGE;
+            ui.page_idx = 0;
+            jw_clear();
+        }
+    }
+
+    /* JW-2 keyboard: line 2 A-P, line 3 Q-Z then 1-6, line 4 7-9 0 then
+     * nine symbols, then SPACE / CAPS / DELETE in the last three cells. */
+    const KB_SYM = "-_.!@#$%&";
+
+    function kb_char(r, c) {
+        if (r === 0)
+            return String.fromCharCode((jw.caps ? 65 : 97) + c);
+        if (r === 1)
+            return c < 10 ? String.fromCharCode((jw.caps ? 81 : 113) + c)
+                          : String.fromCharCode(49 + (c - 10));
+        if (c < 3)
+            return String.fromCharCode(55 + c);
+        if (c === 3)
+            return "0";
+        if (c < 13)
+            return KB_SYM[c - 4];
+        return "";                 /* the three glyph keys */
+    }
+
+    function kb_cell(r, c) {
+        if (r === 2) {
+            if (c === COLS - 1) return G_DEL;
+            if (c === COLS - 2) return jw.caps ? G_CAPS_ON : G_CAPS_OFF;
+            if (c === COLS - 3) return G_SPACE;
+        }
+        return kb_char(r, c);
+    }
+
+    /* Button A released before the 2 s mark: type the key at the POSITION.
+     * Anything that touches the input area leaves STAGING; CAPS does not,
+     * it changes no character. */
+    function jw_type() {
+        const r = jw.kr, c = jw.kc;
+        if (r === 2 && c === COLS - 2) {
+            jw.caps = !jw.caps;
+            return;
+        }
+        jw.staged = false;
+        if (r === 2 && c === COLS - 1) {
+            jw.psk = jw.psk.slice(0, -1);
+            return;
+        }
+        const ch = (r === 2 && c === COLS - 3) ? " " : kb_char(r, c);
+        if (!ch)
+            return;
+        if (jw.psk.length < PSK_MAX)
+            jw.psk += ch;
+    }
+
+    function jw_key(key, press, now) {
+        ui.last_key_ms = now;      /* both edges keep the 10 s idle timer up */
+
+        /* Button B exits from either screen, short or long — its EVENT
+         * function is absorbed for as long as a JW screen is up. */
+        if (key === KEY.B) {
+            if (press)
+                jw_exit(now, true);
+            return;
+        }
+        if (key === KEY.A) {
+            if (press) {
+                ui.a_down_ms = now;
+                ui.a_fired = false;
+            } else {
+                const fired = ui.a_fired;
+                ui.a_down_ms = 0;
+                ui.a_fired = false;
+                if (!fired && ui.screen === SCR.JW2)
+                    jw_type();
+            }
+            return;
+        }
+        if (!press)
+            return;
+
+        if (ui.screen === SCR.JW1) {
+            if (key === KEY.UP && jw.sel > 0)
+                jw.sel--;
+            else if (key === KEY.DOWN && jw.sel + 1 < jw.ssid.length)
+                jw.sel++;
+            else if (key === KEY.LEFT)
+                jw_exit(now, true);
+            else if (key === KEY.RIGHT && jw.ssid.length > 0 && !jw.scanning) {
+                ui.screen = SCR.JW2;
+                ui.a_down_ms = 0;  /* a hold begun on JW-1 must not land on
+                                      JW-2 as an instant STAGING */
+                ui.a_fired = false;
+            }
+            jw_viewport();
+            return;
+        }
+        /* SCR.JW2 — LEFT is a keyboard move here, not an exit; the keyboard
+         * wraps on both axes so no direction is ever a dead end. */
+        if (key === KEY.UP)
+            jw.kr = (jw.kr + 2) % 3;
+        else if (key === KEY.DOWN)
+            jw.kr = (jw.kr + 1) % 3;
+        else if (key === KEY.LEFT)
+            jw.kc = (jw.kc + COLS - 1) % COLS;
+        else if (key === KEY.RIGHT)
+            jw.kc = (jw.kc + 1) % COLS;
+    }
+
     function handle_key(offset, press, now) {
         let key = -1;
         for (let i = 0; i < KEY_GPIO.length; i++)
@@ -267,14 +608,49 @@ function create(hw) {
         if (key < 0)
             return;
 
-        if (ui.error)
-            return;                /* PAGE 0 is static: all input ignored */
+        /* CONNECTING owns the screen until rf-ctl answers: button A is
+         * absorbed, button B is NOT — the EVENT marker stays available,
+         * since an incident does not wait for a Wi-Fi join. */
+        if (ui.screen === SCR.CONN) {
+            if (key !== KEY.B)
+                return;
+        } else if (ui.screen === SCR.JW1 || ui.screen === SCR.JW2) {
+            jw_key(key, press, now);
+            return;
+        }
+
+        /* Button B: EVENT capture (~2 s hold, fired from the tick) — the
+         * one key that acts on any NON-BLANKED screen, PAGE 0 included.
+         * From blank it is still a pure wake key. */
+        if (key === KEY.B) {
+            if (press && ui.blanked && !ui.error) {
+                wake(now);
+                return;
+            }
+            if (press) {
+                ui.b_down_ms = now;
+                ui.b_fired = false;
+            } else {
+                ui.b_down_ms = 0;
+            }
+            if (!ui.error)
+                ui.last_key_ms = now;
+            return;
+        }
+
+        if (ui.error) {
+            ui.a_down_ms = 0;      /* PAGE 0 is static: other input ignored */
+            return;
+        }
         if (!press) {
+            if (key === KEY.A)
+                ui.a_down_ms = 0;
             ui.last_key_ms = now;
             return;
         }
         if (ui.blanked) {
-            wake(now);             /* absorbed: wake only, no paging */
+            wake(now);             /* absorbed: wake only, no paging — an A
+                                      hold must restart after the wake */
             return;
         }
         ui.last_key_ms = now;
@@ -282,20 +658,84 @@ function create(hw) {
             ui.page_idx = (ui.page_idx + NPAGES - 1) % NPAGES;
         else if (key === KEY.RIGHT)
             ui.page_idx = (ui.page_idx + 1) % NPAGES;
-        /* A, B, UP, DOWN, CENTER: reserved — wake/reset-timer only */
+        else if (key === KEY.A) {
+            ui.a_down_ms = now;    /* 5 s hold = JOIN WIFI, fired from the
+                                      tick; short presses stay reserved */
+            ui.a_fired = false;
+        }
+        /* UP, DOWN, CENTER: reserved — wake/reset-timer only */
     }
 
     /* ------------------------------------------------------- rendering -- */
 
+    /* JW-1: four SSIDs, the selected one an INVERTED bar. Names wider than
+     * 14 columns are cut there and marked with a single LDOTS. */
+    function compose_jw1(f) {
+        if (jw.scanning)    { f.rows[0] = "SCANNING..."; return; }
+        if (jw.scan_failed) { f.rows[0] = "RF ERROR";    return; }
+        if (jw.ssid.length === 0) { f.rows[0] = "NO NETWORKS"; return; }
+        for (let r = 0; r < ROWS; r++) {
+            const i = jw.top + r;
+            if (i >= jw.ssid.length)
+                break;
+            const s = jw.ssid[i];
+            f.rows[r] = s.length > SSID_COLS
+                        ? s.slice(0, SSID_COLS) + G_LDOTS : s;
+            if (i === jw.sel)
+                f.inv[r] = 0xFFFF;
+        }
+    }
+
+    /* JW-2: line 1 the input area, lines 2-4 the keyboard. The POSITION
+     * cell is INVERTED; so is the whole input area while STAGING. */
+    function compose_jw2(f) {
+        f.rows[0] = jw.psk.length <= COLS
+                    ? jw.psk
+                    : G_LDOTS + jw.psk.slice(jw.psk.length - (COLS - 1));
+        if (jw.staged)
+            f.inv[0] = 0xFFFF;
+        for (let r = 0; r < 3; r++) {
+            let line = "";
+            for (let c = 0; c < COLS; c++)
+                line += kb_cell(r, c);
+            f.rows[r + 1] = line;
+        }
+        f.inv[1 + jw.kr] |= 1 << jw.kc;
+    }
+
     function compose() {
         const f = { blanked: false, yoff: 0, glyph: '',
-                    rows: ["", "", "", ""] };
+                    inv: [0, 0, 0, 0], rows: ["", "", "", ""] };
 
-        if (ui.blanked && !ui.error) {
+        if (ui.blanked && !ui.error && ui.screen === SCR.PAGE) {
             f.blanked = true;      /* blank hides everything, glyph included */
             return f;
         }
-        f.glyph = debug_card ? 'W' : 'S';  /* install mode, fixed per card */
+        f.glyph = rf_state === "killed" ? 'S'
+                : rf_state === "link"   ? 'W' : 'R';
+
+        if (hw.now() < ui.flash_until_ms) {
+            /* EVENT confirmation — a deliberate 2 s full-screen
+             * interruption of whatever page is up (PAGE 0 returns after) */
+            f.rows[1] = "    " + ui.flash.slice(0, 12);
+            return f;
+        }
+
+        if (ui.screen === SCR.CONN) {
+            /* Same full-screen shape as EVENT, but it lasts as long as the
+             * association attempt does — and it outranks PAGE 0 for that
+             * bounded window; the fault is still there when it returns. */
+            f.rows[1] = "  CONNECTING...";
+            return f;
+        }
+        if (ui.screen === SCR.JW1 || ui.screen === SCR.JW2) {
+            f.glyph = '';          /* JW-2's DELETE key needs column 15 */
+            if (ui.screen === SCR.JW1)
+                compose_jw1(f);
+            else
+                compose_jw2(f);
+            return f;
+        }
 
         if (ui.error) {
             /* PAGE 0 — static, only failing groups, empty lines omitted */
@@ -316,8 +756,9 @@ function create(hw) {
         }
 
         if (PAGES[ui.page_idx] === 2) {
-            /* PAGE 2 — first line: Pi 4 SoC temperature, whole degrees C
-             * (negative-safe round-to-nearest); remaining lines reserved */
+            /* PAGE 2 — line 1: Pi 4 SoC temperature, whole degrees C
+             * (negative-safe round-to-nearest); line 2: firmware power
+             * flags (under-voltage now beats latched); rest reserved */
             if (cpu_temp_valid) {
                 const mc = cpu_temp_mc;
                 const deg = Math.trunc((mc + (mc >= 0 ? 500 : -500)) / 1000);
@@ -325,6 +766,10 @@ function create(hw) {
             } else {
                 f.rows[0] = "TMP ---";
             }
+            if (!throttled_valid)            f.rows[1] = "PWR ---";
+            else if (throttled & 0x1)        f.rows[1] = "PWR UV NOW";
+            else if (throttled & 0x10000)    f.rows[1] = "PWR UV SEEN";
+            else                             f.rows[1] = "PWR OK";
             return f;
         }
 
@@ -354,30 +799,42 @@ function create(hw) {
         fb[y * XRES + x] = on ? 1 : 0;
     }
 
-    /* 8x8 font cell doubled vertically to 8x16. */
-    function draw_char(col, row, ch, yoff) {
+    /* INVERTED cells write every pixel of the 8x16 cell, so the background
+     * fills and the character itself stays dark — no separate fill pass. */
+    function draw_glyph16(col, row, g, yoff, inv) {
+        const x0 = col * CELL_W;
+        const y0 = row * CELL_H + yoff;
+        for (let fy = 0; fy < 16; fy++)
+            for (let fx = 0; fx < 8; fx++) {
+                const on = (g[fy] >> fx) & 1;
+                putpixel(x0 + fx, y0 + fy, inv ? !on : on);
+            }
+    }
+
+    /* 8x8 font cell doubled vertically to 8x16; the private G_* codes
+     * below 0x20 select a hand-drawn 8x16 glyph instead. */
+    function draw_char(col, row, ch, yoff, inv) {
+        const g16 = CELL_GLYPH[ch];
+        if (g16) {
+            draw_glyph16(col, row, g16, yoff, inv);
+            return;
+        }
         let code = ch.charCodeAt(0);
         if (code < 0x20 || code > 0x7E)
-            code = 0x20;
+            code = 0x20;           /* incl. UTF-8 SSID bytes */
         const g = FONT8X8[code - 0x20];
         const x0 = col * CELL_W;
         const y0 = row * CELL_H + yoff;
         for (let fy = 0; fy < 8; fy++) {
             const bits = g[fy];
             for (let fx = 0; fx < 8; fx++) {
-                const on = (bits >> fx) & 1;    /* bit 0 = leftmost */
+                let on = (bits >> fx) & 1;      /* bit 0 = leftmost */
+                if (inv)
+                    on = on ? 0 : 1;
                 putpixel(x0 + fx, y0 + 2 * fy, on);
                 putpixel(x0 + fx, y0 + 2 * fy + 1, on);
             }
         }
-    }
-
-    function draw_glyph16(col, row, g, yoff) {
-        const x0 = col * CELL_W;
-        const y0 = row * CELL_H + yoff;
-        for (let fy = 0; fy < 16; fy++)
-            for (let fx = 0; fx < 8; fx++)
-                putpixel(x0 + fx, y0 + fy, (g[fy] >> fx) & 1);
     }
 
     function render(f) {
@@ -392,22 +849,29 @@ function create(hw) {
             hw_blanked = 0;        /* FBIOBLANK UNBLANK in the C */
         fb.fill(0);
         for (let r = 0; r < ROWS; r++) {
-            /* row 3, col 15 is the reserved RF glyph cell on every screen */
-            const maxc = (r === ROWS - 1) ? COLS - 1 : COLS;
-            for (let c = 0; c < maxc && c < f.rows[r].length; c++)
-                draw_char(c, r, f.rows[r][c], f.yoff);
+            /* row 3, col 15 is the reserved RF glyph cell — except on the
+             * JW screens, which clear the glyph and take all 16 columns */
+            const maxc = (r === ROWS - 1 && f.glyph) ? COLS - 1 : COLS;
+            const len = f.rows[r].length;
+            for (let c = 0; c < maxc; c++) {
+                const inv = (f.inv[r] >> c) & 1;
+                if (c >= len && !inv)
+                    continue;      /* already dark from the fill(0) */
+                draw_char(c, r, c < len ? f.rows[r][c] : " ", f.yoff, inv);
+            }
         }
         if (f.glyph)
             draw_glyph16(COLS - 1, ROWS - 1,
-                         f.glyph === 'S' ? GLYPH_SHIELD : GLYPH_WIRELESS,
-                         f.yoff);
+                         f.glyph === 'S' ? GLYPH_SHIELD :
+                         f.glyph === 'R' ? GLYPH_RF_IDLE : GLYPH_WIRELESS,
+                         f.yoff, false);
         hw.present({ blanked: false, fb });
     }
 
     /* ----------------------------------------------------------- main -- */
 
     /* main() before the loop: conf, first health pass, honest boot state. */
-    function boot(units, debug) {
+    function boot(units, rfJoin) {
         if (units === "KMH") {     /* load_conf() */
             speed_factor = 1.852;
             speed_unit = "KMH";
@@ -415,11 +879,14 @@ function create(hw) {
             speed_factor = 1.15078;
             speed_unit = "MPH";
         }
-        debug_card = !!debug;      /* DEBUG= in dashberry.conf */
+        rf_join = !!rfJoin;        /* RF_JOIN= in dashberry.conf */
         const now = hw.now();
+        ui.screen = SCR.PAGE;
         ui.page_idx = 0;
         ui.last_key_ms = now;
         ui.burn_last_ms = now;
+        job = { kind: RFJ.NONE, h: null, deadline_ms: 0 };
+        jw_clear();
         eval_health(now);
         ui.error = system_err();   /* boot: honest immediate evaluation */
         hw.notify("READY=1");
@@ -433,6 +900,8 @@ function create(hw) {
         hw.notify("WATCHDOG=1");
         watchdog_pets++;
 
+        rf_job_tick(now);
+
         if (++subtick >= HEALTH_TICKS) {
             subtick = 0;
             eval_health(now);
@@ -440,6 +909,10 @@ function create(hw) {
             if (err && !ui.error) {
                 ui.error = true;   /* forces screen on + PAGE 0 */
                 ui.blanked = false;
+                /* A fault outranks a half-finished join: JW-1/JW-2 are
+                 * dropped (an in-flight CONNECT still gets to finish). */
+                if (ui.screen === SCR.JW1 || ui.screen === SCR.JW2)
+                    jw_exit(now, true);
             } else if (!err && ui.error) {
                 ui.error = false;  /* back to PAGES: wake to PAGE 1 */
                 ui.page_idx = 0;
@@ -448,7 +921,39 @@ function create(hw) {
             }
         }
 
-        if (!ui.error && !ui.blanked && now - ui.last_key_ms >= BLANK_MS)
+        /* Button B held to the 2 s mark: record the event, once per hold. */
+        if (ui.b_down_ms && !ui.b_fired && now - ui.b_down_ms >= EVENT_HOLD_MS) {
+            ui.b_fired = true;
+            ui.flash = hw.logEvent() ? "EVENT" : "EVENT ERR";
+            ui.flash_until_ms = now + EVENT_FLASH_MS;
+        }
+
+        /* Button A held to its mark. On JW-2 that is 2 s: first hold
+         * STAGES the input area (INVERTED), a second one commits.
+         * On a page it is 5 s: arm JOIN WIFI, or kill RF again. */
+        if (ui.a_down_ms && !ui.a_fired) {
+            if (ui.screen === SCR.JW2 && now - ui.a_down_ms >= STAGE_HOLD_MS) {
+                ui.a_fired = true;
+                if (jw.staged)
+                    jw_connect(now);
+                else
+                    jw.staged = true;
+            } else if (ui.screen === SCR.PAGE && rf_join && !ui.error &&
+                       !ui.blanked && now - ui.a_down_ms >= RF_HOLD_MS) {
+                ui.a_fired = true;
+                rf_toggle(now);
+            }
+        }
+
+        /* JW-1/JW-2 time out to the pages rather than blanking. The idle
+         * path leaves last_key_ms alone, so the page it returns to blanks
+         * on this same tick — nobody is watching. */
+        if ((ui.screen === SCR.JW1 || ui.screen === SCR.JW2) &&
+            now - ui.last_key_ms >= JW_IDLE_MS)
+            jw_exit(now, false);
+
+        if (ui.screen === SCR.PAGE && !ui.error && !ui.blanked &&
+            now - ui.last_key_ms >= BLANK_MS)
             ui.blanked = true;
 
         if (now - ui.burn_last_ms >= burn_step_ms) {
@@ -492,15 +997,27 @@ function create(hw) {
         setBurnStepMs(ms) { burn_step_ms = ms; },   /* demo aid only */
 
         state() {
+            const scrName = ["PAGE", "JW-1", "JW-2", "CONNECTING"][ui.screen];
             return {
                 error: ui.error, blanked: ui.blanked,
-                page: ui.error ? 0 : PAGES[ui.page_idx],
+                screen: scrName,
+                page: ui.screen !== SCR.PAGE ? null
+                                             : (ui.error ? 0 : PAGES[ui.page_idx]),
                 burn_idx: ui.burn_idx,
                 yoff: ui.error ? BURN_OFFSETS[ui.burn_idx] : 0,
-                blank_in_ms: ui.error || ui.blanked ? null :
-                             Math.max(0, BLANK_MS - (hw.now() - ui.last_key_ms)),
+                blank_in_ms: ui.error || ui.blanked || ui.screen !== SCR.PAGE
+                             ? null
+                             : Math.max(0, BLANK_MS - (hw.now() - ui.last_key_ms)),
                 health: { ...health },
-                debug_card,
+                rf_join, rf_state,
+                jw: {
+                    ssid: [...jw.ssid], sel: jw.sel, top: jw.top,
+                    scanning: jw.scanning, scan_failed: jw.scan_failed,
+                    pskLen: jw.psk.length, psk: jw.psk,
+                    kr: jw.kr, kc: jw.kc, caps: jw.caps, staged: jw.staged,
+                },
+                job: job.kind,
+                flashing: hw.now() < ui.flash_until_ms,
                 gps: { ...gps },
                 df_pct,
                 repaints, watchdog_pets,
@@ -511,7 +1028,14 @@ function create(hw) {
 
 return { create, KEY, KEY_GPIO, XRES, YRES, COLS, ROWS,
          TICK_MS, BLANK_MS, STALE_MS, GPS_SILENT_MS,
-         FONT8X8 };            /* exported so logic-test.js can decode fb */
+         EVENT_HOLD_MS, RF_HOLD_MS, STAGE_HOLD_MS, JW_IDLE_MS,
+         SCAN_TO_MS, CONNECT_TO_MS,
+         G_LDOTS, G_SPACE, G_CAPS_OFF, G_CAPS_ON, G_DEL,
+         FONT8X8,              /* exported so logic-test.js can decode fb */
+         GLYPHS: { LDOTS: GLYPH_LDOTS, SPACE: GLYPH_SPACE,
+                   "CAPSv": GLYPH_CAPS_OFF, "CAPS^": GLYPH_CAPS_ON,
+                   DEL: GLYPH_DEL, SHIELD: GLYPH_SHIELD,
+                   "RF-IDLE": GLYPH_RF_IDLE, WIFI: GLYPH_WIRELESS } };
 
 })();
 

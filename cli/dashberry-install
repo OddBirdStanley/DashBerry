@@ -18,16 +18,32 @@
 #   4. merges boot/config-snippet.txt into config.txt;
 #   5. stages sw/ at /opt/dashberry/sw and enables a oneshot first-boot
 #      service that installs packages, builds dashberry-panel, enables the
-#      units, and reboots (sw/firstinstall.sh). Without --debug the card is
-#      PRODUCTION: the OS flips read-only, no user account or ssh exists,
-#      and every network credential is wiped — sealed; archive by pulling
-#      the card. With --debug NAME:PASS it is a DEBUG card: writable OS,
-#      ssh + that user, journal kept and persistent;
+#      units, and reboots (sw/firstinstall.sh). The card lands in one of
+#      three modes, set by --auth and --debug (see below);
 #   6. (--wifi) stages a first-boot Wi-Fi profile plus the regulatory
 #      domain that stock Pi OS (Trixie) needs before it will unblock wlan,
-#      so boot 2 can run without Ethernet. PRODUCTION wipes every trace of
-#      it before the overlay freezes the OS; DEBUG keeps the profile so the
-#      card rejoins the LAN on every boot.
+#      so boot 2 can run without Ethernet. The staged credential is always
+#      wiped on a non-debug card before the overlay freezes the OS; DEBUG
+#      keeps the profile so the card rejoins the LAN on every boot.
+#
+# The three modes (--debug requires --auth; the account is --auth's job now,
+# it is no longer --debug's parameter):
+#
+#   (neither)            SEALED production card. Read-only OS, no user, no
+#                        sshd, no radios, every network trace wiped. Its
+#                        only interfaces are the OLED and pulling the card.
+#   --auth NAME:PASS     JOIN WIFI card. Still a production card — read-only
+#                        OS, no stored credential, radios blocked at every
+#                        boot — but that account + sshd exist, and the panel
+#                        arms JOIN WIFI (RF_JOIN=1): a 5 s button-A hold on
+#                        the OLED brings the radios up and walks the user
+#                        through picking an SSID and typing its passphrase.
+#                        Needs --wifi-country: without a regulatory domain
+#                        the kernel hard-blocks wlan and the feature is dead.
+#   --debug --auth N:P   DEBUG card. Writable OS, ssh + that account,
+#                        journal kept and made persistent. JOIN WIFI is NOT
+#                        armed here; the card boots RF-KILLED unless a
+#                        --wifi profile was explicitly staged for it.
 #
 # The stock image's own auto-expand is left in place and self-disarms: it
 # refuses to grow a root partition that is not the last one, and /data is.
@@ -47,10 +63,17 @@ Options:
   --bypass-time     ignore DS3231 from system requirement and use GPS for time calibration
   --bypass-rear     ignore rear camera from system requirement
   --root-size GIB   OS partition size in GiB (default: 8)
-  --debug NAME:PASS build a debug card; without it the card has no wireless capabilities
+  --auth NAME:PASS  create this account (+ sshd). On its own it also arms
+                    JOIN WIFI on the panel (needs --wifi-country)
+  --debug           build a debug card: writable OS, journal kept and made
+                    persistent. Requires --auth; JOIN WIFI is not armed
   --wifi SSID:PSK   run the first boot over Wi-Fi instead of Ethernet
-  --wifi-country CC required to configure --wifi
+  --wifi-country CC regulatory domain; required by --wifi and by JOIN WIFI
   -h, --help        display this help
+
+With neither --auth nor --debug the card is SEALED: read-only OS, no
+account, no sshd, no radios — the OLED and pulling the card are its only
+interfaces.
 EOF
 }
 
@@ -64,6 +87,8 @@ BYPASS_TIME=0
 BYPASS_REAR=0
 ROOT_GIB=8
 DEBUG=0
+AUTH=0
+RF_JOIN=0
 USERSPEC=
 WIFISPEC=
 WIFI_CC=
@@ -77,7 +102,8 @@ while [ $# -gt 0 ]; do
         --bypass-time) BYPASS_TIME=1 ;;
         --bypass-rear) BYPASS_REAR=1 ;;
         --root-size)   shift; ROOT_GIB=${1:-} ;;
-        --debug)       shift; DEBUG=1; USERSPEC=${1:-} ;;
+        --debug)       DEBUG=1 ;;
+        --auth)        shift; AUTH=1; USERSPEC=${1:-} ;;
         --wifi)        shift; WIFISPEC=${1:-} ;;
         --wifi-country) shift; WIFI_CC=${1:-} ;;
         -h|--help)     usage; exit 0 ;;
@@ -97,9 +123,27 @@ case $ROOT_GIB in *[!0-9]*|'') die "--root-size requires a whole number of GiB" 
 # up front because the wipe below is the point of no return. The default
 # 8 GiB OS means a 16 GB card in practice.
 MIN_DEV_BYTES=$((512 * 1024 * 1024 + ROOT_GIB * 1024 * 1024 * 1024 + MIN_DATA_BYTES))
-if [ "$DEBUG" = 1 ]; then
-    case $USERSPEC in *:*) ;; *) die "--debug requires NAME:PASS)" ;; esac
+# The account moved out of --debug into --auth, so the three modes are a
+# plain truth table: --debug needs an account to be worth anything, and
+# --auth alone is the JOIN WIFI card.
+[ "$DEBUG" = 0 ] || [ "$AUTH" = 1 ] || die "--debug requires --auth NAME:PASS"
+if [ "$AUTH" = 1 ]; then
+    case $USERSPEC in *:*) ;; *) die "--auth requires NAME:PASS" ;; esac
     need openssl
+    [ "$DEBUG" = 1 ] || RF_JOIN=1
+fi
+# A JOIN WIFI card must carry a regulatory domain or the kernel keeps wlan
+# hard-blocked for its whole life and the feature can never do anything.
+if [ "$RF_JOIN" = 1 ] && [ -z "$WIFI_CC" ]; then
+    die "--auth without --debug arms JOIN WIFI, which needs --wifi-country CC"
+fi
+if [ -n "$WIFI_CC" ]; then
+    case $WIFI_CC in [A-Za-z][A-Za-z]) ;; *) die "--wifi-country requires a two-letter code" ;; esac
+    WIFI_CC=$(printf '%s' "$WIFI_CC" | tr '[:lower:]' '[:upper:]')
+    # A regdom on its own is now meaningful (JOIN WIFI needs one); it is
+    # only pointless on a card with neither --wifi nor JOIN WIFI.
+    [ -n "$WIFISPEC" ] || [ "$RF_JOIN" = 1 ] || \
+        die "--wifi-country needs --wifi or a JOIN WIFI card (--auth without --debug)"
 fi
 if [ -n "$WIFISPEC" ]; then
     case $WIFISPEC in *:*) ;; *) die "--wifi requires SSID:PSK" ;; esac
@@ -111,11 +155,7 @@ if [ -n "$WIFISPEC" ]; then
         die "--wifi PSK must be a 8-63 char passphrase or 64 hex digits"
     [ -n "$WIFI_CC" ] || \
         die "--wifi needs --wifi-country CC"
-    case $WIFI_CC in [A-Za-z][A-Za-z]) ;; *) die "--wifi-country requires a two-letter code" ;; esac
-    WIFI_CC=$(printf '%s' "$WIFI_CC" | tr '[:lower:]' '[:upper:]')
     FIRSTBOOT_WIFI=1
-elif [ -n "$WIFI_CC" ]; then
-    die "--wifi-country should only be used with --wifi"
 fi
 
 for t in dd sfdisk partprobe blkid mkfs.ext4 e2fsck resize2fs lsblk \
@@ -168,9 +208,11 @@ echo
 echo "    image : $IMG"
 echo "    layout: boot | OS ${ROOT_GIB} GiB$( [ $DEBUG = 0 ] && echo ' (read-only)' ) | /data"
 if [ "$DEBUG" = 1 ]; then
-    echo "    mode  : debug"
+    echo "    mode  : debug (user '${USERSPEC%%:*}' + ssh)"
+elif [ "$RF_JOIN" = 1 ]; then
+    echo "    mode  : production + JOIN WIFI (user '${USERSPEC%%:*}' + ssh)"
 else
-    echo "    mode  : production"
+    echo "    mode  : production (sealed)"
 fi
 [ "$BYPASS_TIME" = 1 ] && echo "    bypass: TIME"
 [ "$BYPASS_REAR" = 1 ] && echo "    bypass: REAR"
@@ -345,6 +387,9 @@ fi
 if [ "$DEBUG" = 1 ]; then
     sed -i 's/^DEBUG=0/DEBUG=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
 fi
+if [ "$RF_JOIN" = 1 ]; then
+    sed -i 's/^RF_JOIN=0/RF_JOIN=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
+fi
 printf 'FIRSTBOOT_WIFI=%s\n' "$FIRSTBOOT_WIFI" \
     > "$MNT/opt/dashberry/install-opts"
 
@@ -369,14 +414,27 @@ mkdir -p "$MNT/etc/systemd/system/multi-user.target.wants"
 ln -sf /etc/systemd/system/dashberry-firstinstall.service \
     "$MNT/etc/systemd/system/multi-user.target.wants/dashberry-firstinstall.service"
 
-# PRODUCTION cards get neither a user nor sshd: with no account to log
-# into and no listener, the sealed card's only interface is the OLED and
-# pulling the card itself.
-if [ "$DEBUG" = 1 ]; then
-    info "Debug card: user '${USERSPEC%%:*}' + ssh..."
+# The account is --auth's job, on a debug card and a JOIN WIFI card alike:
+# a card you can bring onto a network is only useful if something answers
+# there. A SEALED card gets neither a user nor sshd — with no account to
+# log into and no listener, its only interface is the OLED and pulling the
+# card itself.
+if [ "$AUTH" = 1 ]; then
+    info "Creating account '${USERSPEC%%:*}' + ssh..."
     printf '%s:%s\n' "${USERSPEC%%:*}" \
         "$(openssl passwd -6 "${USERSPEC#*:}")" > "$BOOTDIR/userconf.txt"
     : > "$BOOTDIR/ssh"
+fi
+# The regulatory domain: stock Pi OS (since bullseye, still true on trixie)
+# keeps wlan rfkill-blocked until one is set, and the kernel cmdline is the
+# offline way to provide it. Needed by a --wifi first boot AND for the
+# lifetime of a JOIN WIFI card. cmdline.txt is a single line — append to
+# it, don't add a second. firstinstall removes the token again during the
+# credential wipe unless the card is a debug or JOIN WIFI build.
+if [ -n "$WIFI_CC" ]; then
+    info "Setting the regulatory domain ($WIFI_CC)..."
+    [ -f "$BOOTDIR/cmdline.txt" ] || die "No cmdline.txt on the boot partition"
+    sed -i "1s/\$/ cfg80211.ieee80211_regdom=$WIFI_CC/" "$BOOTDIR/cmdline.txt"
 fi
 if [ "$FIRSTBOOT_WIFI" = 1 ]; then
     info "Staging first-boot Wi-Fi '$WIFI_SSID'..."
@@ -396,13 +454,6 @@ if [ "$FIRSTBOOT_WIFI" = 1 ]; then
         } > "$NMFILE"
     )
     chmod 600 "$NMFILE"
-    # Stock Pi OS (since bullseye, still true on trixie) keeps wlan
-    # rfkill-blocked until a regulatory domain is set; the kernel cmdline is
-    # the offline way to provide one. cmdline.txt is a single line — append
-    # to it, don't add a second. On a production card firstinstall removes
-    # the token again during the credential wipe; a debug card keeps it.
-    [ -f "$BOOTDIR/cmdline.txt" ] || die "No cmdline.txt on the boot partition"
-    sed -i "1s/\$/ cfg80211.ieee80211_regdom=$WIFI_CC/" "$BOOTDIR/cmdline.txt"
 fi
 
 sync

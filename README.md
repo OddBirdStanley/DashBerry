@@ -31,8 +31,14 @@ no account, no companion app, and no telemetry.
 - **Sealed production install** — the shipped card has no Wi-Fi
   credentials, no login account and no ssh; its only interfaces are the
   OLED panel and physically pulling the card. A separate DEBUG install
-  mode (writable, ssh, persistent logs) exists for bench work, and the
-  panel always shows which one you're looking at
+  mode (writable, ssh, persistent logs) exists for bench work
+- **JOIN WIFI, opt-in and never persistent** — a card built with `--auth`
+  keeps the sealed read-only OS but adds an account and an on-panel way to
+  reach it: hold A for 5 s and the OLED becomes an SSID picker and an
+  on-screen keyboard. Nothing about it survives a reboot — the radios come
+  back blocked and the passphrase is gone — so the privacy default is
+  still "dark", just no longer permanent. The bottom-right glyph reports
+  the live radio state at a glance
 - **Minimal software** — the card carries only what recording requires;
   all heavier tooling runs on your PC and never ships in the vehicle
 
@@ -128,8 +134,13 @@ PC-side CLI.
 # production card (sealed)
 sudo cli/dashberry-install raspios-trixie-arm64-lite.img.xz /dev/sdX
 
+# production card + JOIN WIFI (sealed OS, but the panel can join a
+# network on demand and you can ssh in as dash while it is up)
+sudo cli/dashberry-install --auth dash:changeme --wifi-country US \
+    raspios-trixie-arm64-lite.img.xz /dev/sdX
+
 # bench/development card (writable, ssh as dash)
-sudo cli/dashberry-install --debug dash:changeme \
+sudo cli/dashberry-install --debug --auth dash:changeme \
     raspios-trixie-arm64-lite.img.xz /dev/sdX
 ```
 
@@ -148,11 +159,13 @@ or manual configuration is ever needed.
 | `--bypass-rear` | install without the rear camera; the panel never flags it as missing |
 | `--bypass-time` | install without the DS3231 RTC; the clock is set from GPS after each boot instead |
 | `--root-size N` | OS partition size in GiB (default 8, minimum 8) |
-| `--debug NAME:PASS` | build a DEBUG card — writable OS, SSH with this user, journal kept and persistent, `--wifi` profile kept; without it the card is PRODUCTION — read-only OS, no user, no SSH, all network credentials wiped (sealed) |
-| `--wifi SSID:PSK` | run the first boot over Wi-Fi instead of Ethernet; setup-only on a production card (the installer wipes the profile, DHCP leases and logs before the OS locks read-only), kept on a debug card, which rejoins the LAN every boot |
-| `--wifi-country CC` | two-letter regulatory domain, required with `--wifi` (a stock image keeps Wi-Fi blocked without one) |
+| `--auth NAME:PASS` | create this login account and enable SSH. On its own (no `--debug`) the card stays PRODUCTION — read-only OS, no stored network credentials — but the panel's JOIN WIFI screen is armed, so you can bring the card onto a network by hand and ssh in; requires `--wifi-country` |
+| `--debug` | build a DEBUG card — writable OS, journal kept and persistent, `--wifi` profile kept so it rejoins the LAN every boot. Requires `--auth`; JOIN WIFI is not armed (the card already knows a network) |
+| `--wifi SSID:PSK` | run the first boot over Wi-Fi instead of Ethernet; setup-only on a production card (the installer wipes the profile, DHCP leases and logs before the OS locks read-only), kept on a debug card |
+| `--wifi-country CC` | two-letter regulatory domain, required with `--wifi` and on a JOIN WIFI card (a stock image keeps Wi-Fi blocked without one) |
 
-Both bypass options default to off; the default mode is PRODUCTION.
+Both bypass options default to off. With neither `--auth` nor `--debug` the
+card is a SEALED production card — no account, no SSH, no radios.
 
 ## Usage
 
@@ -165,11 +178,33 @@ switches to a static error screen (`FRONT`, `REAR`, `GPS`, `TIME`,
 `SD FULL`) when a component fails. LEFT/RIGHT cycle to a second page with
 SoC temperature and firmware power status; holding B for ~2 s marks the
 moment as an event, on any screen the panel is currently showing. The
-bottom-right glyph shows the install mode: shield = production (sealed),
-wireless = debug card.
+bottom-right glyph reports the radios: shield = blocked (how every card
+boots), bare antenna = on but not connected, antenna with waves =
+associated.
 
 To archive footage, pull the card and copy `/data`. The read-only OS makes
 removal safe at any time.
+
+### Joining a Wi-Fi network (cards built with `--auth`)
+
+Everything happens on the panel; nothing is stored.
+
+1. Hold **A** for 5 seconds. The radios come up and the screen lists the
+   networks in range, sorted alphabetically. **UP/DOWN** scroll.
+2. **RIGHT** opens the passphrase screen: an on-screen keyboard with the
+   joystick moving between keys and a tap of **A** typing the highlighted
+   one. The last three keys are space, caps and delete.
+3. Hold **A** for 2 seconds to arm the entry (the passphrase line inverts),
+   then hold **A** for 2 seconds again to connect. Typing anything more
+   disarms it, so a mistyped passphrase cannot be sent by accident.
+4. The screen returns to the normal display. The glyph tells you whether it
+   worked — waves for connected, a bare antenna for not.
+
+**LEFT** (on the list) or **B** (anywhere) backs out; so does ten seconds
+of not touching it. Hold **A** for 5 seconds again to switch the radios
+back off, and note that a reboot does that for you: the passphrase you
+typed was never written to the read-only OS, so the card always comes back
+up dark.
 
 ### Processing footage
 
@@ -210,5 +245,7 @@ userland and kernel software used and produced here is free software. The
 one exception is outside the project's control: the Raspberry Pi boot/GPU
 firmware is a closed binary blob, as on essentially every practical SBC and
 commercial dashcam. DashBerry's privacy claims (no cloud, no accounts, no
-telemetry, nothing to connect to on a production card) hold without
-qualification.
+telemetry, nothing to connect to on a sealed card) hold without
+qualification. On a `--auth` card the radios exist but stay blocked until
+somebody physically holds a button on the panel, and nothing they learn is
+written to disk.

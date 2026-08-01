@@ -11,15 +11,22 @@
  *     reported format: 1 bpp (fbdev ssd1307fb) or 32 bpp XRGB8888 (DRM
  *     ssd130x fbdev emulation — what Trixie's kernel binds);
  *   - AUTO-BLANK (10 s, OK state only);
+ *   - JOIN WIFI (armed only by RF_JOIN=1 in /etc/dashberry.conf): a 5 s
+ *     button-A hold turns the radios on and opens JW-1 (SSID list) → JW-2
+ *     (on-screen keyboard) → CONNECTING; the radio work itself is done by
+ *     /usr/local/bin/rf-ctl in a forked child whose stdout is polled, so
+ *     the event loop never blocks on a scan or an association;
  *   - health evaluation from real signals (segments growing, NMEA flowing,
  *     RTC readable, /data writable-with-space) — logged, transitions and a
  *     10 s heartbeat, to /data/health/<session>/<session>.log for the
  *     PC-side renderer;
  *   - systemd watchdog liveness (hand-rolled sd_notify, Type=notify).
  *
- * The bottom-right glyph cell reports the INSTALL MODE, baked at build of
- * the card (DEBUG in /etc/dashberry.conf): shield = production (sealed),
- * wireless = debug (radios/ssh live). There is no runtime RF toggling.
+ * The bottom-right glyph cell reports the LIVE RF STATE, read from
+ * /sys/class/rfkill and the wireless interface's operstate: shield =
+ * RF-KILLED (every card's boot state), bare antenna = RF-ENABLED but not
+ * associated, antenna with waves = associated. It is the only report of
+ * whether a JOIN WIFI attempt worked — there is no text hint.
  *
  * No libgpiod, no libsystemd, no libm. Portable POSIX + Linux UAPI headers.
  * Build: cc -std=c11 -Wall -Wextra -O2 -o dashberry-panel dashberry-panel.c
@@ -33,6 +40,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -50,6 +58,7 @@
 #include <sys/timerfd.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -70,6 +79,9 @@
 #define CPU_TEMP      "/sys/class/thermal/thermal_zone0/temp"  /* milli-degC */
 #define GET_THROTTLED "/sys/devices/platform/soc/soc:firmware/get_throttled"
 #define HEALTH_BASE   "/data/health"
+#define RFKILL_BASE   "/sys/class/rfkill"
+#define NET_BASE      "/sys/class/net"
+#define RF_CTL        "/usr/local/bin/rf-ctl"
 
 /* --------------------------------------------------------------- timing - */
 
@@ -83,6 +95,12 @@
 #define EVENT_HOLD_MS    2000     /* button B hold to mark an EVENT */
 #define EVENT_FLASH_MS   2000     /* EVENT confirmation screen duration */
 #define HB_MS            10000    /* health-log heartbeat cadence */
+#define RF_HOLD_MS       5000     /* button A hold: arm / kill RF (JOIN WIFI) */
+#define STAGE_HOLD_MS    2000     /* button A hold on JW-2: stage / connect */
+#define JW_IDLE_MS       10000    /* JW-1/JW-2 exit after this without input */
+#define SCAN_TO_MS       25000    /* rf-ctl scan watchdog */
+#define RFDOWN_TO_MS     15000    /* rf-ctl down watchdog */
+#define CONNECT_TO_MS    45000    /* rf-ctl connect watchdog */
 
 /* -------------------------------------------------------------- display - */
 
@@ -90,6 +108,21 @@
 #define ROWS 4
 #define CELL_W 8
 #define CELL_H 16
+
+/* Private cell codes: characters below 0x20 never appear in real text, so
+ * they address the hand-drawn 8x16 glyphs straight out of frame.rows[]
+ * without a second per-cell array. draw_char() dispatches on them. */
+#define G_LDOTS    '\x01'   /* SSID/password truncation mark */
+#define G_SPACE    '\x02'   /* JW-2 space key */
+#define G_CAPS_OFF '\x03'   /* JW-2 caps key, OFF: arrow down */
+#define G_CAPS_ON  '\x04'   /* JW-2 caps key, ON: arrow up */
+#define G_DEL      '\x05'   /* JW-2 delete key */
+
+/* JOIN WIFI sizing */
+#define SSID_COLS  (COLS - 2)   /* SSID field width on JW-1; LDOTS follows */
+#define SSID_MAX   32           /* IEEE 802.11 SSID octets */
+#define PSK_MAX    63           /* WPA passphrase ceiling (64 = raw hex PSK) */
+#define MAX_SSIDS  48
 
 /* Bit order within each 1 bpp framebuffer byte. The fbdev mono
  * convention is MSB = leftmost pixel; if every 8-px column group shows
@@ -262,17 +295,51 @@ static const uint8_t font8x8[95][8] = {
     {0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00}, /* ~   */
 };
 
-/* Hand-drawn 8x16 mode glyphs (bit 0 = leftmost, one byte per pixel row —
- * NOT doubled). The cell reports the INSTALL MODE, fixed for the card's
- * lifetime: wireless = DEBUG build (radios/ssh live); shield =
- * PRODUCTION build (sealed). */
+/* Hand-drawn 8x16 glyphs (bit 0 = leftmost, one byte per pixel row — NOT
+ * doubled). The bottom-right cell reports the LIVE RF STATE:
+ *   shield   = RF-KILLED — radios soft/hard-blocked (every card's boot state)
+ *   rf_idle  = RF-ENABLED, not associated — the wireless glyph with its two
+ *              outer arcs stripped, so "reaching out and getting nothing"
+ *              reads as a visibly weaker version of the same symbol
+ *   wireless = RF-ENABLED and associated (user drawing, source of truth
+ *              DashBerry/wireless_glyph.txt, 'x' = lit)
+ * A JOIN WIFI attempt reports its outcome here and nowhere else. */
 static const uint8_t glyph_wireless[16] = {
     0x3C, 0x42, 0x81, 0x81, 0x3C, 0x42, 0x81, 0x81,
+    0x3C, 0x42, 0x81, 0x99, 0x24, 0x00, 0x18, 0x18,
+};
+static const uint8_t glyph_rf_idle[16] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x3C, 0x42, 0x81, 0x99, 0x24, 0x00, 0x18, 0x18,
 };
 static const uint8_t glyph_shield[16] = {
     0x3E, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F,
     0x7F, 0x3E, 0x3E, 0x1C, 0x1C, 0x08, 0x00, 0x00,
+};
+
+/* JOIN WIFI cell glyphs. LDOTS is the truncation mark: two 2x2 blocks on
+ * the text baseline, flush to the cell's right edge — one character wide,
+ * so a truncated 14-column SSID plus its LDOTS still clears column 15. */
+static const uint8_t glyph_ldots[16] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0xD8, 0xD8, 0x00, 0x00,
+};
+/* CAPS: a solid triangle, point down = OFF (lower case), point up = ON. */
+static const uint8_t glyph_caps_off[16] = {
+    0x00, 0x00, 0x00, 0x00, 0x7F, 0x7F, 0x3E, 0x3E,
+    0x1C, 0x1C, 0x08, 0x08, 0x00, 0x00, 0x00, 0x00,
+};
+static const uint8_t glyph_caps_on[16] = {
+    0x00, 0x00, 0x00, 0x00, 0x08, 0x08, 0x1C, 0x1C,
+    0x3E, 0x3E, 0x7F, 0x7F, 0x00, 0x00, 0x00, 0x00,
+};
+static const uint8_t glyph_space[16] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x42, 0x42, 0x7E, 0x7E, 0x00, 0x00, 0x00, 0x00,
+};
+static const uint8_t glyph_del[16] = {
+    0x00, 0x00, 0x00, 0x00, 0x08, 0x0C, 0x0E, 0xFF,
+    0xFF, 0x0E, 0x0C, 0x08, 0x00, 0x00, 0x00, 0x00,
 };
 
 /* ---------------------------------------------------------- framebuffer - */
@@ -378,31 +445,51 @@ static void putpixel(int x, int y, int on)
         *p &= (uint8_t)~bit;
 }
 
-/* 8x8 font cell doubled vertically to 8x16. */
-static void draw_char(int col, int row, char ch, int yoff)
+/* INVERTED cells write every pixel of the 8x16 cell, so the background
+ * fills and the character itself stays dark — no separate fill pass. */
+static void draw_glyph16(int col, int row, const uint8_t *g, int yoff, bool inv)
 {
+    int x0 = col * CELL_W;
+    int y0 = row * CELL_H + yoff;
+    for (int fy = 0; fy < 16; fy++)
+        for (int fx = 0; fx < 8; fx++) {
+            int on = (g[fy] >> fx) & 1;
+            putpixel(x0 + fx, y0 + fy, inv ? !on : on);
+        }
+}
+
+/* 8x8 font cell doubled vertically to 8x16; the private G_* codes below
+ * 0x20 select a hand-drawn 8x16 glyph instead. */
+static void draw_char(int col, int row, char ch, int yoff, bool inv)
+{
+    const uint8_t *g16 = NULL;
+    switch (ch) {
+    case G_LDOTS:    g16 = glyph_ldots;    break;
+    case G_SPACE:    g16 = glyph_space;    break;
+    case G_CAPS_OFF: g16 = glyph_caps_off; break;
+    case G_CAPS_ON:  g16 = glyph_caps_on;  break;
+    case G_DEL:      g16 = glyph_del;      break;
+    default:         break;
+    }
+    if (g16) {
+        draw_glyph16(col, row, g16, yoff, inv);
+        return;
+    }
     if (ch < 0x20 || ch > 0x7E)
-        ch = 0x20;
+        ch = 0x20;                          /* incl. UTF-8 SSID bytes */
     const uint8_t *g = font8x8[ch - 0x20];
     int x0 = col * CELL_W;
     int y0 = row * CELL_H + yoff;
     for (int fy = 0; fy < 8; fy++) {
         uint8_t bits = g[fy];
         for (int fx = 0; fx < 8; fx++) {
-            int on = (bits >> fx) & 1;          /* bit 0 = leftmost */
+            int on = (bits >> fx) & 1;      /* bit 0 = leftmost */
+            if (inv)
+                on = !on;
             putpixel(x0 + fx, y0 + 2 * fy, on);
             putpixel(x0 + fx, y0 + 2 * fy + 1, on);
         }
     }
-}
-
-static void draw_glyph16(int col, int row, const uint8_t *g, int yoff)
-{
-    int x0 = col * CELL_W;
-    int y0 = row * CELL_H + yoff;
-    for (int fy = 0; fy < 16; fy++)
-        for (int fx = 0; fx < 8; fx++)
-            putpixel(x0 + fx, y0 + fy, (g[fy] >> fx) & 1);
 }
 
 /* ----------------------------------------------------------------- conf - */
@@ -411,8 +498,9 @@ static double      speed_factor = 1.15078;   /* knots -> mph (default) */
 static const char *speed_unit   = "MPH";
 static bool        bypass_time;    /* BYPASS_TIME=1: installed without DS3231 */
 static bool        bypass_rear;    /* BYPASS_REAR=1: installed without rear cam */
-static bool        debug_card;     /* DEBUG=1: debug build — wireless glyph;
-                                      default 0 = production — shield glyph */
+static bool        rf_join;        /* RF_JOIN=1: JOIN WIFI armed (an --auth
+                                      card without --debug). 0 = the 5 s
+                                      button-A hold does nothing, as before */
 
 static void load_conf(void)
 {
@@ -433,8 +521,8 @@ static void load_conf(void)
             bypass_time = line[12] == '1';
         } else if (strncmp(line, "BYPASS_REAR=", 12) == 0) {
             bypass_rear = line[12] == '1';
-        } else if (strncmp(line, "DEBUG=", 6) == 0) {
-            debug_card = line[6] == '1';
+        } else if (strncmp(line, "RF_JOIN=", 8) == 0) {
+            rf_join = line[8] == '1';
         }
     }
     fclose(f);
@@ -583,6 +671,96 @@ static void gps_read(int64_t now)
             gps_drop(now);
         return;
     }
+}
+
+/* ------------------------------------------------------------- RF state - */
+
+/* Read, never assumed: the glyph reports what the kernel says right now,
+ * so it stays honest whether RF moved via JOIN WIFI, NetworkManager, a
+ * debug card's boot profile, or a link that dropped on its own. */
+enum rf_state { RF_KILLED, RF_IDLE, RF_LINK };
+
+static int  rf_state = RF_KILLED;
+static char wl_if[32];             /* wireless interface, "" = none found */
+
+/* First netdev with a phy80211/ or wireless/ node. Cached once FOUND, not
+ * once tried: the interface appears when the driver binds, which need not
+ * have happened by the panel's first health tick. The retry is an opendir
+ * plus a couple of stats at 1 Hz, and only on a card that has no wireless
+ * interface yet. */
+static void wl_resolve(void)
+{
+    if (wl_if[0])
+        return;
+    DIR *d = opendir(NET_BASE);
+    if (!d)
+        return;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        size_t nl = strlen(e->d_name);
+        if (e->d_name[0] == '.' || nl >= sizeof wl_if)
+            continue;              /* IFNAMSIZ is 16 — nothing real is cut */
+        char path[PATH_MAX];
+        struct stat st;
+        snprintf(path, sizeof path, NET_BASE "/%s/phy80211", e->d_name);
+        if (stat(path, &st) != 0) {
+            snprintf(path, sizeof path, NET_BASE "/%s/wireless", e->d_name);
+            if (stat(path, &st) != 0)
+                continue;
+        }
+        memcpy(wl_if, e->d_name, nl + 1);
+        break;
+    }
+    closedir(d);
+}
+
+/* RF-ENABLED means some wlan rfkill switch is clear both ways. A hard
+ * block (no regulatory domain on the card) counts as killed — which is
+ * exactly right: nothing can transmit. */
+static bool rf_unblocked(void)
+{
+    DIR *d = opendir(RFKILL_BASE);
+    if (!d)
+        return false;
+    bool live = false;
+    struct dirent *e;
+    while (!live && (e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, "rfkill", 6) != 0)
+            continue;
+        char path[PATH_MAX], buf[32];
+        snprintf(path, sizeof path, RFKILL_BASE "/%s/type", e->d_name);
+        if (read_small(path, buf, sizeof buf) <= 0 ||
+            strncmp(buf, "wlan", 4) != 0)
+            continue;
+        snprintf(path, sizeof path, RFKILL_BASE "/%s/soft", e->d_name);
+        if (read_small(path, buf, sizeof buf) <= 0 || buf[0] != '0')
+            continue;
+        snprintf(path, sizeof path, RFKILL_BASE "/%s/hard", e->d_name);
+        if (read_small(path, buf, sizeof buf) <= 0 || buf[0] != '0')
+            continue;
+        live = true;
+    }
+    closedir(d);
+    return live;
+}
+
+/* operstate "up" on a wireless netdev == associated (the driver reports
+ * carrier only once the link is established). */
+static bool wl_linked(void)
+{
+    wl_resolve();
+    if (!wl_if[0])
+        return false;
+    char path[PATH_MAX], buf[32];
+    snprintf(path, sizeof path, NET_BASE "/%s/operstate", wl_if);
+    return read_small(path, buf, sizeof buf) > 0 &&
+           strncmp(buf, "up", 2) == 0;
+}
+
+static void rf_refresh(void)
+{
+    rf_state = !rf_unblocked() ? RF_KILLED
+                               : (wl_linked() ? RF_LINK : RF_IDLE);
 }
 
 /* --------------------------------------------------------------- health - */
@@ -849,6 +1027,7 @@ static void eval_health(int64_t now)
     health.storage = storage_ok();
     read_cpu_temp();               /* 1 Hz, off the 5 Hz paint path */
     read_throttled();
+    rf_refresh();                  /* glyph truth, not a health state */
     hlog_sync(session, now);
 }
 
@@ -867,8 +1046,13 @@ static const uint32_t key_gpio[KEY_COUNT] = { 17, 22, 27, 23, 4, 5, 6 };
 static const int pages[] = { 1, 2 };   /* wake order: index 0 is PAGE 1 */
 #define NPAGES ((int)(sizeof pages / sizeof pages[0]))
 
+/* Which screen owns the input. PAGE covers PAGE 0/1/2 (ui.error picks
+ * PAGE 0); the three JOIN WIFI screens are their own modes. */
+enum screen { SCR_PAGE, SCR_JW1, SCR_JW2, SCR_CONN };
+
 static struct {
     bool    error;                 /* any health state ERR */
+    int     screen;
     int     page_idx;
     bool    blanked;
     int64_t last_key_ms;
@@ -876,9 +1060,27 @@ static struct {
     int64_t burn_last_ms;
     int64_t b_down_ms;             /* button B pressed since (0 = up) */
     bool    b_fired;               /* this hold already marked an event */
+    int64_t a_down_ms;             /* button A pressed since (0 = up) */
+    bool    a_fired;               /* this hold already fired its action */
     int64_t flash_until_ms;        /* EVENT confirmation visible until */
     char    flash[COLS + 1];       /* EVENT confirmation text */
 } ui;
+
+/* JOIN WIFI screen state. jw.psk is the only secret the panel holds; it is
+ * wiped on every exit and never logged, printed, or passed in argv. */
+static struct {
+    char ssid[MAX_SSIDS][SSID_MAX + 1];
+    int  n;
+    int  sel;                      /* JW-1 cursor (index into ssid[]) */
+    int  top;                      /* JW-1 first visible row */
+    bool scanning;
+    bool scan_failed;
+    char psk[PSK_MAX + 1];
+    int  plen;
+    int  kr, kc;                   /* JW-2 POSITION: keyboard row/column */
+    bool caps;
+    bool staged;                   /* input area INVERTED, armed to connect */
+} jw;
 
 static const int burn_offsets[4] = { 0, 1, 0, -1 };
 
@@ -887,6 +1089,414 @@ static void wake(int64_t now)
     ui.blanked = false;
     ui.page_idx = 0;               /* always wake to PAGE 1 */
     ui.last_key_ms = now;
+}
+
+/* ---------------------------------------------------------- rf-ctl jobs - */
+
+/* Every radio operation is a forked rf-ctl whose stdout joins the poll()
+ * set: a scan takes seconds and an association tens of seconds, and the
+ * panel must keep painting, keep petting the watchdog, and keep accepting
+ * the exit keys throughout. One job at a time; each carries a deadline so
+ * a wedged child can never wedge the UI. */
+enum { RFJ_NONE, RFJ_SCAN, RFJ_DOWN, RFJ_CONNECT };
+
+static struct {
+    int     kind;
+    pid_t   pid;
+    int     fd;                    /* child stdout, -1 once drained */
+    int64_t deadline_ms;
+    bool    reaped;
+    int     status;
+    char    out[4096];
+    size_t  len;
+} job = { .kind = RFJ_NONE, .fd = -1 };
+
+/* in: written to the child's stdin and closed — how the SSID and
+ * passphrase travel, so neither ever appears in argv (/proc-readable).
+ * Both fit far inside PIPE_BUF, so the single write cannot block. */
+static bool rf_spawn(int kind, const char *cmd, const char *in, int64_t now,
+                     int timeout_ms)
+{
+    if (job.kind != RFJ_NONE)
+        return false;
+
+    int op[2], ip[2] = { -1, -1 };
+    if (pipe(op) < 0)
+        return false;
+    if (in && pipe(ip) < 0) {
+        close(op[0]);
+        close(op[1]);
+        return false;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(op[0]);
+        close(op[1]);
+        if (in) {
+            close(ip[0]);
+            close(ip[1]);
+        }
+        return false;
+    }
+    if (pid == 0) {
+        /* Everything else the panel holds is O_CLOEXEC (fb, gpio, timerfd,
+         * gpsd socket, health log, notify socket), so exec closes it. */
+        if (in) {
+            dup2(ip[0], 0);
+            close(ip[0]);
+            close(ip[1]);
+        } else {
+            int devnull = open("/dev/null", O_RDONLY);
+            if (devnull >= 0) {
+                dup2(devnull, 0);
+                close(devnull);
+            }
+        }
+        dup2(op[1], 1);
+        dup2(op[1], 2);            /* diagnostics ride the same pipe */
+        close(op[0]);
+        close(op[1]);
+        execl(RF_CTL, "rf-ctl", cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    close(op[1]);
+    if (in) {
+        close(ip[0]);
+        ssize_t w = write(ip[1], in, strlen(in));
+        (void)w;                   /* SIGPIPE ignored; a dead child fails
+                                      through its exit status instead */
+        close(ip[1]);
+    }
+    fcntl(op[0], F_SETFL, O_NONBLOCK);
+
+    job.kind = kind;
+    job.pid = pid;
+    job.fd = op[0];
+    job.deadline_ms = now + timeout_ms;
+    job.reaped = false;
+    job.status = -1;
+    job.len = 0;
+    return true;
+}
+
+static void rf_job_read(void)
+{
+    for (;;) {
+        char tmp[512];
+        ssize_t n = read(job.fd, tmp, sizeof tmp);
+        if (n > 0) {
+            size_t room = sizeof job.out - 1 - job.len;
+            size_t take = (size_t)n < room ? (size_t)n : room;
+            memcpy(job.out + job.len, tmp, take);
+            job.len += take;       /* silently truncates: 4 KB is ~100 SSIDs */
+            continue;
+        }
+        if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK &&
+                       errno != EINTR)) {
+            close(job.fd);
+            job.fd = -1;
+        }
+        return;
+    }
+}
+
+/* ------------------------------------------------------------ JOIN WIFI - */
+
+static void jw_clear(void)
+{
+    memset(jw.psk, 0, sizeof jw.psk);   /* the secret never outlives a screen */
+    jw.n = 0;
+    jw.sel = 0;
+    jw.top = 0;
+    jw.plen = 0;
+    jw.kr = 0;
+    jw.kc = 0;                     /* POSITION starts at 'A' */
+    jw.caps = false;
+    jw.staged = false;
+    jw.scanning = false;
+    jw.scan_failed = false;
+}
+
+/* user = a key press asked for this (so the page gets its full 10 s);
+ * the idle timeout leaves last_key_ms alone, and PAGE 1 blanks at once. */
+static void jw_exit(int64_t now, bool user)
+{
+    /* Only signal a child we have not reaped — past waitpid() the pid may
+     * already belong to something else. Its result is dropped either way
+     * (rf_job_done checks the screen). */
+    if (job.kind == RFJ_SCAN && !job.reaped)
+        kill(job.pid, SIGKILL);
+    ui.screen = SCR_PAGE;
+    ui.page_idx = 0;
+    ui.a_down_ms = 0;
+    ui.a_fired = false;
+    jw_clear();
+    if (user)
+        ui.last_key_ms = now;
+}
+
+static int ssid_cmp(const void *a, const void *b)
+{
+    const char *x = a, *y = b;
+    for (size_t i = 0;; i++) {
+        int cx = tolower((unsigned char)x[i]);
+        int cy = tolower((unsigned char)y[i]);
+        if (cx != cy)
+            return cx - cy;
+        if (!cx)
+            return strcmp(x, y);   /* stable tiebreak on case alone */
+    }
+}
+
+/* rf-ctl prints one SSID per line. Truncate to 32 octets, drop blanks and
+ * duplicates (truncation can create new ones), then sort alphabetically. */
+static void jw_take_scan(void)
+{
+    jw.n = 0;
+    size_t i = 0;
+    while (i < job.len && jw.n < MAX_SSIDS) {
+        size_t e = i;
+        while (e < job.len && job.out[e] != '\n')
+            e++;
+        size_t l = e - i;
+        while (l && (job.out[i + l - 1] == '\r' || job.out[i + l - 1] == ' '))
+            l--;
+        if (l > SSID_MAX)
+            l = SSID_MAX;
+        if (l) {
+            char cand[SSID_MAX + 1];
+            memcpy(cand, job.out + i, l);
+            cand[l] = '\0';
+            bool dup = false;
+            for (int k = 0; k < jw.n && !dup; k++)
+                dup = strcmp(jw.ssid[k], cand) == 0;
+            if (!dup)
+                memcpy(jw.ssid[jw.n++], cand, l + 1);
+        }
+        i = e + 1;
+    }
+    qsort(jw.ssid, (size_t)jw.n, sizeof jw.ssid[0], ssid_cmp);
+    jw.sel = 0;
+    jw.top = 0;
+}
+
+static void jw_viewport(void)
+{
+    if (jw.sel < jw.top)
+        jw.top = jw.sel;
+    if (jw.sel >= jw.top + ROWS)
+        jw.top = jw.sel - ROWS + 1;
+    if (jw.top < 0)
+        jw.top = 0;
+}
+
+static void rf_job_done(int64_t now)
+{
+    int kind = job.kind;
+    bool ok = job.reaped && job.status >= 0 && WIFEXITED(job.status) &&
+              WEXITSTATUS(job.status) == 0;
+
+    job.kind = RFJ_NONE;
+    rf_refresh();                  /* the glyph must not wait for the tick */
+
+    if (kind == RFJ_SCAN && ui.screen == SCR_JW1) {
+        jw.scanning = false;
+        jw.scan_failed = !ok;
+        if (ok)
+            jw_take_scan();
+    } else if (kind == RFJ_CONNECT) {
+        /* Success or failure, the screen returns to PAGE 1 (or 0) and the
+         * RF glyph is the whole answer — no text hint, by design. */
+        ui.screen = SCR_PAGE;
+        ui.page_idx = 0;
+        ui.blanked = false;
+        ui.last_key_ms = now;
+        jw_clear();
+    }
+    memset(job.out, 0, sizeof job.out);
+    job.len = 0;
+}
+
+static void rf_job_tick(int64_t now)
+{
+    if (job.kind == RFJ_NONE)
+        return;
+    if (!job.reaped) {
+        int st;
+        pid_t r = waitpid(job.pid, &st, WNOHANG);
+        if (r == job.pid) {
+            job.reaped = true;
+            job.status = st;
+        } else if (r < 0) {
+            job.reaped = true;     /* already gone; treat as failed */
+            job.status = -1;
+        }
+    }
+    if (now >= job.deadline_ms) {
+        if (!job.reaped) {
+            kill(job.pid, SIGKILL);
+            return;                /* reaped on a later tick */
+        }
+        if (job.fd >= 0) {         /* a grandchild is holding the pipe */
+            close(job.fd);
+            job.fd = -1;
+        }
+    }
+    if (!job.reaped || job.fd >= 0)
+        return;
+    rf_job_done(now);
+}
+
+/* 5 s button-A hold on a page: RF-KILLED -> radios on + JW-1, else kill. */
+static void rf_toggle(int64_t now)
+{
+    if (job.kind != RFJ_NONE)
+        return;
+    if (rf_state != RF_KILLED) {
+        rf_spawn(RFJ_DOWN, "down", NULL, now, RFDOWN_TO_MS);
+        return;
+    }
+    jw_clear();
+    ui.screen = SCR_JW1;
+    ui.blanked = false;
+    ui.last_key_ms = now;
+    jw.scanning = true;
+    /* rf-ctl scan unblocks the radios itself, so the card reaches
+     * RF-ENABLED even when the scan comes back empty. */
+    if (!rf_spawn(RFJ_SCAN, "scan", NULL, now, SCAN_TO_MS)) {
+        jw.scanning = false;
+        jw.scan_failed = true;
+    }
+}
+
+static void jw_connect(int64_t now)
+{
+    char in[SSID_MAX + PSK_MAX + 4];
+    snprintf(in, sizeof in, "%s\n%s\n", jw.ssid[jw.sel], jw.psk);
+    ui.screen = SCR_CONN;
+    ui.blanked = false;
+    ui.last_key_ms = now;
+    if (!rf_spawn(RFJ_CONNECT, "connect", in, now, CONNECT_TO_MS)) {
+        ui.screen = SCR_PAGE;
+        ui.page_idx = 0;
+        jw_clear();
+    }
+    memset(in, 0, sizeof in);
+}
+
+/* JW-2 keyboard: line 2 A-P, line 3 Q-Z then 1-6, line 4 7-9 0 then nine
+ * symbols, then SPACE / CAPS / DELETE in the last three cells. */
+static const char kb_sym[] = "-_.!@#$%&";
+
+static char kb_char(int r, int c)
+{
+    if (r == 0)
+        return (char)((jw.caps ? 'A' : 'a') + c);
+    if (r == 1)
+        return c < 10 ? (char)((jw.caps ? 'Q' : 'q') + c)
+                      : (char)('1' + (c - 10));
+    if (c < 3)
+        return (char)('7' + c);
+    if (c == 3)
+        return '0';
+    if (c < 13)
+        return kb_sym[c - 4];
+    return 0;                      /* the three glyph keys */
+}
+
+static char kb_cell(int r, int c)
+{
+    if (r == 2) {
+        if (c == COLS - 1)
+            return G_DEL;
+        if (c == COLS - 2)
+            return jw.caps ? G_CAPS_ON : G_CAPS_OFF;
+        if (c == COLS - 3)
+            return G_SPACE;
+    }
+    return kb_char(r, c);
+}
+
+/* Button A released before the 2 s mark: type the key at the POSITION.
+ * Anything that touches the input area leaves STAGING; CAPS does not, it
+ * changes no character. */
+static void jw_type(void)
+{
+    int r = jw.kr, c = jw.kc;
+    if (r == 2 && c == COLS - 2) {
+        jw.caps = !jw.caps;
+        return;
+    }
+    jw.staged = false;
+    if (r == 2 && c == COLS - 1) {
+        if (jw.plen > 0)
+            jw.psk[--jw.plen] = '\0';
+        return;
+    }
+    char ch = (r == 2 && c == COLS - 3) ? ' ' : kb_char(r, c);
+    if (!ch)
+        return;
+    if (jw.plen < PSK_MAX) {
+        jw.psk[jw.plen++] = ch;
+        jw.psk[jw.plen] = '\0';
+    }
+}
+
+static void jw_key(int key, bool press, int64_t now)
+{
+    ui.last_key_ms = now;          /* both edges keep the 10 s idle timer up */
+
+    /* Button B exits from either screen, short or long — its EVENT
+     * function is absorbed for as long as a JW screen is up. */
+    if (key == KEY_B) {
+        if (press)
+            jw_exit(now, true);
+        return;
+    }
+    if (key == KEY_A) {
+        if (press) {
+            ui.a_down_ms = now;
+            ui.a_fired = false;
+        } else {
+            bool fired = ui.a_fired;
+            ui.a_down_ms = 0;
+            ui.a_fired = false;
+            if (!fired && ui.screen == SCR_JW2)
+                jw_type();
+        }
+        return;
+    }
+    if (!press)
+        return;
+
+    if (ui.screen == SCR_JW1) {
+        if (key == KEY_UP && jw.sel > 0)
+            jw.sel--;
+        else if (key == KEY_DOWN && jw.sel + 1 < jw.n)
+            jw.sel++;
+        else if (key == KEY_LEFT)
+            jw_exit(now, true);
+        else if (key == KEY_RIGHT && jw.n > 0 && !jw.scanning) {
+            ui.screen = SCR_JW2;
+            ui.a_down_ms = 0;      /* a hold begun on JW-1 must not land on
+                                      JW-2 as an instant STAGING */
+            ui.a_fired = false;
+        }
+        jw_viewport();
+        return;
+    }
+    /* SCR_JW2 — LEFT is a keyboard move here, not an exit; the keyboard
+     * wraps on both axes so no direction is ever a dead end. */
+    if (key == KEY_UP)
+        jw.kr = (jw.kr + 2) % 3;
+    else if (key == KEY_DOWN)
+        jw.kr = (jw.kr + 1) % 3;
+    else if (key == KEY_LEFT)
+        jw.kc = (jw.kc + COLS - 1) % COLS;
+    else if (key == KEY_RIGHT)
+        jw.kc = (jw.kc + 1) % COLS;
 }
 
 static void handle_key(uint32_t offset, bool press, int64_t now)
@@ -899,6 +1509,18 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
         }
     if (key < 0)
         return;
+
+    /* CONNECTING owns the screen until rf-ctl answers: button A is
+     * absorbed (a stray hold must not restage or kill the radios
+     * mid-association), button B is NOT — the EVENT marker stays
+     * available, since an incident does not wait for a Wi-Fi join. */
+    if (ui.screen == SCR_CONN) {
+        if (key != KEY_B)
+            return;
+    } else if (ui.screen == SCR_JW1 || ui.screen == SCR_JW2) {
+        jw_key(key, press, now);
+        return;
+    }
 
     /* Button B: EVENT capture (~2 s hold, fired from the tick) — the one
      * key that acts on any NON-BLANKED screen, PAGE 0 included (the
@@ -922,14 +1544,19 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
         return;
     }
 
-    if (ui.error)
-        return;                    /* PAGE 0 is static: other input ignored */
+    if (ui.error) {
+        ui.a_down_ms = 0;          /* PAGE 0 is static: other input ignored */
+        return;
+    }
     if (!press) {
+        if (key == KEY_A)
+            ui.a_down_ms = 0;
         ui.last_key_ms = now;
         return;
     }
     if (ui.blanked) {
-        wake(now);                 /* absorbed: wake only, no paging */
+        wake(now);                 /* absorbed: wake only, no paging —
+                                      an A hold must restart after the wake */
         return;
     }
     ui.last_key_ms = now;
@@ -937,32 +1564,110 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
         ui.page_idx = (ui.page_idx + NPAGES - 1) % NPAGES;
     else if (key == KEY_RIGHT)
         ui.page_idx = (ui.page_idx + 1) % NPAGES;
-    /* A, UP, DOWN, CENTER: reserved — wake/reset-timer only */
+    else if (key == KEY_A) {
+        ui.a_down_ms = now;        /* 5 s hold = JOIN WIFI, fired from the
+                                      tick; short presses stay reserved */
+        ui.a_fired = false;
+    }
+    /* UP, DOWN, CENTER: reserved — wake/reset-timer only */
 }
 
 /* ------------------------------------------------------------ rendering - */
 
 struct frame {
-    bool blanked;
-    int  yoff;
-    char glyph;                    /* 'W' wireless (debug), 'S' shield (prod) */
-    char rows[ROWS][COLS + 1];
+    bool     blanked;
+    int      yoff;
+    char     glyph;                /* 'S' shield, 'R' bare antenna, 'W' waves;
+                                      0 = the JW screens own all 16 columns */
+    uint16_t inv[ROWS];            /* INVERTED cells, bit N = column N */
+    char     rows[ROWS][COLS + 1];
 };
+
+/* JW-1: four SSIDs, the selected one an INVERTED bar. Names wider than 14
+ * columns are cut there and marked with a single LDOTS in column 14. */
+static void compose_jw1(struct frame *f)
+{
+    if (jw.scanning) {
+        snprintf(f->rows[0], sizeof f->rows[0], "SCANNING...");
+        return;
+    }
+    if (jw.scan_failed) {
+        snprintf(f->rows[0], sizeof f->rows[0], "RF ERROR");
+        return;
+    }
+    if (jw.n == 0) {
+        snprintf(f->rows[0], sizeof f->rows[0], "NO NETWORKS");
+        return;
+    }
+    for (int r = 0; r < ROWS; r++) {
+        int i = jw.top + r;
+        if (i >= jw.n)
+            break;
+        size_t l = strlen(jw.ssid[i]);
+        if (l > SSID_COLS) {
+            memcpy(f->rows[r], jw.ssid[i], SSID_COLS);
+            f->rows[r][SSID_COLS] = G_LDOTS;
+            f->rows[r][SSID_COLS + 1] = '\0';
+        } else {
+            memcpy(f->rows[r], jw.ssid[i], l + 1);
+        }
+        if (i == jw.sel)
+            f->inv[r] = 0xFFFF;
+    }
+}
+
+/* JW-2: line 1 the input area, lines 2-4 the keyboard. The POSITION cell
+ * is INVERTED; so is the whole input area while STAGING. */
+static void compose_jw2(struct frame *f)
+{
+    if (jw.plen <= COLS) {
+        memcpy(f->rows[0], jw.psk, (size_t)jw.plen + 1);
+    } else {
+        f->rows[0][0] = G_LDOTS;   /* one mark for everything scrolled off */
+        memcpy(f->rows[0] + 1, jw.psk + jw.plen - (COLS - 1), COLS - 1);
+        f->rows[0][COLS] = '\0';
+    }
+    if (jw.staged)
+        f->inv[0] = 0xFFFF;
+
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < COLS; c++)
+            f->rows[r + 1][c] = kb_cell(r, c);
+        f->rows[r + 1][COLS] = '\0';
+    }
+    f->inv[1 + jw.kr] |= (uint16_t)(1u << jw.kc);
+}
 
 static void compose(struct frame *f, int64_t now)
 {
     memset(f, 0, sizeof *f);       /* deterministic padding for memcmp */
 
-    if (ui.blanked && !ui.error) {
+    if (ui.blanked && !ui.error && ui.screen == SCR_PAGE) {
         f->blanked = true;         /* blank hides everything, glyph included */
         return;
     }
-    f->glyph = debug_card ? 'W' : 'S';   /* install mode, fixed per card */
+    f->glyph = rf_state == RF_KILLED ? 'S' : rf_state == RF_LINK ? 'W' : 'R';
 
     if (now < ui.flash_until_ms) {
         /* EVENT confirmation — a deliberate 2 s full-screen interruption
          * of whatever page is up (PAGE 0 returns right after) */
         snprintf(f->rows[1], sizeof f->rows[1], "    %.12s", ui.flash);
+        return;
+    }
+
+    if (ui.screen == SCR_CONN) {
+        /* Same full-screen shape as EVENT, but it lasts as long as the
+         * association attempt does — and it outranks PAGE 0 for that
+         * bounded window; the fault is still there when it returns. */
+        snprintf(f->rows[1], sizeof f->rows[1], "  CONNECTING...");
+        return;
+    }
+    if (ui.screen == SCR_JW1 || ui.screen == SCR_JW2) {
+        f->glyph = 0;              /* JW-2's DELETE key needs column 15 */
+        if (ui.screen == SCR_JW1)
+            compose_jw1(f);
+        else
+            compose_jw2(f);
         return;
     }
 
@@ -1043,14 +1748,22 @@ static void render(const struct frame *f)
     }
     memset(fbmem, 0, fb_screen);
     for (int r = 0; r < ROWS; r++) {
-        /* row 3, col 15 is the reserved RF glyph cell on every screen */
-        int maxc = (r == ROWS - 1) ? COLS - 1 : COLS;
-        for (int c = 0; c < maxc && f->rows[r][c]; c++)
-            draw_char(c, r, f->rows[r][c], f->yoff);
+        /* row 3, col 15 is the reserved RF glyph cell — except on the JW
+         * screens, which clear the glyph and take the full 16 columns */
+        int maxc = (r == ROWS - 1 && f->glyph) ? COLS - 1 : COLS;
+        int len = (int)strlen(f->rows[r]);
+        for (int c = 0; c < maxc; c++) {
+            bool inv = (f->inv[r] >> c) & 1;
+            if (c >= len && !inv)
+                continue;          /* already dark from the memset */
+            draw_char(c, r, c < len ? f->rows[r][c] : ' ', f->yoff, inv);
+        }
     }
     if (f->glyph)
         draw_glyph16(COLS - 1, ROWS - 1,
-                     f->glyph == 'S' ? glyph_shield : glyph_wireless, f->yoff);
+                     f->glyph == 'S' ? glyph_shield :
+                     f->glyph == 'R' ? glyph_rf_idle : glyph_wireless,
+                     f->yoff, false);
 }
 
 /* ----------------------------------------------------------------- GPIO - */
@@ -1094,6 +1807,10 @@ static int gpio_init(void)
 
 int main(void)
 {
+    /* rf-ctl can die with its stdin pipe unread; a SIGPIPE there must not
+     * take the panel down with it. */
+    signal(SIGPIPE, SIG_IGN);
+
     load_conf();
     if (fb_init() < 0)
         return 1;
@@ -1128,7 +1845,7 @@ int main(void)
     int subtick = 0;
 
     for (;;) {
-        struct pollfd pfd[3];
+        struct pollfd pfd[4];
         int n = 0;
         int i_gpio = n;
         pfd[n++] = (struct pollfd){ .fd = gpio_fd, .events = POLLIN };
@@ -1142,6 +1859,11 @@ int main(void)
                 .events = (short)(gps.state == GPS_CONNECTING ? POLLOUT
                                                               : POLLIN),
             };
+        }
+        int i_job = -1;
+        if (job.kind != RFJ_NONE && job.fd >= 0) {
+            i_job = n;
+            pfd[n++] = (struct pollfd){ .fd = job.fd, .events = POLLIN };
         }
 
         if (poll(pfd, (nfds_t)n, -1) < 0) {
@@ -1180,6 +1902,10 @@ int main(void)
             }
         }
 
+        /* --- rf-ctl child stdout --- */
+        if (i_job >= 0 && pfd[i_job].revents)
+            rf_job_read();
+
         /* --- tick: watchdog, health, blank, burn-in, repaint --- */
         if (pfd[i_tick].revents & POLLIN) {
             uint64_t exp;
@@ -1190,6 +1916,8 @@ int main(void)
             if (gps.state == GPS_DOWN && now >= gps.next_try_ms)
                 gps_try_connect(now);
 
+            rf_job_tick(now);
+
             if (++subtick >= HEALTH_TICKS) {
                 subtick = 0;
                 eval_health(now);
@@ -1197,6 +1925,10 @@ int main(void)
                 if (err && !ui.error) {
                     ui.error = true;   /* forces screen on + PAGE 0 */
                     ui.blanked = false;
+                    /* A fault outranks a half-finished join: JW-1/JW-2 are
+                     * dropped (an in-flight CONNECT still gets to finish). */
+                    if (ui.screen == SCR_JW1 || ui.screen == SCR_JW2)
+                        jw_exit(now, true);
                 } else if (!err && ui.error) {
                     ui.error = false;  /* back to PAGES: wake to PAGE 1 */
                     ui.page_idx = 0;
@@ -1205,7 +1937,32 @@ int main(void)
                 }
             }
 
-            if (!ui.error && !ui.blanked &&
+            /* Button A held to its mark. On JW-2 that is 2 s: first hold
+             * STAGES the input area (INVERTED), a second one commits.
+             * On a page it is 5 s: arm JOIN WIFI, or kill RF again. */
+            if (ui.a_down_ms && !ui.a_fired) {
+                if (ui.screen == SCR_JW2 &&
+                    now - ui.a_down_ms >= STAGE_HOLD_MS) {
+                    ui.a_fired = true;
+                    if (jw.staged)
+                        jw_connect(now);
+                    else
+                        jw.staged = true;
+                } else if (ui.screen == SCR_PAGE && rf_join && !ui.error &&
+                           !ui.blanked && now - ui.a_down_ms >= RF_HOLD_MS) {
+                    ui.a_fired = true;
+                    rf_toggle(now);
+                }
+            }
+
+            /* JW-1/JW-2 time out to the pages rather than blanking. The
+             * idle path leaves last_key_ms alone, so the page it returns
+             * to blanks on this same tick — nobody is watching. */
+            if ((ui.screen == SCR_JW1 || ui.screen == SCR_JW2) &&
+                now - ui.last_key_ms >= JW_IDLE_MS)
+                jw_exit(now, false);
+
+            if (ui.screen == SCR_PAGE && !ui.error && !ui.blanked &&
                 now - ui.last_key_ms >= BLANK_MS)
                 ui.blanked = true;
 

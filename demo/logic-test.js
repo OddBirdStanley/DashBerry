@@ -21,7 +21,15 @@ const sim = {
     lat: -30.123456, lon: 111.222222, knots: 78.3,
     rtcOk: true,
     cpuTempMc: 30566,              /* 30.566 C, a real quantized reading */
+    throttled: 0,
     mounted: true, rw: true, freePct: 90.1, fsErrors: false,
+    eventLogWritable: true, events: 0,
+    /* rfkill + operstate stand-in, and the rf-ctl children it serves */
+    rfBlocked: true, rfLinked: false,
+    aps: ["HomeNet", "aardvark-guest-network-5G", "Zebra",
+          "ExactlyFourteen", "0123456789ABCD", "HomeNet"],
+    scanOk: true, correctPsk: "swordfish", rfJobMs: 2000, pending: [],
+    lastConnect: null,
     logs: [],
     presented: null,
 };
@@ -32,14 +40,49 @@ const hw = {
     rearNewestMtimeMs: () => sim.rearLast,
     rtcOk: () => sim.rtcOk,
     cpuTempMc: () => sim.cpuTempMc,
+    throttled: () => sim.throttled,
     statvfs: () => sim.mounted
         ? { rw: sim.rw, freePct: sim.freePct, fsErrors: sim.fsErrors }
         : null,
+    rfState: () => sim.rfBlocked ? "killed" : (sim.rfLinked ? "link" : "idle"),
+    /* Stands in for fork+exec of rf-ctl: the handle is mutated by
+     * runRfJobs() once enough virtual time has passed. */
+    rfCtl: (cmd, stdinText) => {
+        const h = { done: false, ok: false, out: "" };
+        sim.pending.push({ h, cmd, stdinText, at: vt.now + sim.rfJobMs });
+        return h;
+    },
+    logEvent: () => { if (!sim.eventLogWritable) return false;
+                      sim.events++; return true; },
     present: (view) => { sim.presented = { blanked: view.blanked,
                                            fb: Uint8Array.from(view.fb) }; },
     notify: () => {},
     log: (m) => sim.logs.push(m),
 };
+
+/* What rf-ctl does on the card, condensed to its observable effects. */
+function runRfJobs() {
+    for (const j of sim.pending.slice()) {
+        if (vt.now < j.at)
+            continue;
+        sim.pending.splice(sim.pending.indexOf(j), 1);
+        if (j.cmd === "scan") {
+            sim.rfBlocked = false;         /* scan unblocks the radios */
+            j.h.ok = sim.scanOk;
+            j.h.out = sim.scanOk ? sim.aps.join("\n") + "\n" : "";
+        } else if (j.cmd === "down") {
+            sim.rfBlocked = true;
+            sim.rfLinked = false;
+            j.h.ok = true;
+        } else if (j.cmd === "connect") {
+            const [ssid, psk] = String(j.stdinText).split("\n");
+            sim.lastConnect = { ssid, psk };
+            sim.rfLinked = psk === sim.correctPsk;
+            j.h.ok = sim.rfLinked;
+        }
+        j.h.done = true;
+    }
+}
 
 const panel = PANEL.create(hw);
 
@@ -57,6 +100,7 @@ function advance(ms) {
             else
                 panel.gpsNoFix();
         }
+        runRfJobs();
         panel.tick();
     }
 }
@@ -111,6 +155,63 @@ function decodeRow(row, maxc = 16) {
     return s.replace(/ +$/, "");
 }
 
+/* Full 8x16 readback of one cell, straight out of the presented fb. */
+function cellBits(row, col) {
+    const b = [];
+    for (let y = 0; y < 16; y++) {
+        let v = 0;
+        for (let x = 0; x < 8; x++)
+            v |= sim.presented.fb[(row * 16 + y) * 128 + col * 8 + x] << x;
+        b.push(v);
+    }
+    return b;
+}
+
+/* Identify a cell by matching it against the font and the 8x16 glyphs,
+ * upright and inverted — so the JW screens can be asserted as text.
+ * Inverted cells come back with a leading '*', glyphs as [NAME]. */
+function decodeCell(row, col) {
+    const got = cellBits(row, col);
+    for (const inv of [false, true]) {
+        for (let i = 0; i < PANEL.FONT8X8.length; i++) {
+            const g = PANEL.FONT8X8[i];
+            let eq = true;
+            for (let y = 0; y < 16 && eq; y++) {
+                const want = g[y >> 1];
+                eq = got[y] === (inv ? (~want) & 0xFF : want);
+            }
+            if (eq)
+                return (inv ? "*" : "") + String.fromCharCode(0x20 + i);
+        }
+        for (const [name, g] of Object.entries(PANEL.GLYPHS)) {
+            let eq = true;
+            for (let y = 0; y < 16 && eq; y++)
+                eq = got[y] === (inv ? (~g[y]) & 0xFF : g[y]);
+            if (eq)
+                return (inv ? "*" : "") + "[" + name + "]";
+        }
+    }
+    return "?";
+}
+
+function decodeCells(row, maxc = 16) {
+    const out = [];
+    for (let c = 0; c < maxc; c++)
+        out.push(decodeCell(row, c));
+    return out;
+}
+
+/* Cell tokens joined back into a string, inversion markers dropped and
+ * trailing blanks trimmed — the readable form for JW assertions. */
+function decodeRowGlyphs(row, maxc = 16) {
+    return decodeCells(row, maxc).map(t => t.replace(/^\*/, ""))
+                                 .join("").replace(/ +$/, "");
+}
+
+function invMask(row, maxc = 16) {
+    return decodeCells(row, maxc).map(t => t.startsWith("*") ? 1 : 0).join("");
+}
+
 function expectedGlyphPixels(glyph) {
     if (glyph === 'W') {
         /* The wireless glyph's source of truth is the user drawing —
@@ -146,9 +247,10 @@ ok(s.error === false, "1 s in: all signals proven -> OK");
 ok(s.page === 1, "OK state shows PAGE 1");
 ok(s.health.front && s.health.rear && s.health.gpsok && s.health.timeok &&
    s.health.storage, "all five health states ON");
-ok(s.debug_card === false, "boot without DEBUG=1 is a production card");
+ok(s.rf_join === false, "boot without RF_JOIN=1 leaves JOIN WIFI unarmed");
+ok(s.rf_state === "killed", "every card boots RF-KILLED");
 ok(glyphCellPixels().join("") === expectedGlyphPixels('S').join(""),
-   "reserved cell (row 3, col 15) shows the shield glyph (production)");
+   "reserved cell (row 3, col 15) shows the shield glyph (RF-KILLED)");
 
 /* Formatting, decoded from the rendered framebuffer: 5-decimal coords,
  * rounded SPD, and values aligned at column 4 — 3-char labels take one
@@ -179,14 +281,17 @@ ok(panel.state().blanked === false, "wake reset the 10 s timer");
 advance(1200);
 ok(panel.state().blanked === true, "…and blanks again 10 s after the key");
 
-/* Strict absorption of A: pressed while blanked it wakes, nothing more —
- * button A is a plain reserved key now (no hold, no toggle). */
+/* Strict absorption of A: pressed while blanked it wakes and is absorbed,
+ * so the JOIN WIFI hold must restart after the wake — and on this card
+ * RF_JOIN is off, so even a full 5 s hold does nothing. */
 press(PANEL.KEY.A);                /* wakes, absorbed */
-advance(3000);                     /* held well past any old hold window */
+advance(6000);                     /* well past the 5 s RF hold */
 s = panel.state();
 ok(s.blanked === false, "A pressed while blanked wakes");
+ok(s.screen === "PAGE" && s.rf_state === "killed",
+   "5 s A hold on an unarmed card changes nothing (RF_JOIN=0)");
 ok(glyphCellPixels().join("") === expectedGlyphPixels('S').join(""),
-   "holding A changes nothing: glyph still the shield");
+   "…glyph still the shield");
 release(PANEL.KEY.A);
 
 /* PAGE 0 assembly: kill front cam -> stale after 10 s, error line FRONT. */
@@ -206,14 +311,22 @@ s = panel.state();
 ok(!s.health.front && !s.health.rear && !s.health.gpsok,
    "front+rear stale, GPS silent 5 s -> three ERRs");
 
-/* ERROR page: all input is dead — A included. */
+/* ERROR page: all input is dead except the button-B EVENT hold. */
 press(PANEL.KEY.RIGHT); release(PANEL.KEY.RIGHT);
-press(PANEL.KEY.B); release(PANEL.KEY.B);
-ok(panel.state().page === 0, "PAGE 0 ignores joystick/B");
+ok(panel.state().page === 0, "PAGE 0 ignores the joystick");
 press(PANEL.KEY.A);
-advance(2200);
+advance(6000);
 release(PANEL.KEY.A);
-ok(panel.state().page === 0, "PAGE 0 ignores A too (no toggle exists)");
+ok(panel.state().page === 0 && panel.state().screen === "PAGE",
+   "PAGE 0 ignores the A hold (no JOIN WIFI from a faulted card)");
+{
+    const before = sim.events;
+    press(PANEL.KEY.B);
+    advance(2200);                 /* the one exception: EVENT still works */
+    release(PANEL.KEY.B);
+    ok(sim.events === before + 1, "PAGE 0 still takes the button-B EVENT hold");
+    advance(2200);                 /* let the EVENT flash expire */
+}
 
 /* Storage: full -> its own line. */
 sim.freePct = 0;
@@ -247,10 +360,23 @@ ok(s.page === 2, "RIGHT from PAGE 1 shows PAGE 2");
 /* 30566 mC -> 30.566 C -> rounds to 31 */
 ok(decodeRow(0) === "TMP 31 C",
    `PAGE 2 row 0 renders "TMP 31 C" (got "${decodeRow(0)}")`);
-ok(decodeRow(1) === "" && decodeRow(2) === "" && decodeRow(3, 15) === "",
-   "PAGE 2 rows 1-3 are reserved (empty)");
+ok(decodeRow(1) === "PWR OK",
+   `PAGE 2 row 1 renders "PWR OK" (got "${decodeRow(1)}")`);
+ok(decodeRow(2) === "" && decodeRow(3, 15) === "",
+   "PAGE 2 rows 2-3 are reserved (empty)");
 ok(glyphCellPixels().join("") === expectedGlyphPixels('S').join(""),
-   "install-mode glyph shows on PAGE 2 too");
+   "RF glyph shows on PAGE 2 too");
+
+/* PWR precedence: under-voltage NOW beats the latched bit. */
+sim.throttled = 0x10001;
+advance(1200);
+ok(decodeRow(1) === "PWR UV NOW",
+   `bit 0 set renders "PWR UV NOW" (got "${decodeRow(1)}")`);
+sim.throttled = 0x10000;
+advance(1200);
+ok(decodeRow(1) === "PWR UV SEEN",
+   `bit 16 alone renders "PWR UV SEEN" (got "${decodeRow(1)}")`);
+sim.throttled = 0;
 
 /* Negative-safe rounding and read-failure placeholder (1 Hz cadence). */
 sim.cpuTempMc = -10499;            /* -10.499 C -> -10, not -11 or -9 */
@@ -288,16 +414,278 @@ s = panel.state();
 ok(s.error === false, "no-fix is NOT a GPS ERR (sentences still flowing)");
 ok(s.gps.have_fix === false, "…but PAGE 1 will show LAT/LON/SPD ---");
 
-/* DEBUG card: boot with DEBUG=1 -> wireless glyph, fixed for the card's
- * lifetime (install mode is conf-baked, there is no runtime RF state). */
-{
-    const dbg = PANEL.create(hw);
-    dbg.boot("MPH", true);
-    dbg.tick();                    /* first paint (PAGE 0: nothing proven) */
-    ok(dbg.state().debug_card === true, "DEBUG=1 boot is a debug card");
-    ok(glyphCellPixels().join("") === expectedGlyphPixels('W').join(""),
-       "debug card shows the wireless glyph (per wireless_glyph.txt)");
+/* ------------------------------------------------- JOIN WIFI (§3d) ----- */
+
+/* An RF_JOIN=1 card: everything else identical, but the 5 s button-A hold
+ * is armed. Fresh panel so the earlier card's state cannot leak in. */
+sim.gpsHaveFix = true;
+const jp = PANEL.create(hw);
+const jstate = () => jp.state();
+
+function jadvance(ms) {
+    const end = vt.now + ms;
+    while (vt.now < end) {
+        vt.now = Math.min(vt.now + PANEL.TICK_MS, end);
+        sim.frontLast = vt.now;
+        sim.rearLast = vt.now;
+        jp.gpsFix(sim.lat, sim.lon, sim.knots);
+        runRfJobs();
+        jp.tick();
+    }
 }
+function jpress(k)   { jp.keyEvent(PANEL.KEY_GPIO[k], true); }
+function jrelease(k) { jp.keyEvent(PANEL.KEY_GPIO[k], false); }
+/* Type the key under the POSITION: a press released inside the 2 s mark. */
+function jtap(k) { jpress(k); jadvance(200); jrelease(k); }
+
+jp.boot("MPH", true);
+jadvance(1400);
+ok(jstate().rf_join === true && jstate().error === false,
+   "RF_JOIN=1 card boots armed and healthy");
+
+/* The 5 s hold: radios on, JW-1 opens immediately showing SCANNING. */
+jpress(PANEL.KEY.A);
+jadvance(5200);
+ok(jstate().screen === "JW-1" && jstate().jw.scanning === true,
+   "5 s A hold opens JW-1 and starts the scan");
+ok(decodeRowGlyphs(0) === "SCANNING...", "JW-1 shows SCANNING... while scanning");
+jrelease(PANEL.KEY.A);
+
+/* Scan lands: sorted alphabetically, deduped, truncated + LDOTS. */
+jadvance(2200);
+let js = jstate();
+ok(js.jw.scanning === false && js.rf_state === "idle",
+   "scan finished; RF-ENABLED but not associated");
+ok(js.jw.ssid.join("|") ===
+   "0123456789ABCD|aardvark-guest-network-5G|ExactlyFourteen|HomeNet|Zebra",
+   `SSIDs sorted alphabetically and deduped (got ${js.jw.ssid.join("|")})`);
+ok(decodeRowGlyphs(0) === "0123456789ABCD", "JW-1 row 0 is the first SSID");
+ok(invMask(0) === "1111111111111111",
+   "the selected SSID is an INVERTED full-width bar");
+ok(decodeRowGlyphs(1) === "aardvark-guest[LDOTS]",
+   `overlong SSID cut at 14 columns + one LDOTS (got "${decodeRowGlyphs(1)}")`);
+ok(decodeCell(1, 15) === " ",
+   "column 15 stays clear on JW-1 (LDOTS sits in column 14)");
+
+/* The JW screens give up the reserved cell — JW-2's DELETE key needs
+ * column 15, and both screens are uniform about it. */
+ok(decodeCell(3, 15) === " ", "the JW screens suppress the RF glyph cell");
+
+/* UP/DOWN scroll and clamp; the viewport follows past four entries. */
+jtap(PANEL.KEY.UP);
+ok(jstate().jw.sel === 0, "UP at the top of the list clamps");
+for (let i = 0; i < 4; i++) jtap(PANEL.KEY.DOWN);
+js = jstate();
+ok(js.jw.sel === 4 && js.jw.top === 1,
+   "DOWN past the fourth row scrolls the viewport by one");
+ok(decodeRowGlyphs(3) === "Zebra" && invMask(3) === "1111111111111111",
+   "the last SSID renders on the bottom row, inverted");
+jtap(PANEL.KEY.DOWN);
+ok(jstate().jw.sel === 4, "DOWN at the end of the list clamps");
+
+/* LEFT exits JW-1 back to the pages; RF stays enabled. */
+jtap(PANEL.KEY.LEFT);
+jadvance(200);
+ok(jstate().screen === "PAGE" && jstate().rf_state === "idle",
+   "LEFT exits JW-1 and leaves RF enabled");
+ok(cellBits(3, 15).join(",") === PANEL.GLYPHS["RF-IDLE"].join(","),
+   "back on the pages, RF-ENABLED-but-unassociated is the bare antenna");
+
+/* A second 5 s hold kills RF (no JW-1 this time). */
+jpress(PANEL.KEY.A);
+jadvance(5200);
+jrelease(PANEL.KEY.A);
+jadvance(2400);
+ok(jstate().screen === "PAGE" && jstate().rf_state === "killed",
+   "a 5 s A hold while RF-ENABLED kills the radios again");
+ok(cellBits(3, 15).join(",") === PANEL.GLYPHS.SHIELD.join(","),
+   "…and the glyph returns to the shield");
+
+/* Back into JW-1, then RIGHT to JW-2. */
+jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
+jadvance(2200);
+jtap(PANEL.KEY.DOWN); jtap(PANEL.KEY.DOWN); jtap(PANEL.KEY.DOWN);
+ok(jstate().jw.ssid[jstate().jw.sel] === "HomeNet", "selected HomeNet");
+jtap(PANEL.KEY.RIGHT);
+jadvance(200);
+js = jstate();
+ok(js.screen === "JW-2", "RIGHT on JW-1 opens JW-2");
+ok(js.jw.kr === 0 && js.jw.kc === 0, "POSITION starts at line 2's leftmost");
+ok(decodeRowGlyphs(1) === "abcdefghijklmnop", "JW-2 line 2 is a-p");
+ok(decodeRowGlyphs(2) === "qrstuvwxyz123456", "JW-2 line 3 is q-z then 1-6");
+ok(decodeRowGlyphs(3) === "7890-_.!@#$%&[SPACE][CAPSv][DEL]",
+   `JW-2 line 4 is 7-9 0, nine symbols, SPACE/CAPS/DELETE (got "${decodeRowGlyphs(3)}")`);
+ok(invMask(1) === "1000000000000000", "the POSITION cell is INVERTED");
+ok(decodeRowGlyphs(0) === "", "the input area starts empty");
+
+/* Typing: a tap types the key under the POSITION. */
+jtap(PANEL.KEY.A);                 /* 'a' */
+jtap(PANEL.KEY.RIGHT); jtap(PANEL.KEY.RIGHT);
+jtap(PANEL.KEY.A);                 /* 'c' */
+jadvance(200);
+ok(jstate().jw.psk === "ac", "short A presses type the key at the POSITION");
+
+/* CAPS is a toggle: it flips the key caps and the characters typed. */
+jp.keyEvent(PANEL.KEY_GPIO[PANEL.KEY.DOWN], true);   /* to line 4 */
+jrelease(PANEL.KEY.DOWN);
+jp.keyEvent(PANEL.KEY_GPIO[PANEL.KEY.DOWN], true);
+jrelease(PANEL.KEY.DOWN);
+for (let i = 0; i < 12; i++) jtap(PANEL.KEY.RIGHT);  /* col 2 -> col 14 */
+jadvance(200);
+ok(jstate().jw.kr === 2 && jstate().jw.kc === 14, "navigated to the CAPS key");
+jtap(PANEL.KEY.A);
+jadvance(200);
+ok(jstate().jw.caps === true, "A on the CAPS key toggles CAPS on");
+ok(decodeRowGlyphs(1) === "ABCDEFGHIJKLMNOP", "CAPS on: the key caps go upper");
+ok(decodeCell(3, 14) === "*[CAPS^]",
+   "the CAPS glyph flips to the up arrow (and is the inverted POSITION)");
+ok(jstate().jw.psk === "ac", "CAPS itself types nothing");
+
+/* DELETE is the last cell; SPACE the third from the right. */
+jtap(PANEL.KEY.RIGHT);             /* -> DELETE */
+jtap(PANEL.KEY.A);
+jadvance(200);
+ok(jstate().jw.psk === "a", "DELETE removes the last character");
+
+/* Input area: <=16 chars in full, longer = one LDOTS + the last 15. */
+jtap(PANEL.KEY.UP);                /* back to line 3 */
+jadvance(200);
+while (jstate().jw.psk.length < 16) { jtap(PANEL.KEY.A); }
+jadvance(200);
+ok(jstate().jw.psk.length === 16 && decodeRowGlyphs(0).length === 16,
+   "16 characters are displayed in full");
+ok(decodeCell(0, 0) !== "[LDOTS]", "…with no truncation mark");
+jtap(PANEL.KEY.A); jtap(PANEL.KEY.A);
+jadvance(200);
+js = jstate();
+ok(js.jw.psk.length === 18, "typed two more (18 characters held)");
+ok(decodeCell(0, 0) === "[LDOTS]",
+   "past 16 the first cell becomes LDOTS");
+ok(decodeRowGlyphs(0).slice(-15) === js.jw.psk.slice(-15),
+   "…followed by exactly the last 15 characters");
+
+/* STAGING: a 2 s A hold inverts the input area; typing leaves it. */
+jpress(PANEL.KEY.A);
+jadvance(2200);
+ok(jstate().jw.staged === true, "a 2 s A hold on JW-2 enters STAGING");
+ok(invMask(0) === "1111111111111111",
+   "STAGING renders the whole input area INVERTED");
+jrelease(PANEL.KEY.A);
+jadvance(200);
+ok(jstate().jw.staged === true && jstate().jw.psk.length === 18,
+   "releasing after the hold does not also type");
+jtap(PANEL.KEY.A);
+jadvance(200);
+ok(jstate().jw.staged === false && jstate().jw.psk.length === 19,
+   "typing anything more exits STAGING");
+
+/* Wrong passphrase: CONNECTING, then back to PAGE 1 with RF still on but
+ * unassociated — the glyph is the only report. */
+while (jstate().jw.psk.length) {    /* clear via DELETE */
+    jp.keyEvent(PANEL.KEY_GPIO[PANEL.KEY.DOWN], true); jrelease(PANEL.KEY.DOWN);
+    break;
+}
+jstate();
+{
+    /* Drive to DELETE (line 4, last cell) and empty the field. */
+    while (jstate().jw.kr !== 2) { jtap(PANEL.KEY.DOWN); }
+    while (jstate().jw.kc !== 15) { jtap(PANEL.KEY.RIGHT); }
+    while (jstate().jw.psk.length) { jtap(PANEL.KEY.A); }
+    ok(jstate().jw.psk === "", "DELETE empties the input area");
+}
+/* Type the wrong PSK by hand: 'z' (line 3, column 9). */
+while (jstate().jw.kr !== 1) { jtap(PANEL.KEY.DOWN); }
+while (jstate().jw.kc !== 9) { jtap(PANEL.KEY.RIGHT); }
+jtap(PANEL.KEY.A);
+jadvance(200);
+ok(jstate().jw.psk === "Z", "typed a wrong single-character passphrase");
+
+jpress(PANEL.KEY.A); jadvance(2200); jrelease(PANEL.KEY.A);   /* stage */
+jpress(PANEL.KEY.A); jadvance(2200);                          /* commit */
+ok(jstate().screen === "CONNECTING", "a second 2 s hold starts the attempt");
+ok(decodeRow(1) === "  CONNECTING...".trimEnd(),
+   `CONNECTING renders like EVENT (got "${decodeRow(1)}")`);
+jrelease(PANEL.KEY.A);
+
+/* Button B is NOT absorbed while CONNECTING; button A is. */
+{
+    const before = sim.events;
+    jpress(PANEL.KEY.B);
+    jadvance(2200);
+    jrelease(PANEL.KEY.B);
+    ok(sim.events === before + 1,
+       "button B still marks an EVENT while CONNECTING");
+}
+jadvance(3000);
+js = jstate();
+ok(js.screen === "PAGE" && js.page === 1,
+   "a finished attempt returns to PAGE 1 either way");
+ok(js.rf_state === "idle" && js.jw.pskLen === 0,
+   "wrong PSK: RF stays enabled, unassociated; the passphrase is wiped");
+ok(cellBits(3, 15).join(",") === PANEL.GLYPHS["RF-IDLE"].join(","),
+   "failure reads as the bare antenna — no text hint");
+
+/* Right passphrase: the glyph gains its waves. */
+jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);   /* kill RF */
+jadvance(2400);
+jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);   /* re-arm */
+jadvance(2400);
+while (jstate().jw.ssid[jstate().jw.sel] !== "HomeNet") jtap(PANEL.KEY.DOWN);
+jtap(PANEL.KEY.RIGHT);
+jadvance(200);
+for (const ch of sim.correctPsk) {
+    /* every character of "swordfish" lives on line 3 (q-z) or line 2 */
+    const line2 = ch >= "a" && ch <= "p";
+    const wantR = line2 ? 0 : 1;
+    const wantC = line2 ? ch.charCodeAt(0) - 97 : ch.charCodeAt(0) - 113;
+    while (jstate().jw.kr !== wantR) jtap(PANEL.KEY.DOWN);
+    while (jstate().jw.kc !== wantC) jtap(PANEL.KEY.RIGHT);
+    jtap(PANEL.KEY.A);
+}
+jadvance(200);
+ok(jstate().jw.psk === sim.correctPsk,
+   `typed the passphrase on the keyboard (got "${jstate().jw.psk}")`);
+jpress(PANEL.KEY.A); jadvance(2200); jrelease(PANEL.KEY.A);
+jpress(PANEL.KEY.A); jadvance(2200); jrelease(PANEL.KEY.A);
+jadvance(3000);
+js = jstate();
+ok(sim.lastConnect.ssid === "HomeNet" && sim.lastConnect.psk === sim.correctPsk,
+   "rf-ctl connect received the SSID and passphrase on stdin");
+ok(js.rf_state === "link" && js.screen === "PAGE",
+   "a successful join lands back on PAGE 1, associated");
+ok(cellBits(3, 15).join(",") === PANEL.GLYPHS.WIFI.join(","),
+   "success reads as the wireless glyph — the only report of the outcome");
+
+/* Exit rules: button B leaves JW-1 without marking an EVENT; 10 s of no
+ * input leaves too, and the page it returns to blanks straight away.
+ * The hold is a toggle off ANY enabled state, associated included — so
+ * reaching JW-1 from here costs a kill and a re-arm. */
+jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
+jadvance(2400);
+ok(jstate().screen === "PAGE" && jstate().rf_state === "killed",
+   "the A hold kills RF from the associated state too (no JW-1)");
+jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
+jadvance(2400);
+ok(jstate().screen === "JW-1", "re-arming opens JW-1 again");
+{
+    const before = sim.events;
+    jpress(PANEL.KEY.B);
+    jadvance(2400);                /* well past the 2 s EVENT hold */
+    jrelease(PANEL.KEY.B);
+    ok(jstate().screen === "PAGE", "button B exits JW-1");
+    ok(sim.events === before,
+       "…and its EVENT function is absorbed while a JW screen is up");
+}
+/* B left the radios on, so the cycle is kill then re-arm again. */
+jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
+jadvance(2400);
+jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
+jadvance(2400);
+ok(jstate().screen === "JW-1", "JW-1 up once more");
+jadvance(10400);                   /* no input at all */
+js = jstate();
+ok(js.screen === "PAGE" && js.blanked === true,
+   "10 s without input exits the JW screens and the page blanks at once");
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
 process.exit(failures ? 1 : 0);

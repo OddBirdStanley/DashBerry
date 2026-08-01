@@ -10,14 +10,21 @@
 # merge boot/config-snippet.txt and etc/fstab.snippet by hand).
 #
 # Options come from two places, both written by dashberry-install:
-#   - BYPASS_TIME / BYPASS_REAR / DEBUG in ./etc/dashberry.conf (the copy
-#     installed to /etc below — panel and installer read the same truth).
-#     DEBUG=0 is a PRODUCTION card: the OS goes read-only (overlayfs) and
-#     every Wi-Fi trace (profile, leases, regdom token, journal) is wiped.
-#     DEBUG=1 is a DEBUG card: writable OS, Wi-Fi profile and journal kept,
-#     and the journal made persistent (/var/log/journal);
+#   - BYPASS_TIME / BYPASS_REAR / DEBUG / RF_JOIN in ./etc/dashberry.conf
+#     (the copy installed to /etc below — panel and installer read the same
+#     truth). DEBUG=0 is a PRODUCTION card: the OS goes read-only
+#     (overlayfs) and every stored Wi-Fi credential is wiped. DEBUG=1 is a
+#     DEBUG card: writable OS, Wi-Fi profile and journal kept, and the
+#     journal made persistent (/var/log/journal). RF_JOIN=1 (a production
+#     card built with --auth) keeps the regdom token so the panel's JOIN
+#     WIFI screen has radios it can legally bring up;
 #   - FIRSTBOOT_WIFI in ../install-opts (this boot runs over a staged Wi-Fi
 #     profile instead of Ethernet).
+#
+# Whatever the mode, the card ends this script RF-KILLED and boots that way:
+# `nmcli radio wifi off` persists WirelessEnabled=false. The one exception
+# is a debug card that was given a --wifi profile — an explicit request for
+# a card that rejoins the LAN by itself.
 #
 # dashberry-cli (../cli) is PC-side and is deliberately NOT installed here —
 # it never ships on the image.
@@ -32,6 +39,7 @@ FROM_UNIT=0
 BYPASS_TIME=0
 BYPASS_REAR=0
 DEBUG=0
+RF_JOIN=0
 FIRSTBOOT_WIFI=0
 . ./etc/dashberry.conf
 [ -f ../install-opts ] && . ../install-opts
@@ -173,22 +181,45 @@ if [ "$DEBUG" = 1 ]; then
     # boot), keep the journal, and make it persistent — /var/log/journal
     # existing flips journald's Storage=auto to disk from the next boot,
     # so crash-window logs survive a power cut on the writable OS.
-    echo "debug card: keeping Wi-Fi + journal; enabling persistent journal..."
+    echo "debug card: keeping the journal; enabling persistent journal..."
     mkdir -p /var/log/journal
+    if [ "$FIRSTBOOT_WIFI" = 1 ]; then
+        # A --wifi profile on a debug card is the explicit request for a
+        # card that rejoins the LAN by itself: keep it, keep the regdom,
+        # leave the radios live. This is the ONLY build that boots
+        # RF-ENABLED. JOIN WIFI is not armed here — the card already knows
+        # a network, and the panel's toggle would only fight this profile.
+        echo "debug card: keeping the staged Wi-Fi profile (radios stay live)"
+    else
+        # No network was ever named for this card, so it has nothing to
+        # talk to: leave it dark rather than beaconing on the bench.
+        echo "debug card: no --wifi profile — leaving the radios blocked"
+        nmcli radio wifi off 2>/dev/null || true
+    fi
 else
-    echo "production card: wiping first-boot Wi-Fi traces..."
+    echo "production card: wiping stored Wi-Fi credentials..."
     # Must happen BEFORE the overlay flip: anything left now is frozen into
     # the read-only OS forever. Wiped: the NM profile (holds the plaintext
-    # PSK), DHCP leases and the seen-bssids cache, the cmdline regdom token,
-    # and — on a Wi-Fi install — the journal (NM logs the SSID; the PSK
-    # never reaches it). nmcli radio wifi off additionally persists
-    # WirelessEnabled=false into NetworkManager.state, so a production card
-    # never scans or associates again.
+    # PSK), DHCP leases and the seen-bssids cache, and — on a Wi-Fi install
+    # — the journal (NM logs the SSID; the PSK never reaches it). nmcli
+    # radio wifi off additionally persists WirelessEnabled=false into
+    # NetworkManager.state, so the card comes up RF-KILLED on this and
+    # every later boot — including a JOIN WIFI card, whose radios only ever
+    # come up from the panel and never survive the reboot.
     nmcli radio wifi off 2>/dev/null || true
     rm -f /etc/NetworkManager/system-connections/dashberry-firstboot.nmconnection
     rm -f /var/lib/NetworkManager/*.lease
     rm -f /var/lib/NetworkManager/seen-bssids
-    sed -i 's/ cfg80211\.ieee80211_regdom=[A-Za-z][A-Za-z]//g' "$CMDLINE"
+    if [ "$RF_JOIN" = 1 ]; then
+        # JOIN WIFI card: the credential is gone like on any production
+        # card, but the regulatory domain must survive — without it the
+        # kernel hard-blocks wlan for the card's whole life and rf-ctl
+        # could never bring the radios up, so the feature would be dead on
+        # arrival. The regdom is not a credential: it names no network.
+        echo "JOIN WIFI armed: keeping the regulatory domain in cmdline.txt"
+    else
+        sed -i 's/ cfg80211\.ieee80211_regdom=[A-Za-z][A-Za-z]//g' "$CMDLINE"
+    fi
     if [ "$FIRSTBOOT_WIFI" = 1 ]; then
         journalctl --rotate --vacuum-time=1s >/dev/null 2>&1 || true
     fi

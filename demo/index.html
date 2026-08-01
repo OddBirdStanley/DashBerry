@@ -121,7 +121,9 @@
       <div class="key ab" data-key="B">B</div>
     </div>
     <div id="keyhints">keyboard: arrows = joystick · Enter = center ·
-      A / B keys (all reserved: wake / reset the blank timer)</div>
+      A / B keys (press-and-hold works)<br>
+      B hold 2 s = EVENT marker · A hold 5 s = JOIN WIFI on/off (armed
+      cards only) · on JW-2, A hold 2 s = stage, again = connect</div>
   </div>
 
   <div class="card" style="flex:1">
@@ -171,6 +173,13 @@
       <div class="slider">SoC temp
         <input type="range" id="cputemp" min="-20" max="90" step="0.487" value="42.1">
         <span class="val" id="cputempval"></span></div>
+      <div class="slider">get_throttled
+        <select id="throttled">
+          <option value="0">0 — PWR OK</option>
+          <option value="65536">bit 16 — PWR UV SEEN</option>
+          <option value="1">bit 0 — PWR UV NOW</option>
+          <option value="">read failure — PWR ---</option>
+        </select></div>
     </div>
 
     <div class="grp">
@@ -180,11 +189,40 @@
 
     <div class="grp">
       UNITS <select id="units"><option>MPH</option><option>KMH</option></select>
-      <label class="row"><input type="checkbox" id="debugcard">
-        DEBUG=1 card (wireless glyph; unchecked = production, shield)</label>
+      <label class="row"><input type="checkbox" id="rfjoin">
+        RF_JOIN=1 card (arms the 5 s button-A JOIN WIFI hold)</label>
       <button class="act" id="restart">restart panel daemon</button>
       <span style="color:var(--dim);font-size:11.5px">(conf is read at boot,
-        as in the C)</span>
+        as in the C; a reboot always lands RF-KILLED)</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Radios (rf-ctl / rfkill stand-in)</h2>
+    <div class="grp">
+      <div class="slider">access points in range
+        <span class="val" id="apcount"></span></div>
+      <textarea id="aps" rows="5" style="width:100%;background:#232a33;
+        color:var(--ink);border:1px solid var(--edge);border-radius:6px;
+        font:12px ui-monospace,monospace;padding:6px"
+      >HomeNet
+aardvark-guest-network-5G
+Zebra
+CoffeeShop Free WiFi
+ExactlyFourteen</textarea>
+      <div style="color:var(--dim);font-size:11.5px">one SSID per line — what
+        <code>rf-ctl scan</code> prints</div>
+    </div>
+    <div class="grp">
+      <label class="row">passphrase that works
+        <input id="goodpsk" value="swordfish" style="background:#232a33;
+          color:var(--ink);border:1px solid var(--edge);border-radius:6px;
+          padding:3px 6px;font:inherit;width:130px"></label>
+      <label class="row"><input type="checkbox" id="scanfails">
+        make <code>rf-ctl scan</code> fail (JW-1 shows RF ERROR)</label>
+      <div class="slider">rf-ctl latency
+        <input type="range" id="rflat" min="200" max="8000" step="100" value="2000">
+        <span class="val" id="rflatval"></span></div>
     </div>
   </div>
 
@@ -208,6 +246,9 @@ const $ = (id) => document.getElementById(id);
 const sim = {
     frontLast: 0, rearLast: 0,
     lat: 43.61871, lon: -116.21460, heading: 1.1,
+    /* rfkill soft-block + operstate stand-in, and the rf-ctl children it
+     * serves. A fresh boot is always RF-KILLED, like the real card. */
+    rfBlocked: true, rfLinked: false, pending: [], events: 0,
 };
 
 const logEl = $("log");
@@ -229,16 +270,57 @@ const hw = {
     cpuTempMc: () => $("thermal").checked
         ? Math.round(parseFloat($("cputemp").value) * 1000)
         : null,
+    throttled: () => $("throttled").value === "" ? null
+                                                 : parseInt($("throttled").value, 10),
     statvfs: () => {
         if (!$("mounted").checked) return null;
         const pct = parseFloat($("free").value);
         return { rw: $("rw").checked, freePct: pct,
                  fsErrors: $("fserr").checked };
     },
+    rfState: () => sim.rfBlocked ? "killed" : (sim.rfLinked ? "link" : "idle"),
+    /* Stands in for fork+exec of rf-ctl: the handle is mutated by
+     * runRfJobs() once the simulated child has "run" long enough. */
+    rfCtl: (cmd, stdinText) => {
+        const h = { done: false, ok: false, out: "" };
+        sim.pending.push({ h, cmd, stdinText,
+                           at: performance.now() + parseInt($("rflat").value, 10) });
+        logLine(`rf-ctl ${cmd} started`);
+        return h;
+    },
+    logEvent: () => { sim.events++;
+                      logLine("health log: event marker appended", true);
+                      return true; },
     present: (view) => blit(view),
     notify: (msg) => { if (msg === "READY=1") logLine("sd_notify: READY=1"); },
     log: (msg) => logLine(msg, true),
 };
+
+/* What rf-ctl does on the card, condensed to its observable effects. */
+function runRfJobs() {
+    const now = performance.now();
+    for (const j of sim.pending.slice()) {
+        if (now < j.at) continue;
+        sim.pending.splice(sim.pending.indexOf(j), 1);
+        if (j.cmd === "scan") {
+            sim.rfBlocked = false;         /* the scan unblocks the radios */
+            j.h.ok = !$("scanfails").checked;
+            j.h.out = j.h.ok ? $("aps").value : "";
+        } else if (j.cmd === "down") {
+            sim.rfBlocked = true;
+            sim.rfLinked = false;
+            j.h.ok = true;
+        } else if (j.cmd === "connect") {
+            const [ssid, psk] = String(j.stdinText).split("\n");
+            sim.rfLinked = psk === $("goodpsk").value;
+            j.h.ok = sim.rfLinked;
+            logLine(`rf-ctl connect "${ssid}" -> ` +
+                    (sim.rfLinked ? "associated" : "FAILED"), true);
+        }
+        j.h.done = true;
+        logLine(`rf-ctl ${j.cmd} exited ${j.h.ok ? 0 : 1}`);
+    }
+}
 
 let panel = PANEL.create(hw);
 
@@ -321,8 +403,12 @@ setInterval(() => {
 
 /* --------------------------------------------------- tick + inspector -- */
 
+const RF_PILL = { killed: ["off", "RF-KILLED 🛡"], idle: ["off", "RF ON, no link"],
+                  link: ["on", "ASSOCIATED 📡"] };
+
 let prev = null;
 setInterval(() => {
+    runRfJobs();
     panel.tick();
     const s = panel.state();
 
@@ -334,19 +420,27 @@ setInterval(() => {
         if (s.blanked !== prev.blanked)
             logLine(s.blanked ? "AUTO-BLANK: display off"
                               : "wake (key absorbed, PAGE 1)");
+        if (s.screen !== prev.screen)
+            logLine(`screen -> ${s.screen}`, true);
+        if (s.rf_state !== prev.rf_state)
+            logLine(`RF -> ${s.rf_state}`, true);
+        if (s.jw.staged !== prev.jw.staged && s.jw.staged)
+            logLine("JW-2: STAGING (hold A again to connect)", true);
     }
     prev = s;
 
     /* inspector */
+    const rf = RF_PILL[s.rf_state];
     $("bigstate").innerHTML =
-        `<span class="pill ${s.error ? "off" : "on"}">${s.error ? "ERROR — PAGE 0" : "OK — PAGE " + s.page}</span>` +
+        `<span class="pill ${s.error ? "off" : "on"}">${s.error ? "ERROR — PAGE 0" : (s.page === null ? s.screen : "OK — PAGE " + s.page)}</span>` +
         `<span class="pill ${s.blanked ? "off" : "on"}">${s.blanked ? "BLANKED" : "SCREEN ON"}</span>` +
-        `<span class="pill ${s.debug_card ? "off" : "on"}">${s.debug_card ? "DEBUG 📡" : "PRODUCTION 🛡"}</span>`;
+        `<span class="pill ${rf[0]}">${rf[1]}</span>` +
+        `<span class="pill ${s.rf_join ? "on" : ""}">${s.rf_join ? "JOIN WIFI armed" : "JOIN WIFI unarmed"}</span>`;
     $("healthpills").innerHTML =
         ["front", "rear", "gpsok", "timeok", "storage"].map(k =>
             `<span class="pill ${s.health[k] ? "on" : "off"}">${k}</span>`
         ).join("");
-    $("kv").innerHTML = [
+    const kv = [
         ["gps", s.gps.have_fix
             ? `${s.gps.lat.toFixed(5)}, ${s.gps.lon.toFixed(5)} @ ${s.gps.knots.toFixed(1)} kn`
             : "no fix"],
@@ -354,7 +448,19 @@ setInterval(() => {
         ["burn shift", `idx ${s.burn_idx} (yoff ${s.yoff}) — PAGE 0 only`],
         ["repaints", `${s.repaints} (change-only, 5 Hz cap)`],
         ["watchdog pets", s.watchdog_pets],
-    ].map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+        ["events marked", sim.events],
+    ];
+    if (s.screen === "JW-1")
+        kv.push(["JW-1", s.jw.scanning ? "scanning…"
+                 : `${s.jw.ssid.length} SSIDs, cursor ${s.jw.sel}` +
+                   (s.jw.scan_failed ? " (scan FAILED)" : "")]);
+    if (s.screen === "JW-2")
+        kv.push(["JW-2", `${s.jw.pskLen} chars` +
+                 (s.jw.staged ? " — STAGED" : "") +
+                 (s.jw.caps ? " — CAPS" : "") +
+                 ` — POSITION ${s.jw.kr},${s.jw.kc}`]);
+    $("kv").innerHTML =
+        kv.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
     $("blankfill").style.width = s.blank_in_ms === null ? "0"
         : (100 * (1 - s.blank_in_ms / 10000)) + "%";
 
@@ -362,6 +468,10 @@ setInterval(() => {
     $("freeval").textContent = parseFloat($("free").value).toFixed(1) + " %";
     $("cputempval").textContent =
         parseFloat($("cputemp").value).toFixed(1) + " °C";
+    $("rflatval").textContent =
+        (parseInt($("rflat").value, 10) / 1000).toFixed(1) + " s";
+    $("apcount").textContent =
+        $("aps").value.split("\n").filter(l => l.trim()).length + " in range";
 }, PANEL.TICK_MS);
 
 /* -------------------------------------------------------------- boot -- */
@@ -370,16 +480,21 @@ $("fastburn").addEventListener("change", () =>
     panel.setBurnStepMs($("fastburn").checked ? 3000 : 60000));
 
 function bootPanel() {
+    /* A reboot always lands RF-KILLED — nothing the JOIN WIFI screen does
+     * survives it (the profile lives on the read-only OS's tmpfs overlay). */
+    sim.rfBlocked = true;
+    sim.rfLinked = false;
+    sim.pending.length = 0;
     panel = PANEL.create(hw);
     panel.setBurnStepMs($("fastburn").checked ? 3000 : 60000);
-    panel.boot($("units").value, $("debugcard").checked);
+    panel.boot($("units").value, $("rfjoin").checked);
     prev = null;
     logLine(`dashberry-panel booted (UNITS=${$("units").value}, ` +
-            `DEBUG=${$("debugcard").checked ? 1 : 0}); ` +
+            `RF_JOIN=${$("rfjoin").checked ? 1 : 0}); radios blocked; ` +
             `health must prove itself — expect a moment of PAGE 0`, true);
 }
 $("restart").addEventListener("click", bootPanel);
-$("debugcard").addEventListener("change", bootPanel);
+$("rfjoin").addEventListener("change", bootPanel);
 bootPanel();
 </script>
 </body>

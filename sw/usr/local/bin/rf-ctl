@@ -1,0 +1,120 @@
+#!/bin/sh
+# rf-ctl — the radio half of JOIN WIFI, run by dashberry-panel.
+#
+# The panel forks this for every radio operation and polls its stdout, so
+# nothing here may assume a terminal and nothing may take longer than the
+# panel's per-command deadline (scan 25 s, down 15 s, connect 45 s — the
+# panel SIGKILLs past it). Exit status is the whole answer for `down` and
+# `connect`; `scan` additionally prints one SSID per line on stdout.
+#
+# NetworkManager is the stack (Trixie, same assumption dashberry-install
+# makes when it stages a first-boot profile). wpa_supplicant is never
+# driven directly.
+#
+#   rf-ctl scan        unblock the radios, rescan, print the SSIDs in range
+#   rf-ctl connect     read SSID then passphrase from STDIN (one per line),
+#                      write a 0600 keyfile and bring it up
+#   rf-ctl down        drop the profile and block the radios again
+#
+# The passphrase arrives on stdin and is written under umask 077 — it is
+# never an argument (argv is world-readable through /proc), never echoed,
+# and never logged. On a production card /etc is an overlayfs whose upper
+# layer is tmpfs, so the keyfile dies with the power: that is what makes
+# "rebooting places the card in RF-KILLED again" true for credentials too.
+set -eu
+
+PROFILE_ID=dashberry-join
+PROFILE=/etc/NetworkManager/system-connections/$PROFILE_ID.nmconnection
+
+command -v nmcli >/dev/null 2>&1 || {
+    echo "rf-ctl: nmcli not found — this card has no NetworkManager" >&2
+    exit 1
+}
+
+# Remove the profile whether or not it is up. Never fatal: `down` must
+# always reach the rfkill block below, and `connect` uses this to clean up
+# a failed attempt before reporting the failure.
+drop_profile() {
+    nmcli connection down "$PROFILE_ID" >/dev/null 2>&1 || true
+    rm -f "$PROFILE"
+    nmcli connection reload >/dev/null 2>&1 || true
+}
+
+case "${1:-}" in
+scan)
+    # rfkill first: NetworkManager will not scan through a soft block, and
+    # WirelessEnabled=false is exactly what firstinstall persisted.
+    rfkill unblock wifi 2>/dev/null || true
+    nmcli radio wifi on >/dev/null 2>&1 || true
+
+    # A hard block here means no regulatory domain (the card was built
+    # without --wifi-country) — the radios cannot legally key up, so say
+    # so rather than printing an empty list that looks like "no APs".
+    if rfkill list wifi 2>/dev/null | grep -q 'Hard blocked: yes'; then
+        echo "rf-ctl: wlan is hard-blocked (no regulatory domain?)" >&2
+        exit 1
+    fi
+
+    # --rescan yes forces a fresh sweep instead of NM's cached list.
+    # -t -f SSID prints one field per line, backslash-escaping ':' and
+    # '\' — undo exactly those two, in that order. Hidden APs come back
+    # as an empty field and are dropped: there is nothing to display and
+    # nothing the JW-1 list could usefully select.
+    nmcli -t -f SSID device wifi list --rescan yes 2>/dev/null |
+        sed -e 's/\\:/:/g' -e 's/\\\\/\\/g' |
+        grep -v '^[[:space:]]*$' |
+        sort -u
+    ;;
+
+connect)
+    # Line 1 = SSID, line 2 = passphrase (may be empty for an open AP).
+    IFS= read -r SSID || SSID=
+    IFS= read -r PSK   || PSK=
+    [ -n "$SSID" ] || { echo "rf-ctl: no SSID on stdin" >&2; exit 1; }
+
+    drop_profile
+    # printf, not a heredoc: the passphrase must land byte-for-byte
+    # ($, \, %s-safe). umask 077 so it is never world-readable even
+    # briefly — NM refuses keyfiles that are not 600 anyway.
+    (
+        umask 077
+        {
+            printf '[connection]\nid=%s\nuuid=%s\ntype=wifi\nautoconnect=false\n\n' \
+                "$PROFILE_ID" "$(cat /proc/sys/kernel/random/uuid)"
+            printf '[wifi]\nmode=infrastructure\nssid=%s\n\n' "$SSID"
+            if [ -n "$PSK" ]; then
+                printf '[wifi-security]\nkey-mgmt=wpa-psk\npsk=%s\n\n' "$PSK"
+            fi
+            printf '[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n'
+        } > "$PROFILE"
+    )
+    chmod 600 "$PROFILE"
+    nmcli connection reload >/dev/null 2>&1 || true
+
+    # --wait: nmcli returns only once the connection is actually up
+    # (association AND addressing), which is what the panel reports. Kept
+    # under the panel's 45 s deadline so the child exits on its own.
+    if nmcli --wait 35 connection up "$PROFILE_ID" >/dev/null 2>&1; then
+        exit 0
+    fi
+    # Failed: leave nothing half-up. The radios stay ENABLED on purpose —
+    # the user is standing at the car and gets another try without
+    # re-arming; the bare-antenna glyph is what reports the failure.
+    drop_profile
+    exit 1
+    ;;
+
+down)
+    drop_profile
+    # Persisted (NetworkManager.state) on a writable OS; on a production
+    # card the write lands in the overlay and the frozen state is already
+    # false. Either way the radios are down now.
+    nmcli radio wifi off >/dev/null 2>&1 || true
+    rfkill block wifi 2>/dev/null || true
+    ;;
+
+*)
+    echo "usage: rf-ctl scan|connect|down" >&2
+    exit 2
+    ;;
+esac
