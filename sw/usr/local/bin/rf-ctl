@@ -3,8 +3,8 @@
 #
 # The panel forks this for every radio operation and polls its stdout, so
 # nothing here may assume a terminal and nothing may take longer than the
-# panel's per-command deadline (scan 25 s, down 15 s, connect 45 s — the
-# panel SIGKILLs past it). Exit status is the whole answer for `down` and
+# panel's per-command deadline (scan 25 s, down 15 s, connect 30 s — past
+# it the panel SIGKILLs the whole process group). Exit status is the whole answer for `down` and
 # `connect`; `scan` additionally prints one SSID per line on stdout.
 #
 # NetworkManager is the stack (Trixie, same assumption dashberry-install
