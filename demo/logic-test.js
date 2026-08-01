@@ -725,6 +725,15 @@ ok(js.rf_state === "killed",
     ok(ev === " EVENT", `EVENT renders " EVENT" (got "${ev}")`);
     jadvance(2200);                /* let the flash expire */
 
+    /* EVENT ERROR — the health log unwritable, marker lost */
+    sim.eventLogWritable = false;
+    const everr = at(() => { jpress(PANEL.KEY.B); jadvance(2200);
+                             jrelease(PANEL.KEY.B); });
+    ok(everr === " EVENT ERROR",
+       `an unwritable log renders " EVENT ERROR" (got "${everr}")`);
+    sim.eventLogWritable = true;
+    jadvance(2200);
+
     /* NO NETWORKS, from a scan that comes back empty */
     const savedAps = sim.aps;
     sim.aps = [];
@@ -746,9 +755,9 @@ ok(js.rf_state === "killed",
     jtap(PANEL.KEY.LEFT);
     jadvance(2400);
 
-    ok([ev, nn, rferr, " CONNECTING...", " SCANNING..."]
+    ok([ev, everr, nn, rferr, " CONNECTING...", " SCANNING..."]
         .every(t => t.startsWith(" ") && !t.startsWith("  ")),
-       "all five status messages share the one-column indent");
+       "all six status messages share the one-column indent");
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);

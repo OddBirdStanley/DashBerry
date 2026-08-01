@@ -1997,12 +1997,12 @@ int main(void)
 
             /* Button B held to the 2 s mark: record the event, once per
              * hold. The marker line is the payload; the flash is feedback
-             * (EVENT ERR = the /data log is unwritable, marker lost). */
+             * (EVENT ERROR = the /data log is unwritable, marker lost). */
             if (ui.b_down_ms && !ui.b_fired &&
                 now - ui.b_down_ms >= EVENT_HOLD_MS) {
                 ui.b_fired = true;
                 snprintf(ui.flash, sizeof ui.flash,
-                         hlog_line("event") ? "EVENT" : "EVENT ERR");
+                         hlog_line("event") ? "EVENT" : "EVENT ERROR");
                 ui.flash_until_ms = now + EVENT_FLASH_MS;
             }
 

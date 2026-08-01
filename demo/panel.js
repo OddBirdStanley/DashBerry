@@ -28,7 +28,7 @@
  *                               harness when the simulated child exits;
  *                               stands in for fork+exec of rf-ctl
  *   logEvent()               -> bool: append an `event` record (health log);
- *                               false = unwritable, panel flashes EVENT ERR
+ *                               false = unwritable, panel flashes EVENT ERROR
  *   present(view)               render sink: { blanked, fb (Uint8Array) }
  *   notify(msg)                 sd_notify stand-in ("READY=1"/"WATCHDOG=1")
  *   log(msg)                    stderr stand-in
@@ -952,7 +952,7 @@ function create(hw) {
         /* Button B held to the 2 s mark: record the event, once per hold. */
         if (ui.b_down_ms && !ui.b_fired && now - ui.b_down_ms >= EVENT_HOLD_MS) {
             ui.b_fired = true;
-            ui.flash = hw.logEvent() ? "EVENT" : "EVENT ERR";
+            ui.flash = hw.logEvent() ? "EVENT" : "EVENT ERROR";
             ui.flash_until_ms = now + EVENT_FLASH_MS;
         }
 
