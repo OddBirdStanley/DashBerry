@@ -93,8 +93,10 @@ connect)
 
     # --wait: nmcli returns only once the connection is actually up
     # (association AND addressing), which is what the panel reports. Kept
-    # under the panel's 45 s deadline so the child exits on its own.
-    if nmcli --wait 35 connection up "$PROFILE_ID" >/dev/null 2>&1; then
+    # under the panel's 30 s deadline, with room for the teardown below, so
+    # the child exits on its own and the SIGKILL path stays theoretical.
+    # A join that has not completed in 25 s has failed in practice.
+    if nmcli --wait 25 connection up "$PROFILE_ID" >/dev/null 2>&1; then
         exit 0
     fi
     # Failed: leave nothing half-up. The radios stay ENABLED on purpose —

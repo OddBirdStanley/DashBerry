@@ -29,6 +29,7 @@ const sim = {
     aps: ["HomeNet", "aardvark-guest-network-5G", "Zebra",
           "ExactlyFourteen", "0123456789ABCD", "HomeNet"],
     scanOk: true, correctPsk: "swordfish", rfJobMs: 2000, pending: [],
+    downFailsLeft: 0,              /* make N `rf-ctl down` runs exit nonzero */
     lastConnect: null,
     logs: [],
     presented: null,
@@ -71,9 +72,14 @@ function runRfJobs() {
             j.h.ok = sim.scanOk;
             j.h.out = sim.scanOk ? sim.aps.join("\n") + "\n" : "";
         } else if (j.cmd === "down") {
-            sim.rfBlocked = true;
-            sim.rfLinked = false;
-            j.h.ok = true;
+            if (sim.downFailsLeft > 0) {
+                sim.downFailsLeft--;   /* radios stay up: the kill failed */
+                j.h.ok = false;
+            } else {
+                sim.rfBlocked = true;
+                sim.rfLinked = false;
+                j.h.ok = true;
+            }
         } else if (j.cmd === "connect") {
             const [ssid, psk] = String(j.stdinText).split("\n");
             sim.lastConnect = { ssid, psk };
@@ -712,6 +718,48 @@ ok(js.error === true && js.screen === "PAGE",
    "a health fault drops JW-1 for PAGE 0");
 ok(js.rf_state === "killed",
    "…and that exit kills the radios too (a faulted card joins nothing)");
+
+/* Getting the radios down is retried, not fired once and assumed: it is the
+ * privacy-preserving direction, so "probably off" is not good enough. */
+{
+    jtap(PANEL.KEY.CENTER); jadvance(200);        /* wake if blanked */
+    jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
+    jadvance(2400);
+    ok(jstate().screen === "JW-1", "armed for the retry check");
+
+    sim.downFailsLeft = 2;         /* first two kills fail outright */
+    jtap(PANEL.KEY.LEFT);          /* exit -> owes a down */
+    jadvance(200);
+    ok(jstate().rf_kill_pending === true, "the exit records the debt");
+    jadvance(9000);                /* three jobs at ~2 s each */
+    ok(sim.downFailsLeft === 0, "…and both failures really were consumed");
+    ok(jstate().rf_state === "killed",
+       "a failed rf-ctl down is retried until the radios are actually down");
+    ok(jstate().rf_kill_pending === false, "…then the debt is settled");
+}
+
+/* But not retried forever — a card that truly cannot go dark says so on
+ * the glyph rather than spawning rf-ctl until the end of time. */
+{
+    jtap(PANEL.KEY.CENTER); jadvance(200);
+    jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
+    jadvance(2400);
+    ok(jstate().screen === "JW-1", "armed for the give-up check");
+
+    sim.downFailsLeft = 99;        /* rf-ctl down can never succeed */
+    jtap(PANEL.KEY.LEFT);
+    jadvance(20000);
+    const spent = 99 - sim.downFailsLeft;
+    ok(spent === 3, `it gives up after RF_KILL_TRIES attempts (spent ${spent})`);
+    ok(jstate().rf_kill_pending === false, "…and stops asking");
+    ok(jstate().rf_state === "idle",
+       "…leaving the glyph honest about radios it could not turn off");
+    sim.downFailsLeft = 0;
+    jtap(PANEL.KEY.CENTER); jadvance(200);   /* 20 s of idle blanked it */
+    jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
+    jadvance(2400);
+    ok(jstate().rf_state === "killed", "button A still works after giving up");
+}
 
 /* Every full-screen status message shares one shape: line 2, indented by
  * a single column. Checked together so they cannot drift apart again. */

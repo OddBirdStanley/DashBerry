@@ -100,7 +100,12 @@
 #define JW_IDLE_MS       10000    /* JW-1/JW-2 exit after this without input */
 #define SCAN_TO_MS       25000    /* rf-ctl scan watchdog */
 #define RFDOWN_TO_MS     15000    /* rf-ctl down watchdog */
-#define CONNECT_TO_MS    45000    /* rf-ctl connect watchdog */
+#define CONNECT_TO_MS    30000    /* rf-ctl connect watchdog: the hard cap
+                                     on how long CONNECTING can hold the
+                                     screen. rf-ctl's own nmcli --wait sits
+                                     under it so the child normally exits
+                                     first and this never fires. */
+#define RF_KILL_TRIES    3        /* attempts to get the radios back down */
 
 /* -------------------------------------------------------------- display - */
 
@@ -1064,7 +1069,8 @@ static struct {
     bool    a_fired;               /* this hold already fired its action */
     int64_t flash_until_ms;        /* EVENT confirmation visible until */
     char    flash[COLS + 1];       /* EVENT confirmation text */
-    bool    rf_kill_pending;       /* a JW exit owes an rf-ctl down */
+    bool    rf_kill_pending;       /* the radios are owed an rf-ctl down */
+    int     rf_kill_tries;         /* attempts spent on it so far */
 } ui;
 
 /* JOIN WIFI screen state. jw.psk is the only secret the panel holds; it is
@@ -1141,6 +1147,11 @@ static bool rf_spawn(int kind, const char *cmd, const char *in, int64_t now,
         return false;
     }
     if (pid == 0) {
+        /* Own process group, so a cancel reaches the pipelines rf-ctl
+         * forks and not just the shell wrapping them. Set on both sides of
+         * the fork: whichever call wins, the group exists before either
+         * process can need it. */
+        setpgid(0, 0);
         /* Everything else the panel holds is O_CLOEXEC (fb, gpio, timerfd,
          * gpsd socket, health log, notify socket), so exec closes it. */
         if (in) {
@@ -1162,6 +1173,7 @@ static bool rf_spawn(int kind, const char *cmd, const char *in, int64_t now,
         _exit(127);
     }
 
+    setpgid(pid, pid);             /* harmless if the child got there first */
     close(op[1]);
     if (in) {
         close(ip[0]);
@@ -1180,6 +1192,27 @@ static bool rf_spawn(int kind, const char *cmd, const char *in, int64_t now,
     job.status = -1;
     job.len = 0;
     return true;
+}
+
+/* rf-ctl forks pipelines (`nmcli | sed | grep | sort`), and those children
+ * inherit our stdout pipe. Signalling the shell alone leaves them running,
+ * holding the pipe open — which used to stall job completion until the
+ * deadline, and with it anything queued behind the one job slot. Signal the
+ * process group instead, and drop the output we no longer care about so the
+ * job can finish on the next reap rather than on EOF. */
+static void rf_job_cancel(void)
+{
+    if (job.kind == RFJ_NONE)
+        return;
+    if (!job.reaped) {
+        kill(-job.pid, SIGKILL);   /* the group: pgid == pid, set at spawn */
+        kill(job.pid, SIGKILL);    /* in case setpgid() lost its race */
+    }
+    if (job.fd >= 0) {
+        close(job.fd);
+        job.fd = -1;
+    }
+    job.deadline_ms = 0;           /* completes as soon as it is reaped */
 }
 
 static void rf_job_read(void)
@@ -1204,6 +1237,16 @@ static void rf_job_read(void)
 }
 
 /* ------------------------------------------------------------ JOIN WIFI - */
+
+/* The radios are owed a trip back down. Every caller goes through here so
+ * the attempt is retried if rf-ctl fails, rather than fired once and
+ * assumed to have worked — this is the privacy-preserving direction, so
+ * "probably off" is not good enough. */
+static void rf_kill_request(void)
+{
+    ui.rf_kill_pending = true;
+    ui.rf_kill_tries = 0;
+}
 
 static void jw_clear(void)
 {
@@ -1232,15 +1275,13 @@ static void jw_clear(void)
  * idle timeout leaves last_key_ms alone, and PAGE 1 blanks at once. */
 static void jw_exit(int64_t now, bool user)
 {
-    /* Only signal a child we have not reaped — past waitpid() the pid may
-     * already belong to something else. Its result is dropped either way
-     * (rf_job_done checks the screen). */
-    if (job.kind == RFJ_SCAN && !job.reaped)
-        kill(job.pid, SIGKILL);
-    /* Deferred, not spawned here: a scan may still be occupying the one
-     * job slot, and it has to be reaped before `down` can run. The tick
-     * drains this within 200 ms. */
-    ui.rf_kill_pending = true;
+    /* A scan in flight is genuinely cancelled, not just orphaned — the
+     * `down` below cannot spawn until the one job slot is free. */
+    if (job.kind == RFJ_SCAN)
+        rf_job_cancel();
+    /* Deferred, not spawned here: the slot may still be occupied for a
+     * tick or two. rf_kill_drain() picks it up. */
+    rf_kill_request();
     ui.screen = SCR_PAGE;
     ui.page_idx = 0;
     ui.a_down_ms = 0;
@@ -1319,6 +1360,14 @@ static void rf_job_done(int64_t now)
         jw.scan_failed = !ok;
         if (ok)
             jw_take_scan();
+    } else if (kind == RFJ_DOWN) {
+        if (ok) {
+            ui.rf_kill_pending = false;
+            ui.rf_kill_tries = 0;
+        }
+        /* Not ok: the debt stands and rf_kill_drain() tries again, bounded
+         * by RF_KILL_TRIES. The glyph is reading rfkill either way, so a
+         * card that really cannot go dark says so on screen. */
     } else if (kind == RFJ_CONNECT) {
         /* Success or failure, the screen returns to PAGE 1 (or 0) and the
          * RF glyph is the whole answer — no text hint, by design. */
@@ -1349,6 +1398,7 @@ static void rf_job_tick(int64_t now)
     }
     if (now >= job.deadline_ms) {
         if (!job.reaped) {
+            kill(-job.pid, SIGKILL);   /* the group, not just the shell */
             kill(job.pid, SIGKILL);
             return;                /* reaped on a later tick */
         }
@@ -1369,8 +1419,13 @@ static void rf_kill_drain(int64_t now)
 {
     if (!ui.rf_kill_pending || job.kind != RFJ_NONE)
         return;
+    if (ui.rf_kill_tries >= RF_KILL_TRIES) {
+        ui.rf_kill_pending = false;   /* out of tries; the glyph tells the
+                                         truth and button A still works */
+        return;
+    }
     if (rf_spawn(RFJ_DOWN, "down", NULL, now, RFDOWN_TO_MS))
-        ui.rf_kill_pending = false;
+        ui.rf_kill_tries++;
 }
 
 /* 5 s button-A hold on a page: RF-KILLED -> radios on + JW-1, else kill. */
@@ -1379,11 +1434,11 @@ static void rf_toggle(int64_t now)
     if (job.kind != RFJ_NONE)
         return;
     if (rf_state != RF_KILLED) {
-        ui.rf_kill_pending = false;
-        rf_spawn(RFJ_DOWN, "down", NULL, now, RFDOWN_TO_MS);
+        rf_kill_request();         /* same retried path as a JW exit */
         return;
     }
     ui.rf_kill_pending = false;    /* arming supersedes an owed kill */
+    ui.rf_kill_tries = 0;
     jw_clear();
     ui.screen = SCR_JW1;
     ui.blanked = false;

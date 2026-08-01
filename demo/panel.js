@@ -53,7 +53,9 @@ const STAGE_HOLD_MS = 2000;     /* button A hold on JW-2: stage / connect */
 const JW_IDLE_MS    = 10000;    /* JW-1/JW-2 exit after this without input */
 const SCAN_TO_MS    = 25000;    /* rf-ctl scan watchdog */
 const RFDOWN_TO_MS  = 15000;    /* rf-ctl down watchdog */
-const CONNECT_TO_MS = 45000;    /* rf-ctl connect watchdog */
+const CONNECT_TO_MS = 30000;    /* rf-ctl connect watchdog: the hard cap on
+                                   how long CONNECTING can hold the screen */
+const RF_KILL_TRIES = 3;        /* attempts to get the radios back down */
 
 /* -------------------------------------------------------------- display - */
 
@@ -289,7 +291,8 @@ function create(hw) {
         a_fired: false,            /* this hold already fired its action */
         flash_until_ms: 0,         /* EVENT confirmation visible until */
         flash: "",
-        rf_kill_pending: false,    /* a JW exit owes an rf-ctl down */
+        rf_kill_pending: false,    /* the radios are owed an rf-ctl down */
+        rf_kill_tries: 0,          /* attempts spent on it so far */
     };
 
     /* JOIN WIFI screen state. jw.psk is the only secret the panel holds;
@@ -373,6 +376,15 @@ function create(hw) {
 
     /* --------------------------------------------------------- JOIN WIFI - */
 
+    /* The radios are owed a trip back down. Every caller goes through here
+     * so the attempt is retried if rf-ctl fails, rather than fired once and
+     * assumed to have worked — this is the privacy-preserving direction, so
+     * "probably off" is not good enough. */
+    function rf_kill_request() {
+        ui.rf_kill_pending = true;
+        ui.rf_kill_tries = 0;
+    }
+
     function jw_clear() {
         jw.psk = "";               /* the secret never outlives a screen */
         jw.ssid = [];
@@ -402,7 +414,7 @@ function create(hw) {
             job = { kind: RFJ.NONE, h: null, deadline_ms: 0 };
         /* Deferred, not spawned here: a scan may still hold the one job
          * slot. The tick drains this within 200 ms. */
-        ui.rf_kill_pending = true;
+        rf_kill_request();
         ui.screen = SCR.PAGE;
         ui.page_idx = 0;
         ui.a_down_ms = 0;
@@ -452,6 +464,13 @@ function create(hw) {
             jw.scan_failed = !ok;
             if (ok)
                 jw_take_scan(out);
+        } else if (kind === RFJ.DOWN) {
+            if (ok) {
+                ui.rf_kill_pending = false;
+                ui.rf_kill_tries = 0;
+            }
+            /* Not ok: the debt stands and rf_kill_drain retries, bounded by
+             * RF_KILL_TRIES. The glyph reads the radio state either way. */
         } else if (kind === RFJ.CONNECT) {
             /* Success or failure, the screen returns to PAGE 1 (or 0) and
              * the RF glyph is the whole answer — no text hint, by design. */
@@ -479,8 +498,13 @@ function create(hw) {
     function rf_kill_drain(now) {
         if (!ui.rf_kill_pending || job.kind !== RFJ.NONE)
             return;
+        if (ui.rf_kill_tries >= RF_KILL_TRIES) {
+            ui.rf_kill_pending = false;   /* out of tries; the glyph tells
+                                             the truth and A still works */
+            return;
+        }
         if (rf_spawn(RFJ.DOWN, "down", null, now, RFDOWN_TO_MS))
-            ui.rf_kill_pending = false;
+            ui.rf_kill_tries++;
     }
 
     /* 5 s button-A hold on a page: RF-KILLED -> radios on + JW-1, else kill. */
@@ -488,11 +512,11 @@ function create(hw) {
         if (job.kind !== RFJ.NONE)
             return;
         if (rf_state !== "killed") {
-            ui.rf_kill_pending = false;
-            rf_spawn(RFJ.DOWN, "down", null, now, RFDOWN_TO_MS);
+            rf_kill_request();        /* same retried path as a JW exit */
             return;
         }
         ui.rf_kill_pending = false;   /* arming supersedes an owed kill */
+        ui.rf_kill_tries = 0;
         jw_clear();
         ui.screen = SCR.JW1;
         ui.blanked = false;
@@ -913,6 +937,7 @@ function create(hw) {
         ui.burn_last_ms = now;
         job = { kind: RFJ.NONE, h: null, deadline_ms: 0 };
         ui.rf_kill_pending = false;
+        ui.rf_kill_tries = 0;
         jw_clear();
         eval_health(now);
         ui.error = system_err();   /* boot: honest immediate evaluation */
@@ -1045,6 +1070,8 @@ function create(hw) {
                     kr: jw.kr, kc: jw.kc, caps: jw.caps, staged: jw.staged,
                 },
                 job: job.kind,
+                rf_kill_pending: ui.rf_kill_pending,
+                rf_kill_tries: ui.rf_kill_tries,
                 flashing: hw.now() < ui.flash_until_ms,
                 gps: { ...gps },
                 df_pct,
