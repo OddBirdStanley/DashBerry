@@ -24,6 +24,7 @@ const sim = {
     throttled: 0,
     mounted: true, rw: true, freePct: 90.1, fsErrors: false,
     eventLogWritable: true, events: 0,
+    settingsFile: null,            /* /data/settings.conf, null = absent */
     /* rfkill + operstate stand-in, and the rf-ctl children it serves */
     rfBlocked: true, rfLinked: false,
     aps: ["HomeNet", "aardvark-guest-network-5G", "Zebra",
@@ -55,6 +56,9 @@ const hw = {
     },
     logEvent: () => { if (!sim.eventLogWritable) return false;
                       sim.events++; return true; },
+    /* /data/settings.conf stand-in (atomic tmp+rename in the C). */
+    settingsLoad: () => sim.settingsFile,
+    settingsSave: (text) => { sim.settingsFile = text; return true; },
     present: (view) => { sim.presented = { blanked: view.blanked,
                                            fb: Uint8Array.from(view.fb) }; },
     notify: () => {},
@@ -396,13 +400,130 @@ ok(decodeRow(0) === "TMP ---",
 ok(panel.state().error === false, "temp read failure is not a health ERR");
 sim.cpuTempMc = 30566;
 
-/* Cyclic paging: RIGHT wraps back to PAGE 1; LEFT from PAGE 1 -> PAGE 2. */
+/* ---------------------------------------------------- settings (PAGE 3+) --
+ * One page per setting: the name left on line 1, the choices right-aligned
+ * below it, the LIVE one under an inverted bar. UP/DOWN move the bar, and
+ * the move itself is the change — there is no commit key.
+ */
+function pageTo(n) {               /* RIGHT until PAGE n is up */
+    for (let i = 0; i < 8 && panel.state().page !== n; i++) {
+        press(PANEL.KEY.RIGHT); release(PANEL.KEY.RIGHT);
+        advance(200);
+    }
+}
 press(PANEL.KEY.RIGHT); release(PANEL.KEY.RIGHT);
 advance(200);
-ok(panel.state().page === 1, "RIGHT from PAGE 2 wraps to PAGE 1");
+ok(panel.state().page === 3, "RIGHT from PAGE 2 shows PAGE 3");
+ok(decodeRow(0) === "Speed Unit",
+   `PAGE 3 names the setting as written, not in caps (got "${decodeRow(0)}")`);
+ok(decodeRowGlyphs(1, 15) === "            MPH",
+   `the live choice is right-aligned (got "${decodeRowGlyphs(1, 15)}")`);
+ok(invMask(1, 15) === "111111111111111" && invMask(2, 15) === "000000000000000",
+   `…and only its row wears the bar (got ${invMask(1, 15)}/${invMask(2, 15)})`);
+ok(decodeRow(2) === "            KMH",
+   `the other choice sits under it, same column (got "${decodeRow(2)}")`);
+ok(decodeRow(3, 15) === "", "unused choice rows stay empty");
+ok(glyphCellPixels().join("") === expectedGlyphPixels('S').join(""),
+   "the settings bar stops short of the RF glyph cell");
+
+/* The bar IS the value: DOWN moves it, PAGE 1's speed line follows, and
+ * the choice is on the card before the key is even released. */
+press(PANEL.KEY.DOWN); release(PANEL.KEY.DOWN);
+advance(200);
+ok(panel.state().settings[0].value === "KMH", "DOWN selects KMH");
+ok(sim.settingsFile === "speed_unit=KMH\nalways_on=Off\n",
+   `the choice is persisted immediately (got ${JSON.stringify(sim.settingsFile)})`);
+press(PANEL.KEY.DOWN); release(PANEL.KEY.DOWN);
+advance(200);
+ok(panel.state().settings[0].value === "KMH",
+   "DOWN at the end of the list clamps, it does not wrap");
+pageTo(1);
+ok(decodeRow(2) === "SPD 145 KMH",
+   `PAGE 1 speed follows the setting (got "${decodeRow(2)}")`);
+pageTo(3);
+press(PANEL.KEY.UP); release(PANEL.KEY.UP);
+advance(200);
+ok(panel.state().settings[0].value === "MPH" && decodeRow(3, 15) === "",
+   "UP puts it back to MPH; a two-choice page leaves the fourth row empty");
+
+/* PAGE 4 — Always On disables AUTO-BLANK, and takes PAGE 0's burn-in
+ * shift with it (a page that never blanks IS the burn-in case). */
+pageTo(4);
+ok(decodeRow(0) === "Always On",
+   `RIGHT from PAGE 3 shows PAGE 4 (got "${decodeRow(0)}")`);
+ok(decodeRowGlyphs(1, 15) === "            Off" && invMask(1, 15).endsWith("1"),
+   `"Off" is the default and is the barred row (got "${decodeRowGlyphs(1, 15)}")`);
+advance(10400);
+ok(panel.state().blanked === true, "with Always On off, PAGE 4 still blanks");
+press(PANEL.KEY.CENTER); release(PANEL.KEY.CENTER);   /* wake -> PAGE 1 */
+advance(200);
+pageTo(4);
+press(PANEL.KEY.DOWN); release(PANEL.KEY.DOWN);
+advance(200);
+ok(panel.state().settings[1].value === "On", "DOWN selects On");
+advance(20000);
+s = panel.state();
+ok(s.blanked === false, "Always On disables AUTO-BLANK");
+ok(s.blank_in_ms === null, "…so there is no blank countdown left to report");
+panel.setBurnStepMs(3000);
+const burnYoff = panel.state().yoff;
+advance(3200);
+ok(panel.state().yoff !== burnYoff,
+   "…and the burn-in shift takes over on a page that never blanks");
+panel.setBurnStepMs(PANEL.BURN_STEP_MS);
+
+/* A settings page is not special to anything else: a fault still steals
+ * the screen, and PAGE 0 still ignores the joystick. */
+sim.frontWriting = false;
+advance(11000);
+s = panel.state();
+ok(s.error === true && s.page === 0,
+   "a fault still takes a settings page to PAGE 0");
+press(PANEL.KEY.DOWN); release(PANEL.KEY.DOWN);
+advance(200);
+ok(panel.state().settings[1].value === "On",
+   "…and nothing can be changed from a faulted card");
+sim.frontWriting = true;
+sim.frontLast = vt.now;
+advance(1400);
+ok(panel.state().error === false && panel.state().page === 1,
+   "clearing the fault returns to PAGE 1");
+
+/* A restart reads the stored choices back (the panel's settings_load). */
+{
+    sim.settingsFile = "speed_unit=KMH\nalways_on=On\n";
+    const p2 = PANEL.create(hw);
+    p2.boot("MPH");                /* the card was BUILT for MPH... */
+    const st = p2.state();
+    ok(st.settings[0].value === "KMH" && st.settings[1].value === "On",
+       "a restarted panel comes back with the stored choices, not the built-in ones");
+    sim.settingsFile = "speed_unit=NAUTICAL\nnonsense=1\n";
+    const p3 = PANEL.create(hw);
+    p3.boot("MPH");
+    ok(p3.state().settings[0].value === "MPH",
+       "an unknown key or value leaves the installed default standing");
+    sim.settingsFile = "speed_unit=MPH\nalways_on=Off\n";
+}
+
+/* Back to the defaults the rest of the file assumes. */
+pageTo(4);
+press(PANEL.KEY.UP); release(PANEL.KEY.UP);
+advance(200);
+ok(panel.state().settings[1].value === "Off" &&
+   panel.state().blank_in_ms !== null,
+   "Always On back off: the blank timer returns");
+
+/* Cyclic paging over the full list. */
+pageTo(1);
 press(PANEL.KEY.LEFT); release(PANEL.KEY.LEFT);
 advance(200);
-ok(panel.state().page === 2, "LEFT from PAGE 1 wraps to PAGE 2");
+ok(panel.state().page === 4, "LEFT from PAGE 1 wraps to the last page");
+press(PANEL.KEY.RIGHT); release(PANEL.KEY.RIGHT);
+advance(200);
+ok(panel.state().page === 1, "RIGHT from the last page wraps to PAGE 1");
+press(PANEL.KEY.RIGHT); release(PANEL.KEY.RIGHT);
+advance(200);
+ok(panel.state().page === 2, "…and PAGE 2 is where the next tests resume");
 
 /* Lighting up always starts at PAGE 1: blank while on PAGE 2, wake. */
 advance(10200);

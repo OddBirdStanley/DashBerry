@@ -10,7 +10,10 @@
  *     name at startup (fb number is probe order) and rendered per its
  *     reported format: 1 bpp (fbdev ssd1307fb) or 32 bpp XRGB8888 (DRM
  *     ssd130x fbdev emulation — what Trixie's kernel binds);
- *   - AUTO-BLANK (10 s, OK state only);
+ *   - PAGE 3+ — the settings pages: one persistent multiple-choice setting
+ *     per page, chosen on the panel and stored on /data (the OS is
+ *     read-only in production, so /data is the only writable home);
+ *   - AUTO-BLANK (10 s, OK state only, unless "Always On" is set);
  *   - JOIN WIFI (armed only by RF_JOIN=1 in /etc/dashberry.conf): a 5 s
  *     button-A hold turns the radios on and opens JW-1 (SSID list) → JW-2
  *     (on-screen keyboard) → CONNECTING; the radio work itself is done by
@@ -79,6 +82,8 @@
 #define CPU_TEMP      "/sys/class/thermal/thermal_zone0/temp"  /* milli-degC */
 #define GET_THROTTLED "/sys/devices/platform/soc/soc:firmware/get_throttled"
 #define HEALTH_BASE   "/data/health"
+#define SETTINGS_PATH "/data/settings.conf"     /* panel-chosen, persistent */
+#define SETTINGS_TMP  "/data/settings.conf.tmp"
 #define RFKILL_BASE   "/sys/class/rfkill"
 #define NET_BASE      "/sys/class/net"
 #define RF_CTL        "/usr/local/bin/rf-ctl"
@@ -507,6 +512,136 @@ static bool        rf_join;        /* RF_JOIN=1: JOIN WIFI armed (an --auth
                                       card without --debug). 0 = the 5 s
                                       button-A hold does nothing, as before */
 
+/* ------------------------------------------------------------- settings - */
+
+/* User-chosen configuration, one multiple-choice setting per page from
+ * PAGE 3 on: the name on line 1, the choices right-aligned below it, the
+ * active one under an INVERTED bar — JW-1's shape, with the list being the
+ * choices instead of SSIDs. UP/DOWN move the bar and moving it IS the
+ * change: with the live value always the one under the bar, the screen
+ * cannot disagree with what the card is doing, and no key has to be spent
+ * on a commit.
+ *
+ * ADDING A SETTING: append a row to settings[] (name, choices, default
+ * index) and its page number to pages[]. Everything else — rendering,
+ * paging, the viewport for more choices than fit, load, atomic save — is
+ * generic. The compile-time check under pages[] catches the half-done job.
+ *
+ * Storage is /data, not /etc: the production OS is read-only, and /data is
+ * the one volume that survives a write. Values are stored as the choice
+ * TEXT (`speed_unit=KMH`), so the file explains itself to whoever pulls the
+ * card, and an unrecognized key or value simply leaves the default. */
+
+#define OPT_MAX 8                      /* choices per setting */
+#define OPT_ROWS (ROWS - 1)            /* choice rows: everything below the name */
+#define OPT_COLS (COLS - 1)            /* right-aligned field: clears the glyph cell */
+
+struct setting {
+    const char *key;                   /* settings.conf key */
+    const char *name;                  /* line 1, left-aligned, as written */
+    const char *opts[OPT_MAX + 1];     /* choices, NULL-terminated */
+    int         value;                 /* index into opts[] — the live value */
+};
+
+enum { SET_UNITS, SET_ALWAYS_ON, SET_COUNT };
+
+static struct setting settings[SET_COUNT] = {
+    [SET_UNITS]     = { "speed_unit", "Speed Unit",
+                        { "MPH", "KMH", NULL }, 0 },
+    [SET_ALWAYS_ON] = { "always_on",  "Always On",
+                        { "Off", "On", NULL }, 0 },
+};
+
+static int setting_nopts(const struct setting *s)
+{
+    int n = 0;
+    while (n < OPT_MAX && s->opts[n])
+        n++;
+    return n;
+}
+
+/* Read a setting by the choice's text rather than its index, so callers
+ * never encode the table's ordering. */
+static bool setting_is(int idx, const char *opt)
+{
+    return strcmp(settings[idx].opts[settings[idx].value], opt) == 0;
+}
+
+/* Push the settings that other code caches into that code. Called after
+ * load_conf(), after settings_load(), and after every change. */
+static void settings_apply(void)
+{
+    if (setting_is(SET_UNITS, "KMH")) {
+        speed_factor = 1.852;          /* knots -> km/h */
+        speed_unit = "KMH";
+    } else {
+        speed_factor = 1.15078;        /* knots -> mph */
+        speed_unit = "MPH";
+    }
+}
+
+/* True once the stored values are in hand — or once /data is provably
+ * mounted and simply has no settings file yet. `/data` carries `nofail`,
+ * which explicitly does NOT order the mount before local-fs.target, so the
+ * panel can start before it: a one-shot read at startup would silently fall
+ * back to the installed defaults and then save them over the user's real
+ * choices on the first key press. eval_health retries until this is true. */
+static bool settings_loaded;
+
+static bool settings_load(void)
+{
+    FILE *f = fopen(SETTINGS_PATH, "r");
+    if (!f)
+        return errno == ENOENT;        /* never been set: defaults stand */
+    char line[128];
+    while (fgets(line, sizeof line, f)) {
+        char *nl = strpbrk(line, "\r\n");
+        if (nl)
+            *nl = '\0';
+        char *eq = strchr(line, '=');
+        if (!eq)
+            continue;
+        *eq++ = '\0';
+        for (int i = 0; i < SET_COUNT; i++) {
+            if (strcmp(line, settings[i].key) != 0)
+                continue;
+            for (int o = 0; settings[i].opts[o]; o++)
+                if (strcmp(eq, settings[i].opts[o]) == 0)
+                    settings[i].value = o;   /* unknown text: default stands */
+        }
+    }
+    fclose(f);
+    return true;
+}
+
+/* Atomic (tmp -> fsync -> rename), and best-effort like the health log: a
+ * full or read-only /data loses the save, never the panel — the value is
+ * already live in memory and the page still shows the truth. */
+static void settings_save(void)
+{
+    char buf[256];
+    size_t len = 0;
+    for (int i = 0; i < SET_COUNT; i++) {
+        int n = snprintf(buf + len, sizeof buf - len, "%s=%s\n",
+                         settings[i].key, settings[i].opts[settings[i].value]);
+        if (n < 0 || (size_t)n >= sizeof buf - len)
+            return;                    /* table outgrew the buffer: skip */
+        len += (size_t)n;
+    }
+    int fd = open(SETTINGS_TMP, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return;
+    bool ok = write(fd, buf, len) == (ssize_t)len && fsync(fd) == 0;
+    close(fd);
+    if (!ok || rename(SETTINGS_TMP, SETTINGS_PATH) != 0)
+        unlink(SETTINGS_TMP);
+}
+
+/* ------------------------------------------------ conf (install-time) - */
+
+/* /etc/dashberry.conf is what the CARD was built with; settings.conf above
+ * is what the USER chose on the panel afterwards. Load order says which
+ * wins: this first, settings_load() second. */
 static void load_conf(void)
 {
     FILE *f = fopen(CONF_PATH, "r");
@@ -515,13 +650,10 @@ static void load_conf(void)
     char line[256];
     while (fgets(line, sizeof line, f)) {
         if (strncmp(line, "UNITS=", 6) == 0) {
-            if (strncmp(line + 6, "KMH", 3) == 0) {
-                speed_factor = 1.852;        /* knots -> km/h */
-                speed_unit = "KMH";
-            } else {
-                speed_factor = 1.15078;      /* knots -> mph */
-                speed_unit = "MPH";
-            }
+            /* The installed default for the PAGE 3 "Speed Unit" setting —
+             * whatever the user last picked on the panel outranks it (see
+             * settings_load, which runs after this). */
+            settings[SET_UNITS].value = strncmp(line + 6, "KMH", 3) == 0;
         } else if (strncmp(line, "BYPASS_TIME=", 12) == 0) {
             bypass_time = line[12] == '1';
         } else if (strncmp(line, "BYPASS_REAR=", 12) == 0) {
@@ -792,6 +924,13 @@ static void read_cpu_temp(void)
         cpu_temp_mc = atoi(buf);
 }
 
+/* Whole degrees C, round-to-nearest and negative-safe. One definition for
+ * the PAGE 2 line and the health log, so they can never disagree. */
+static int cpu_temp_c(void)
+{
+    return (cpu_temp_mc + (cpu_temp_mc >= 0 ? 500 : -500)) / 1000;
+}
+
 /* Firmware throttle flags for the PAGE 2 PWR line — the same bitmask
  * vcgencmd get_throttled reports, read from the firmware driver's sysfs
  * node: bit 0 = under-voltage NOW,
@@ -901,6 +1040,12 @@ static bool storage_ok(void)
  *   <epoch> gpsfix <FIX|NOFIX>         RMC fix presence (OK-but-fixless)
  *   <epoch> event                      button-B marker
  *   <epoch> hb                         heartbeat — bounds session end
+ *   <epoch> tmp <degC>                 SoC temperature, whole degrees
+ * The tmp record rides the heartbeat (one per 10 s, plus one in the initial
+ * dump) — the glovebox is an oven and a card that throttled, or died, in a
+ * heat wave should say so off-card without anyone having watched PAGE 2.
+ * A failed sensor read writes no record at all: absence means unknown, so
+ * there is no sentinel value for a parser to mistake for a reading.
  * The full state set is written once after boot so a parser needs no
  * assumed defaults; after that only transitions, plus the 10 s heartbeat.
  * Each record is one unbuffered write(2) (durability rides on the 1 s
@@ -934,6 +1079,15 @@ static void hlog_state(const char *comp, bool ok)
 {
     char rec[32];
     snprintf(rec, sizeof rec, "%s %s", comp, ok ? "OK" : "ERR");
+    hlog_line(rec);
+}
+
+static void hlog_temp(void)
+{
+    if (!cpu_temp_valid)
+        return;                        /* no reading, no record */
+    char rec[32];
+    snprintf(rec, sizeof rec, "tmp %d", cpu_temp_c());
     hlog_line(rec);
 }
 
@@ -976,6 +1130,7 @@ static void hlog_sync(const char *session, int64_t now)
         hlog_state("time", health.timeok);
         hlog_state("storage", health.storage);
         hlog_line(fix ? "gpsfix FIX" : "gpsfix NOFIX");
+        hlog_temp();                   /* the dump is a complete snapshot */
         hlog.front = health.front;
         hlog.rear = health.rear;
         hlog.gpsok = health.gpsok;
@@ -1000,6 +1155,7 @@ static void hlog_sync(const char *session, int64_t now)
     if (now - hlog.last_hb_ms >= HB_MS) {
         hlog.last_hb_ms = now;
         hlog_line("hb");
+        hlog_temp();
     }
 }
 
@@ -1030,6 +1186,13 @@ static void eval_health(int64_t now)
                    (now - gps.last_nmea_ms) <= GPS_SILENT_MS;
     health.timeok = bypass_time || rtc_ok();
     health.storage = storage_ok();
+    /* Settings live on /data, which may still have been mounting when the
+     * panel started (nofail — see settings_loaded). Retry until it answers,
+     * and only treat "no file" as final once storage is provably there. */
+    if (!settings_loaded) {
+        settings_loaded = settings_load() && health.storage;
+        settings_apply();
+    }
     read_cpu_temp();               /* 1 Hz, off the 5 Hz paint path */
     read_throttled();
     rf_refresh();                  /* glyph truth, not a health state */
@@ -1048,8 +1211,50 @@ enum key { KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_CENTER, KEY_A, KEY_B,
            KEY_COUNT };
 static const uint32_t key_gpio[KEY_COUNT] = { 17, 22, 27, 23, 4, 5, 6 };
 
-static const int pages[] = { 1, 2 };   /* wake order: index 0 is PAGE 1 */
+/* Wake order: index 0 is PAGE 1. PAGE 3 and up are the settings pages, one
+ * per settings[] row IN TABLE ORDER — the assert below is what makes adding
+ * a setting without giving it a page a compile error rather than a page
+ * nobody can reach. */
+#define SET_PAGE_FIRST 3
+static const int pages[] = { 1, 2, SET_PAGE_FIRST, SET_PAGE_FIRST + 1 };
 #define NPAGES ((int)(sizeof pages / sizeof pages[0]))
+_Static_assert(NPAGES == 2 + SET_COUNT, "every setting needs a page in pages[]");
+
+/* The setting a page number owns, or NULL for the fixed pages (0/1/2). */
+static struct setting *page_setting(int page)
+{
+    int i = page - SET_PAGE_FIRST;
+    return (i >= 0 && i < SET_COUNT) ? &settings[i] : NULL;
+}
+
+/* Which choices are on screen when there are more than OPT_ROWS of them.
+ * Derived from the value alone (no stored scroll position): the live choice
+ * is always visible, and the frame stays a pure function of state, which is
+ * what the repaint-on-change comparison relies on. */
+static int setting_top(const struct setting *s)
+{
+    int n = setting_nopts(s);
+    if (n <= OPT_ROWS)
+        return 0;
+    int top = s->value - OPT_ROWS / 2;
+    if (top > n - OPT_ROWS)
+        top = n - OPT_ROWS;
+    return top < 0 ? 0 : top;
+}
+
+/* UP/DOWN on a settings page. Clamps at the ends like JW-1's list rather
+ * than wrapping — a held key must not cycle the value back around. Every
+ * accepted move applies and persists immediately: there is no staging
+ * state that a power cut could catch half-committed. */
+static void setting_move(struct setting *s, int delta)
+{
+    int v = s->value + delta;
+    if (v < 0 || v >= setting_nopts(s) || v == s->value)
+        return;
+    s->value = v;
+    settings_apply();
+    settings_save();
+}
 
 /* Which screen owns the input. PAGE covers PAGE 0/1/2 (ui.error picks
  * PAGE 0); the three JOIN WIFI screens are their own modes. */
@@ -1649,6 +1854,7 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
         return;
     }
     ui.last_key_ms = now;
+    struct setting *set = page_setting(pages[ui.page_idx]);
     if (key == KEY_LEFT)
         ui.page_idx = (ui.page_idx + NPAGES - 1) % NPAGES;
     else if (key == KEY_RIGHT)
@@ -1657,8 +1863,11 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
         ui.a_down_ms = now;        /* 5 s hold = JOIN WIFI, fired from the
                                       tick; short presses stay reserved */
         ui.a_fired = false;
+    } else if (set && (key == KEY_UP || key == KEY_DOWN)) {
+        setting_move(set, key == KEY_UP ? -1 : 1);
     }
-    /* UP, DOWN, CENTER: reserved — wake/reset-timer only */
+    /* UP, DOWN (off a settings page), CENTER: reserved — wake/reset-timer
+       only */
 }
 
 /* ------------------------------------------------------------ rendering - */
@@ -1762,9 +1971,14 @@ static void compose(struct frame *f, int64_t now)
         return;
     }
 
+    /* Burn-in shift: PAGE 0 is static for as long as the fault lasts, and
+     * with Always On so is every page — same static-picture risk, same
+     * ±1 px mitigation. The pages that AUTO-BLANK still take none. */
+    if (ui.error || (setting_is(SET_ALWAYS_ON, "On") && ui.screen == SCR_PAGE))
+        f->yoff = burn_offsets[ui.burn_idx];
+
     if (ui.error) {
         /* PAGE 0 — static, only failing groups, empty lines omitted */
-        f->yoff = burn_offsets[ui.burn_idx];
         snprintf(f->rows[0], sizeof f->rows[0], "Errors:");
         int r = 1;
         if (!health.front || !health.rear)
@@ -1782,14 +1996,31 @@ static void compose(struct frame *f, int64_t now)
         return;
     }
 
+    /* PAGE 3+ — a settings page: the name on line 1 as written (left), the
+     * choices right-aligned under it, the live one under a bar. The bar is
+     * OPT_COLS wide, not the full 16, so it stops short of the glyph cell
+     * and every choice row is the same width on every line. */
+    const struct setting *set = page_setting(pages[ui.page_idx]);
+    if (set) {
+        snprintf(f->rows[0], sizeof f->rows[0], "%s", set->name);
+        int n = setting_nopts(set), top = setting_top(set);
+        for (int r = 0; r < OPT_ROWS && top + r < n; r++) {
+            const char *o = set->opts[top + r];
+            int pad = OPT_COLS - (int)strlen(o);
+            snprintf(f->rows[r + 1], sizeof f->rows[r + 1], "%*s%s",
+                     pad > 0 ? pad : 0, "", o);
+            if (top + r == set->value)
+                f->inv[r + 1] = (1u << OPT_COLS) - 1;
+        }
+        return;
+    }
+
     if (pages[ui.page_idx] == 2) {
         /* PAGE 2 — line 1: Pi 4 SoC temperature, whole degrees C
          * (negative-safe round-to-nearest); line 2: firmware power flags
          * (under-voltage now beats latched); remaining lines reserved */
         if (cpu_temp_valid) {
-            int mc = cpu_temp_mc;
-            int deg = (mc + (mc >= 0 ? 500 : -500)) / 1000;
-            snprintf(f->rows[0], sizeof f->rows[0], "TMP %d C", deg);
+            snprintf(f->rows[0], sizeof f->rows[0], "TMP %d C", cpu_temp_c());
         } else {
             snprintf(f->rows[0], sizeof f->rows[0], "TMP ---");
         }
@@ -1902,7 +2133,11 @@ int main(void)
      * take the panel down with it. */
     signal(SIGPIPE, SIG_IGN);
 
-    load_conf();
+    load_conf();                   /* the card's installed defaults; the
+                                      user's PAGE 3+ choices land on top of
+                                      them from the first eval_health, once
+                                      /data has answered */
+    settings_apply();
     if (fb_init() < 0)
         return 1;
     int gpio_fd = gpio_init();
@@ -2054,7 +2289,12 @@ int main(void)
                 now - ui.last_key_ms >= JW_IDLE_MS)
                 jw_exit(now, false);
 
+            /* AUTO-BLANK, unless PAGE 4's "Always On" is set — that setting
+             * exists precisely to keep the panel readable at a glance while
+             * driving, so it outranks the 10 s timer (the burn-in shift in
+             * compose() takes over as the mitigation). */
             if (ui.screen == SCR_PAGE && !ui.error && !ui.blanked &&
+                !setting_is(SET_ALWAYS_ON, "On") &&
                 now - ui.last_key_ms >= BLANK_MS)
                 ui.blanked = true;
 

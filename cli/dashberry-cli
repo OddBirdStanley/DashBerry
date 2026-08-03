@@ -138,19 +138,21 @@ def health_path(data, session):
 def parse_health(path):
     """Parse the panel's per-session health log (format: IMPL.md — lines of
     '<epoch> boot' / '<epoch> <comp> <OK|ERR>' / '<epoch> gpsfix <FIX|NOFIX>'
-    / '<epoch> event' / '<epoch> hb'). Returns None if absent/unreadable,
-    else a dict:
+    / '<epoch> event' / '<epoch> hb' / '<epoch> tmp <degC>'). Returns None if
+    absent/unreadable, else a dict:
       start, end   first/last record epoch (boot .. last heartbeat)
       err          {comp: [(t0, t1), ...]} ERR spans (open spans end at end)
       nofix        [(t0, t1), ...] spans without a GPS fix
       events       [epoch, ...] button-B markers
+      temps        [degC, ...] SoC temperature samples (empty on sessions
+                   recorded before the panel logged them)
     Tolerates the duplicate initial-state dumps a mid-session log reopen
     produces (same-state records are ignored)."""
     if not path:
         return None
     err, open_err = {}, {}
     nofix, nofix_open = [], None
-    events = []
+    events, temps = [], []
     start = end = None
     try:
         f = open(path, "r", errors="replace")
@@ -168,6 +170,11 @@ def parse_health(path):
             kind = parts[1]
             if kind == "event":
                 events.append(t)
+            elif kind == "tmp" and len(parts) >= 3:
+                try:
+                    temps.append(int(parts[2]))
+                except ValueError:
+                    pass
             elif kind == "gpsfix" and len(parts) >= 3:
                 if parts[2] == "NOFIX" and nofix_open is None:
                     nofix_open = t
@@ -186,7 +193,7 @@ def parse_health(path):
     if nofix_open is not None:
         nofix.append((nofix_open, end))
     return {"start": start, "end": end, "err": err, "nofix": nofix,
-            "events": events}
+            "events": events, "temps": temps}
 
 
 def spans_subtract(spans, minus):
@@ -324,6 +331,14 @@ def catalog_verbose(data, session, fixes, units):
               % (ind, len(health["events"]), marks))
     else:
         print("%sevents 0" % ind)
+    # SoC temperature, one sample per health-log heartbeat. The peak is the
+    # number that matters — a glovebox in summer is where thermal throttling
+    # (and a dead card) comes from — with the average for context. Omitted
+    # entirely for sessions recorded before the panel logged temperature.
+    temps = health["temps"]
+    if temps:
+        print("%stemp avg %d C   peak %d C"
+              % (ind, round(sum(temps) / len(temps)), max(temps)))
 
 
 def cmd_catalog(args):

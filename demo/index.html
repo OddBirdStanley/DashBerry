@@ -189,6 +189,8 @@
 
     <div class="grp">
       UNITS <select id="units"><option>MPH</option><option>KMH</option></select>
+      <span style="color:var(--dim);font-size:11.5px">(the card's installed
+        default — a PAGE 3 choice outranks it)</span>
       <label class="row"><input type="checkbox" id="rfjoin">
         RF_JOIN=1 card (arms the 5 s button-A JOIN WIFI hold)</label>
       <button class="act" id="restart">restart panel daemon</button>
@@ -249,6 +251,7 @@ const sim = {
     /* rfkill soft-block + operstate stand-in, and the rf-ctl children it
      * serves. A fresh boot is always RF-KILLED, like the real card. */
     rfBlocked: true, rfLinked: false, pending: [], events: 0,
+    settingsFile: null,            /* /data/settings.conf; survives a reboot */
 };
 
 const logEl = $("log");
@@ -291,6 +294,14 @@ const hw = {
     logEvent: () => { sim.events++;
                       logLine("health log: event marker appended", true);
                       return true; },
+    /* /data/settings.conf (the PAGE 3+ choices). sim.settingsFile survives
+     * a panel reboot in this harness exactly as the file survives one on
+     * the card — it is the whole point of the page. */
+    settingsLoad: () => sim.settingsFile,
+    settingsSave: (text) => { sim.settingsFile = text;
+                              logLine("settings saved: " +
+                                      text.trim().replace(/\n/g, "  "), true);
+                              return true; },
     present: (view) => blit(view),
     notify: (msg) => { if (msg === "READY=1") logLine("sd_notify: READY=1"); },
     log: (msg) => logLine(msg, true),
@@ -445,7 +456,8 @@ setInterval(() => {
             ? `${s.gps.lat.toFixed(5)}, ${s.gps.lon.toFixed(5)} @ ${s.gps.knots.toFixed(1)} kn`
             : "no fix"],
         ["free", `${s.df_pct.toFixed(2)} %`],
-        ["burn shift", `idx ${s.burn_idx} (yoff ${s.yoff}) — PAGE 0 only`],
+        ["burn shift", `idx ${s.burn_idx} (yoff ${s.yoff}) — PAGE 0 / Always On`],
+        ["settings", s.settings.map(x => `${x.key}=${x.value}`).join("  ")],
         ["repaints", `${s.repaints} (change-only, 5 Hz cap)`],
         ["watchdog pets", s.watchdog_pets],
         ["events marked", sim.events],

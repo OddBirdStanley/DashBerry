@@ -218,8 +218,27 @@ const KEY = { UP: 0, DOWN: 1, LEFT: 2, RIGHT: 3, CENTER: 4, A: 5, B: 6 };
 const KEY_GPIO = [17, 22, 27, 23, 4, 5, 6];
 
 const BURN_OFFSETS = [0, 1, 0, -1];
-const PAGES = [1, 2];              /* wake order: index 0 is PAGE 1 */
+
+/* Settings (PAGE 3+), ported from the C's settings[] table: one persistent
+ * multiple-choice setting per page — the name on line 1 as written, the
+ * choices right-aligned below it, the live one under an INVERTED bar
+ * (JW-1's shape). UP/DOWN move the bar, and moving it IS the change.
+ * Adding a setting = a row here + its page number in PAGES. */
+const OPT_ROWS = ROWS - 1;         /* choice rows: everything below the name */
+const OPT_COLS = COLS - 1;         /* right-aligned field: clears the glyph */
+const SETTINGS = [
+    { key: "speed_unit", name: "Speed Unit", opts: ["MPH", "KMH"] },
+    { key: "always_on",  name: "Always On",  opts: ["Off", "On"] },
+];
+const SET_UNITS = 0, SET_ALWAYS_ON = 1;
+const SET_PAGE_FIRST = 3;
+
+/* Wake order: index 0 is PAGE 1; PAGE 3+ are the settings pages, one per
+ * SETTINGS row in table order (the C has a _Static_assert here). */
+const PAGES = [1, 2, SET_PAGE_FIRST, SET_PAGE_FIRST + 1];
 const NPAGES = PAGES.length;
+if (NPAGES !== 2 + SETTINGS.length)
+    throw new Error("every setting needs a page in PAGES");
 
 function create(hw) {
 
@@ -231,6 +250,89 @@ function create(hw) {
     /* conf (load_conf) */
     let speed_factor = 1.15078;    /* knots -> mph (default) */
     let speed_unit   = "MPH";
+
+    /* Live values of SETTINGS, as indices into each opts[]. The C keeps
+     * these in the table itself; here the table is module-level (shared by
+     * every create()), so the values live per instance.
+     *
+     * Persistence is /data/settings.conf in the C. The hw hooks are
+     * OPTIONAL: a harness that provides neither gets a panel whose settings
+     * survive within the run but not across a reboot — enough to exercise
+     * the UI, and the harnesses that care inject the pair. */
+    const set_value = SETTINGS.map(() => 0);
+    let settings_loaded = false;
+
+    function setting_is(idx, opt) {
+        return SETTINGS[idx].opts[set_value[idx]] === opt;
+    }
+
+    /* Push settings into the code that caches them (the C's
+     * settings_apply): PAGE 1's speed conversion is the only one so far —
+     * "Always On" is read where it acts, in the blank timer. */
+    function settings_apply() {
+        if (setting_is(SET_UNITS, "KMH")) {
+            speed_factor = 1.852;      /* knots -> km/h */
+            speed_unit = "KMH";
+        } else {
+            speed_factor = 1.15078;    /* knots -> mph */
+            speed_unit = "MPH";
+        }
+    }
+
+    function settings_load() {
+        if (!hw.settingsLoad)
+            return true;               /* no store: defaults stand */
+        const text = hw.settingsLoad();
+        if (text === null)
+            return true;               /* never been set */
+        for (const line of String(text).split("\n")) {
+            const eq = line.indexOf("=");
+            if (eq < 0)
+                continue;
+            const key = line.slice(0, eq), val = line.slice(eq + 1);
+            const i = SETTINGS.findIndex(s => s.key === key);
+            if (i < 0)
+                continue;
+            const o = SETTINGS[i].opts.indexOf(val);
+            if (o >= 0)
+                set_value[i] = o;      /* unknown text: default stands */
+        }
+        return true;
+    }
+
+    function settings_save() {
+        if (!hw.settingsSave)
+            return;
+        hw.settingsSave(SETTINGS.map((s, i) => s.key + "=" + s.opts[set_value[i]])
+                                .join("\n") + "\n");
+    }
+
+    /* The setting a page number owns, or -1 for the fixed pages 0/1/2. */
+    function page_setting(page) {
+        const i = page - SET_PAGE_FIRST;
+        return i >= 0 && i < SETTINGS.length ? i : -1;
+    }
+
+    /* Visible choice window; derived from the value alone, so the frame
+     * stays a pure function of state (repaint-on-change depends on it). */
+    function setting_top(idx) {
+        const n = SETTINGS[idx].opts.length;
+        if (n <= OPT_ROWS)
+            return 0;
+        return Math.max(0, Math.min(n - OPT_ROWS,
+                                    set_value[idx] - (OPT_ROWS >> 1)));
+    }
+
+    /* Clamps at the ends like JW-1's list; every accepted move applies and
+     * persists at once — nothing is ever staged. */
+    function setting_move(idx, delta) {
+        const v = set_value[idx] + delta;
+        if (v < 0 || v >= SETTINGS[idx].opts.length || v === set_value[idx])
+            return;
+        set_value[idx] = v;
+        settings_apply();
+        settings_save();
+    }
     let rf_join      = false;      /* RF_JOIN=1: JOIN WIFI armed. 0 = the 5 s
                                       button-A hold does nothing, as before */
 
@@ -320,6 +422,14 @@ function create(hw) {
                        (now - gps.last_nmea_ms) <= GPS_SILENT_MS;
         health.timeok = hw.rtcOk();
         health.storage = storage_ok();
+        /* Settings live on /data, which carries nofail and so may still
+         * have been mounting when the panel started: retry until it
+         * answers, and only believe "no file" once storage is provably
+         * there (settings_loaded in the C). */
+        if (!settings_loaded) {
+            settings_loaded = settings_load() && health.storage;
+            settings_apply();
+        }
         read_cpu_temp();           /* 1 Hz, off the 5 Hz paint path */
         read_throttled();
         rf_refresh();              /* glyph truth, not a health state */
@@ -707,6 +817,7 @@ function create(hw) {
             return;
         }
         ui.last_key_ms = now;
+        const set = page_setting(PAGES[ui.page_idx]);
         if (key === KEY.LEFT)
             ui.page_idx = (ui.page_idx + NPAGES - 1) % NPAGES;
         else if (key === KEY.RIGHT)
@@ -715,8 +826,11 @@ function create(hw) {
             ui.a_down_ms = now;    /* 5 s hold = JOIN WIFI, fired from the
                                       tick; short presses stay reserved */
             ui.a_fired = false;
+        } else if (set >= 0 && (key === KEY.UP || key === KEY.DOWN)) {
+            setting_move(set, key === KEY.UP ? -1 : 1);
         }
-        /* UP, DOWN, CENTER: reserved — wake/reset-timer only */
+        /* UP, DOWN (off a settings page), CENTER: reserved — wake/
+           reset-timer only */
     }
 
     /* ------------------------------------------------------- rendering -- */
@@ -793,9 +907,14 @@ function create(hw) {
             return f;
         }
 
+        /* Burn-in shift: PAGE 0 is static for as long as the fault lasts,
+         * and with Always On so is every page — same risk, same ±1 px. */
+        if (ui.error ||
+            (setting_is(SET_ALWAYS_ON, "On") && ui.screen === SCR.PAGE))
+            f.yoff = BURN_OFFSETS[ui.burn_idx];
+
         if (ui.error) {
             /* PAGE 0 — static, only failing groups, empty lines omitted */
-            f.yoff = BURN_OFFSETS[ui.burn_idx];
             f.rows[0] = "Errors:";
             let r = 1;
             if (!health.front || !health.rear)
@@ -808,6 +927,22 @@ function create(hw) {
                               (health.timeok ? "" : "TIME");
             if (!health.storage && r < ROWS)
                 f.rows[r++] = "SD FULL";
+            return f;
+        }
+
+        /* PAGE 3+ — a settings page: name on line 1 (left, as written),
+         * choices right-aligned under it, the live one under a bar that
+         * stops one column short of the glyph cell. */
+        const set = page_setting(PAGES[ui.page_idx]);
+        if (set >= 0) {
+            f.rows[0] = SETTINGS[set].name;
+            const n = SETTINGS[set].opts.length, top = setting_top(set);
+            for (let r = 0; r < OPT_ROWS && top + r < n; r++) {
+                const o = SETTINGS[set].opts[top + r];
+                f.rows[r + 1] = " ".repeat(Math.max(0, OPT_COLS - o.length)) + o;
+                if (top + r === set_value[set])
+                    f.inv[r + 1] = (1 << OPT_COLS) - 1;
+            }
             return f;
         }
 
@@ -928,13 +1063,12 @@ function create(hw) {
 
     /* main() before the loop: conf, first health pass, honest boot state. */
     function boot(units, rfJoin) {
-        if (units === "KMH") {     /* load_conf() */
-            speed_factor = 1.852;
-            speed_unit = "KMH";
-        } else {
-            speed_factor = 1.15078;
-            speed_unit = "MPH";
-        }
+        /* load_conf(): UNITS is only the INSTALLED DEFAULT for the PAGE 3
+         * setting — whatever the user last chose outranks it, and lands on
+         * top from the first eval_health once /data has answered. */
+        set_value[SET_UNITS] = units === "KMH" ? 1 : 0;
+        settings_loaded = false;   /* a restart re-reads /data */
+        settings_apply();
         rf_join = !!rfJoin;        /* RF_JOIN= in dashberry.conf */
         const now = hw.now();
         ui.screen = SCR.PAGE;
@@ -1011,7 +1145,11 @@ function create(hw) {
             now - ui.last_key_ms >= JW_IDLE_MS)
             jw_exit(now, false);
 
+        /* AUTO-BLANK, unless PAGE 4's "Always On" is set — that setting
+         * exists to keep the panel readable while driving, so it outranks
+         * the 10 s timer (the burn-in shift takes over as mitigation). */
         if (ui.screen === SCR.PAGE && !ui.error && !ui.blanked &&
+            !setting_is(SET_ALWAYS_ON, "On") &&
             now - ui.last_key_ms >= BLANK_MS)
             ui.blanked = true;
 
@@ -1063,10 +1201,16 @@ function create(hw) {
                 page: ui.screen !== SCR.PAGE ? null
                                              : (ui.error ? 0 : PAGES[ui.page_idx]),
                 burn_idx: ui.burn_idx,
-                yoff: ui.error ? BURN_OFFSETS[ui.burn_idx] : 0,
-                blank_in_ms: ui.error || ui.blanked || ui.screen !== SCR.PAGE
+                yoff: ui.error || (setting_is(SET_ALWAYS_ON, "On") &&
+                                   ui.screen === SCR.PAGE)
+                      ? BURN_OFFSETS[ui.burn_idx] : 0,
+                blank_in_ms: ui.error || ui.blanked ||
+                             ui.screen !== SCR.PAGE ||
+                             setting_is(SET_ALWAYS_ON, "On")
                              ? null
                              : Math.max(0, BLANK_MS - (hw.now() - ui.last_key_ms)),
+                settings: SETTINGS.map((s, i) => ({ key: s.key, name: s.name,
+                                                    value: s.opts[set_value[i]] })),
                 health: { ...health },
                 rf_join, rf_state,
                 jw: {
@@ -1088,7 +1232,8 @@ function create(hw) {
 }
 
 return { create, KEY, KEY_GPIO, XRES, YRES, COLS, ROWS,
-         TICK_MS, BLANK_MS, STALE_MS, GPS_SILENT_MS,
+         SETTINGS, SET_PAGE_FIRST, OPT_COLS,
+         TICK_MS, BLANK_MS, BURN_STEP_MS, STALE_MS, GPS_SILENT_MS,
          EVENT_HOLD_MS, RF_HOLD_MS, STAGE_HOLD_MS, JW_IDLE_MS,
          SCAN_TO_MS, CONNECT_TO_MS,
          G_LDOTS, G_SPACE, G_CAPS_OFF, G_CAPS_ON, G_DEL,

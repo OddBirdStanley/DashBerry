@@ -163,6 +163,7 @@ or manual configuration is ever needed.
 | `--debug` | build a DEBUG card — writable OS, journal kept and persistent, `--wifi` profile kept so it rejoins the LAN every boot. Requires `--auth`; JOIN WIFI is not armed (the card already knows a network) |
 | `--wifi SSID:PSK` | run the first boot over Wi-Fi instead of Ethernet; setup-only on a production card (the installer wipes the profile, DHCP leases and logs before the OS locks read-only), kept on a debug card |
 | `--wifi-country CC` | two-letter regulatory domain, required with `--wifi` and on a JOIN WIFI card (a stock image keeps Wi-Fi blocked without one) |
+| `--invert-front`, `--invert-rear` | that camera is mounted upside down — its video is flipped vertically at capture, so recordings are upright |
 
 Both bypass options default to off. With neither `--auth` nor `--debug` the
 card is a SEALED production card — no account, no SSH, no radios.
@@ -175,8 +176,12 @@ Operation is hands-off: ignition on → recording within ~20 s; ignition off →
 hard power cut, absorbed by design. The panel shows live
 latitude/longitude/speed/free-space when healthy, blanks after 10 s, and
 switches to a static error screen (`FRONT`, `REAR`, `GPS`, `TIME`,
-`SD FULL`) when a component fails. LEFT/RIGHT cycle to a second page with
-SoC temperature and firmware power status; holding B for ~2 s marks the
+`SD FULL`) when a component fails. LEFT/RIGHT cycle through three more
+pages: SoC temperature and firmware power status, then two settings —
+**Speed Unit** (MPH/KMH) and **Always On** (keep the panel lit instead of
+blanking after 10 s). On a settings page UP/DOWN pick the choice; the
+highlighted line is the live one, and the card remembers it across
+reboots. Holding B for ~2 s marks the
 moment as an event, on any screen the panel is currently showing. The
 bottom-right glyph reports the radios: shield = blocked (how every card
 boots), bare antenna = on but not connected, antenna with waves =
