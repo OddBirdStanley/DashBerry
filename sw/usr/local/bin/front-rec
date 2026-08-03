@@ -49,15 +49,31 @@ TAIL=$(ls "$OUT" 2>/dev/null | grep -E '^[0-9]+\.mp4$' | sort -n | tail -1)
 # splitmuxsink-fragment-closed with the file's true duration; we patch the
 # boxes the moment each file closes. stdbuf keeps -m line-buffered so the
 # patch happens within the second, not 4 KB of messages later.
-# Focus is pinned at the hyperfocal position (--autofocus-mode manual with
-# --lens-position default = rpicam's hyperfocal setting): a dashcam lens must
-# never hunt — rain/dirt on the windshield sits far inside the minimum focus
-# distance and continuous AF would pull focus off the road for it; footage
-# should be sharp from hood to infinity, day and night.
+# Focus is pinned, never hunting: rain and dirt on the windshield sit far
+# inside the lens's minimum focus distance, and continuous AF would pull
+# focus off the road to chase them.
+#
+# WHAT IT IS PINNED TO changed (fixed: every clip was soft). It used to be
+# `--lens-position default`, which reads as "the sensible default" but is
+# not the hyperfocal distance: rpicam-apps passes the LensPosition control's
+# DEFAULT VALUE, which comes from the camera tuning file's AF range — on the
+# IMX708 that is ~1.0 dioptre, i.e. a lens focused at ONE METRE. Everything
+# a dashcam actually films is 5 m to infinity, wide open at night with the
+# shallowest depth of field of the day: permanently, uniformly soft footage,
+# and nothing on the panel to say so. FRONT_LENS_DIOPTRE is an explicit
+# reciprocal distance instead, 0.0 = infinity by default (VERIFY on bench:
+# sharp hood->infinity; 0.4 buys near-field at the cost of the far end).
+#
+# INVERT_FRONT=1 (dashberry-install --invert-front): the camera is mounted
+# upside down, so flip vertically AT CAPTURE — the ISP does it for free and
+# the recorded file is upright, which means every later consumer (the panel's
+# health check, dashberry-cli render, any player) needs to know nothing.
+[ "${INVERT_FRONT:-0}" = 1 ] && FLIP=--vflip || FLIP=
 rpicam-vid -t 0 -n \
     --width "$FRONT_W" --height "$FRONT_H" --framerate "$FRONT_FPS" \
     --bitrate "$FRONT_BITRATE" --intra "$FRONT_FPS" \
-    --autofocus-mode manual --lens-position default \
+    --autofocus-mode manual --lens-position "${FRONT_LENS_DIOPTRE:-0.0}" \
+    $FLIP \
     --codec libav --libav-format mpegts -o - |
 stdbuf -oL gst-launch-1.0 -e -m fdsrc fd=0 \
     ! tsdemux \
