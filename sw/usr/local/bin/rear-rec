@@ -50,10 +50,19 @@ TAIL=$(ls "$OUT" 2>/dev/null | grep -E '^[0-9]+\.mp4$' | sort -n | tail -1)
 # The -m watcher patches each closed segment's declared duration (mvhd/mehd)
 # — v4l2src's running time also grows continuously across segments, so the
 # same qtmux absolute-duration bug applies here; details in front-rec.
+#
+# INVERT_REAR=1 (dashberry-install --invert-rear): the camera is mounted
+# upside down. Unlike the front (where the ISP flips for free), this one
+# costs a videoflip element between the decoder and the encoder — a row
+# reversal on already-decoded I420, cheap next to the software jpegdec
+# that is already in the chain, and nothing in the UVC gadget is asked to
+# change (the Zero's image stays untouched, per the project rule). Rear
+# footage lands upright, so every downstream consumer stays ignorant.
+[ "${INVERT_REAR:-0}" = 1 ] && FLIP='videoflip method=vertical-flip !' || FLIP=
 stdbuf -oL gst-launch-1.0 -e -m v4l2src device="$REAR_CAM_DEV" \
     ! "image/jpeg,width=$REAR_W,height=$REAR_H,framerate=$REAR_FPS/1" \
     ! jpegdec \
-    ! v4l2h264enc extra-controls="controls,video_bitrate=$REAR_BITRATE,h264_i_frame_period=$REAR_FPS" \
+    ! $FLIP v4l2h264enc extra-controls="controls,video_bitrate=$REAR_BITRATE,h264_i_frame_period=$REAR_FPS" \
     ! "video/x-h264,level=(string)4" \
     ! h264parse \
     ! splitmuxsink location="$OUT/%05d.mp4" \

@@ -62,6 +62,8 @@ Usage: sudo dashberry-install [options] <image> <device>
 Options:
   --bypass-time     ignore DS3231 from system requirement and use GPS for time calibration
   --bypass-rear     ignore rear camera from system requirement
+  --invert-front    front camera is mounted upside down: flip its video
+  --invert-rear     rear camera is mounted upside down: flip its video
   --root-size GIB   OS partition size in GiB (default: 8)
   --auth NAME:PASS  create this account (+ sshd). On its own it also arms
                     JOIN WIFI on the panel (needs --wifi-country)
@@ -85,6 +87,8 @@ MIN_DATA_BYTES=$((1024 * 1024 * 1024))    # refuse a /data smaller than 1 GiB
 
 BYPASS_TIME=0
 BYPASS_REAR=0
+INVERT_FRONT=0
+INVERT_REAR=0
 ROOT_GIB=8
 DEBUG=0
 AUTH=0
@@ -101,6 +105,8 @@ while [ $# -gt 0 ]; do
     case $1 in
         --bypass-time) BYPASS_TIME=1 ;;
         --bypass-rear) BYPASS_REAR=1 ;;
+        --invert-front) INVERT_FRONT=1 ;;
+        --invert-rear)  INVERT_REAR=1 ;;
         --root-size)   shift; ROOT_GIB=${1:-} ;;
         --debug)       DEBUG=1 ;;
         --auth)        shift; AUTH=1; USERSPEC=${1:-} ;;
@@ -208,14 +214,16 @@ echo
 echo "    image : $IMG"
 echo "    layout: boot | OS ${ROOT_GIB} GiB$( [ $DEBUG = 0 ] && echo ' (read-only)' ) | /data"
 if [ "$DEBUG" = 1 ]; then
-    echo "    mode  : debug (user '${USERSPEC%%:*}' + ssh)"
+    echo "    mode  : debug"
 elif [ "$RF_JOIN" = 1 ]; then
-    echo "    mode  : production + JOIN WIFI (user '${USERSPEC%%:*}' + ssh)"
+    echo "    mode  : production (ssh enabled)"
 else
     echo "    mode  : production (sealed)"
 fi
 [ "$BYPASS_TIME" = 1 ] && echo "    bypass: TIME"
 [ "$BYPASS_REAR" = 1 ] && echo "    bypass: REAR"
+[ "$INVERT_FRONT" = 1 ] && echo "    invert: FRONT (camera mounted upside down)"
+[ "$INVERT_REAR" = 1 ] && echo "    invert: REAR (camera mounted upside down)"
 if [ "$FIRSTBOOT_WIFI" = 1 ]; then
     echo "    wifi  : $WIFI_SSID ($WIFI_CC)"
 fi
@@ -375,6 +383,15 @@ cp -a "$SWDIR" "$MNT/opt/dashberry/sw"
 # Docs stay on the PC — the payload ships code only (README.md is
 # gitignored dev documentation, not part of the runtime).
 rm -f "$MNT/opt/dashberry/sw/README.md"
+# cp -a copies the dev tree as it is, junk included. firstinstall now
+# survives stray files, but they still have no business on the card:
+#   - __pycache__ from running the PC-side tools over the tree;
+#   - src/dashberry-panel if it was built on this PC. That one is not
+#     cosmetic: it is an x86 binary, and make on the Pi would see it newer
+#     than dashberry-panel.c, skip the rebuild, and install a panel the
+#     card cannot execute.
+find "$MNT/opt/dashberry/sw" -name __pycache__ -type d -prune -exec rm -rf {} +
+rm -f "$MNT/opt/dashberry/sw/src/dashberry-panel"
 # Bypass and mode flags ride in the payload's conf — the one the
 # firstinstall step installs to /etc — so the panel (which bakes the
 # shield/wireless glyph off DEBUG) and firstinstall read the same truth.
@@ -383,6 +400,15 @@ if [ "$BYPASS_TIME" = 1 ]; then
 fi
 if [ "$BYPASS_REAR" = 1 ]; then
     sed -i 's/^BYPASS_REAR=0/BYPASS_REAR=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
+fi
+# Mounting orientation: the recorders flip at capture, so the files on the
+# card are upright and nothing downstream has to know which way the camera
+# was screwed to the glass.
+if [ "$INVERT_FRONT" = 1 ]; then
+    sed -i 's/^INVERT_FRONT=0/INVERT_FRONT=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
+fi
+if [ "$INVERT_REAR" = 1 ]; then
+    sed -i 's/^INVERT_REAR=0/INVERT_REAR=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
 fi
 if [ "$DEBUG" = 1 ]; then
     sed -i 's/^DEBUG=0/DEBUG=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
