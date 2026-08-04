@@ -11,9 +11,10 @@ Stdlib only; ffmpeg/ffprobe are invoked as subprocesses for all heavy lifting.
 Subcommands:
   catalog  one line per DRIVE (= per-boot session directory); --verbose adds
            distance / average / top speed and button-B event markers
-  render   continuous boot-to-shutdown video of one drive (footage holes
-           become black "No Signal" filler, GPS trouble is labeled from
-           the health log; --annotate burns time/position/speed);
+  render   continuous boot-to-shutdown video of one drive (footage holes —
+           including segments ffprobe cannot read — become black "No
+           Signal" filler, GPS trouble is labeled from the health log;
+           --annotate burns time/position/speed);
            --camera both-prio-* composites the other camera picture-in-
            picture. Always a re-encode — near-transparent x264 settings
   gpx      GPX 1.0 track (native <speed>, m/s) from the session NMEA log
@@ -54,6 +55,10 @@ CAM_FALLBACK_WH = {"front": (1920, 1080), "rear": (1280, 720)}
 
 def die(msg):
     sys.exit("dashberry-cli: " + msg)
+
+
+def warn(msg):
+    sys.stderr.write("dashberry-cli: " + msg + "\n")
 
 
 def sessions(data):
@@ -216,18 +221,32 @@ def spans_subtract(spans, minus):
     return [(a, b) for a, b in out if b - a > 0.2]
 
 
-def ffprobe_duration(path):
+# A file ffprobe cannot read is a broken SEGMENT, not a broken install, and
+# the two used to be one fatal error: a card pulled after a power cut ends
+# its last session with a zero-length or header-less fragment (the recorder
+# never got to finalize it), and that one file aborted the whole render —
+# the drive you most wanted to look at is exactly the one that ends badly.
+# So the probes take fatal=False and answer None, and callers treat an
+# unreadable file as footage that is not there: the timeline covers it with
+# "No Signal" filler like any other hole. ffprobe *itself* missing stays
+# fatal — that is the broken install, and no amount of skipping fixes it.
+
+def ffprobe_duration(path, fatal=True):
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             capture_output=True, text=True, check=True).stdout.strip()
         return float(out)
-    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
-        die("ffprobe failed on %s (is ffmpeg installed?)" % path)
+    except FileNotFoundError:
+        die("ffprobe not found (is ffmpeg installed?)")
+    except (subprocess.CalledProcessError, ValueError):
+        if fatal:
+            die("ffprobe failed on %s" % path)
+        return None
 
 
-def ffprobe_wh(path):
+def ffprobe_wh(path, fatal=True):
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
@@ -235,8 +254,12 @@ def ffprobe_wh(path):
             capture_output=True, text=True, check=True).stdout.strip()
         w, h = out.split(",")
         return int(w), int(h)
-    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
-        die("ffprobe failed on %s (is ffmpeg installed?)" % path)
+    except FileNotFoundError:
+        die("ffprobe not found (is ffmpeg installed?)")
+    except (subprocess.CalledProcessError, ValueError):
+        if fatal:
+            die("ffprobe failed on %s" % path)
+        return None
 
 
 def parse_hms(s):
@@ -265,10 +288,15 @@ def drive_start(data, session):
     duration) of both cameras and the first RMC fix. None if no evidence."""
     starts = []
     for cam in ("front", "rear"):
-        segs = segments(data, session, cam)
-        if segs:
-            p, mt = segs[0]
-            starts.append(mt - ffprobe_duration(p))
+        # First segment that actually probes: segments() is sorted, so that
+        # is this camera's earliest surviving evidence. An unreadable one is
+        # skipped rather than fatal — catalog must still list a drive whose
+        # tail fragment was truncated by a power cut.
+        for p, mt in segments(data, session, cam):
+            dur = ffprobe_duration(p, fatal=False)
+            if dur is not None:
+                starts.append(mt - dur)
+                break
     fixes = parse_rmc(nmea_path(data, session))
     if fixes:
         starts.append(fixes[0][0])
@@ -436,7 +464,11 @@ def cam_segments_abs(data, session, cam):
     (mtime is the segment END — see module docstring)."""
     out = []
     for path, mtime in segments(data, session, cam):
-        dur = ffprobe_duration(path)
+        dur = ffprobe_duration(path, fatal=False)
+        if dur is None:
+            warn("skipping unreadable segment %s (rendered as No Signal)"
+                 % path)
+            continue
         out.append((path, mtime - dur, dur))
     out.sort(key=lambda s: s[1])
     return out
@@ -560,6 +592,10 @@ def cmd_render(args):
         cams = [args.camera]
 
     segs = {c: cam_segments_abs(data, session, c) for c in cams}
+    # Re-count the directory (no probing) to report what was dropped: a
+    # render that silently covers a broken segment with filler looks the
+    # same as one where the camera really was down.
+    n_bad = sum(len(segments(data, session, c)) - len(segs[c]) for c in cams)
     fixes = parse_rmc(nmea_path(data, session))
     health = parse_health(health_path(data, session))
 
@@ -584,8 +620,8 @@ def cmd_render(args):
         die("requested range is empty")
 
     def cam_wh(cam):
-        return (ffprobe_wh(segs[cam][0][0]) if segs[cam]
-                else CAM_FALLBACK_WH[cam])
+        wh = ffprobe_wh(segs[cam][0][0], fatal=False) if segs[cam] else None
+        return wh or CAM_FALLBACK_WH[cam]
 
     input_args, filter_lines = [], []
     idx = 0
@@ -636,8 +672,9 @@ def cmd_render(args):
             die("ffmpeg not found")
         except subprocess.CalledProcessError as e:
             die("ffmpeg failed (%d)" % e.returncode)
-    print("wrote %s (%s span %s, %d segments, %d filler pieces)"
-          % (args.output, args.camera, fmt_span(hi - lo), idx, n_fill))
+    print("wrote %s (%s span %s, %d segments, %d filler pieces%s)"
+          % (args.output, args.camera, fmt_span(hi - lo), idx, n_fill,
+             ", %d unreadable segments skipped" % n_bad if n_bad else ""))
 
 
 # ------------------------------------------------------------------- gpx --
