@@ -82,9 +82,20 @@ done
 # Full rpicam-apps (not -lite): front-rec needs the libav encoder wrapper
 # (--codec libav --libav-format mpegts) so PTS/DTS travel in-band down the
 # pipe — the lite build is compiled without libav.
+#
+# util-linux-extra carries `hwclock`, which since bookworm is NOT in
+# util-linux and is absent from the stock Lite image. Field-observed
+# 2026-08-04: `hwclock` was simply not on the card, so the `hwclock -w`
+# below exited 127 and the else-branch warning fired — the DS3231 was never
+# written, whether or not it was fitted — and session-init's RTC re-read
+# (`hwclock -s`) was dead code at every boot besides. This apt step is the
+# only moment the card is online, so a binary missing here is missing for
+# the life of the card. util-linux is named alongside it so the pair reads
+# as one stated requirement rather than an assumed base package.
 apt-get install -y --no-install-recommends \
     rpicam-apps gstreamer1.0-tools gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad gpsd gpsd-clients chrony gcc make
+    gstreamer1.0-plugins-bad gpsd gpsd-clients chrony gcc make \
+    util-linux util-linux-extra
 
 echo "building panel daemon..."
 make -C src
