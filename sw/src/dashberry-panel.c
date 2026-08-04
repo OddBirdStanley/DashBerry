@@ -507,6 +507,7 @@ static void draw_char(int col, int row, char ch, int yoff, bool inv)
 static double      speed_factor = 1.15078;   /* knots -> mph (default) */
 static const char *speed_unit   = "MPH";
 static bool        bypass_time;    /* BYPASS_TIME=1: installed without DS3231 */
+static long long   clock_floor;    /* CLOCK_FLOOR: epoch the card cannot predate */
 static bool        bypass_rear;    /* BYPASS_REAR=1: installed without rear cam */
 static bool        rf_join;        /* RF_JOIN=1: JOIN WIFI armed (an --auth
                                       card without --debug). 0 = the 5 s
@@ -660,6 +661,10 @@ static void load_conf(void)
             bypass_rear = line[12] == '1';
         } else if (strncmp(line, "RF_JOIN=", 8) == 0) {
             rf_join = line[8] == '1';
+        } else if (strncmp(line, "CLOCK_FLOOR=", 12) == 0) {
+            /* Shared with session-init so the panel and the session name
+             * can never disagree about what "implausible" means. */
+            clock_floor = strtoll(line + 12, NULL, 10);
         }
     }
     fclose(f);
@@ -973,10 +978,30 @@ static time_t newest_mp4_mtime(const char *base, const char *session)
     return newest;
 }
 
+/* TIME asks two questions of the DS3231, not one.
+ *
+ * Readable proves the rtc driver and the I2C device answer. It does NOT
+ * prove the value is right — a DS3231 that firstinstall never managed to
+ * set, or whose coin cell has died, answers perfectly with a well-formed
+ * 2000-01-01. That is not cosmetic: session-init mints every session name
+ * from that clock, retention deletes by oldest mtime and so eats the drive
+ * being recorded before it touches last month's, and nothing on an offline
+ * card ever corrects any of it. The fault is invisible until a card is
+ * pulled months later and the folder names are all wrong.
+ *
+ * So the value is tested against CLOCK_FLOOR — the same epoch session-init
+ * refuses to mint below (dashberry.conf). A dead cell lands on PAGE 0 the
+ * first time it matters, which is the one place the driver would see it.
+ * INVESTIGATE-TIMESTAMPS.md carries the full diagnosis. */
 static bool rtc_ok(void)
 {
     char buf[32];
-    return read_small(RTC_EPOCH, buf, sizeof buf) > 0 && isdigit((unsigned char)buf[0]);
+    if (read_small(RTC_EPOCH, buf, sizeof buf) <= 0 ||
+        !isdigit((unsigned char)buf[0]))
+        return false;              /* absent, unreadable, or not a number */
+    /* clock_floor == 0 means the key is absent from the conf (an older
+     * card): fall back to the readability-only test rather than fault. */
+    return clock_floor == 0 || strtoll(buf, NULL, 10) >= clock_floor;
 }
 
 /* Storage OK: /data mounted rw, statvfs free > 0, not remounted ro, and —
