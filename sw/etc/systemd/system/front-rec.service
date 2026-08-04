@@ -15,6 +15,12 @@ KillMode=control-group
 # -e on gst-launch turns SIGINT into EOS so the in-flight segment finalizes.
 KillSignal=SIGINT
 TimeoutStopSec=10
+# Finalizing the segment is not the same as declaring its duration: the
+# fragment-closed watcher that patches mvhd/tkhd is itself in the cgroup
+# being killed, so the last segment can lose the race and end up declaring
+# 0 (= plays as empty). Runs after the cgroup is dead, still ordered before
+# /data unmounts, and is a no-op when the watcher did win.
+ExecStopPost=/usr/local/bin/tail-repair current front
 
 [Install]
 WantedBy=dashberry.target

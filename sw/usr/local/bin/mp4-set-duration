@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""mp4-set-duration FILE DURATION_NS — rewrite a finished DashBerry segment's
-declared duration boxes in place.
+"""mp4-set-duration FILE {DURATION_NS|scan|repair} — rewrite a DashBerry
+segment's declared duration boxes in place.
 
 Works around a GStreamer 1.26 qtmux bug: in splitmuxsink's continuous-input
 reuse pattern, mvhd/mehd get the muxer's ABSOLUTE running time (time since
@@ -12,7 +12,24 @@ authoritative duration.
 
 Walks the box tree properly (no byte-scanning: fourcc strings can occur
 inside mdat payload) and patches: mvhd + mehd (movie level), and tkhd +
-mdhd (every track). Exit 0 on success."""
+mdhd (every track). Exit 0 on success.
+
+Modes:
+  DURATION_NS  the authoritative duration, straight from splitmuxsink's
+               fragment-closed message (the live recorder path).
+  scan         recover the duration from the sample tables (moof/traf/trun)
+               and patch unconditionally — for a file whose fragment-closed
+               message never fired.
+  repair       same, but first read the DECLARED duration out of the file's
+               head and do nothing when it is already plausible. This is the
+               sweep path (tail-repair): it must look at every session on
+               the card without pulling gigabytes off it, so an untouched
+               file costs one short read instead of a full one.
+
+The file's mtime is preserved across a patch. Two things on this card read
+mtimes and would be misled by a repair sweep bumping them: the panel's
+recording-alive check (newest segment in the LIVE session vs STALE_SECS)
+and retention's delete-oldest-first ordering."""
 import sys, struct, os
 
 
@@ -40,6 +57,7 @@ def full_box(buf, body):
 
 
 def patch(path, dur_ns):
+    st = os.stat(path)
     with open(path, "r+b") as f:
         buf = bytearray(f.read())
         moov = None
@@ -96,17 +114,121 @@ def patch(path, dur_ns):
         if mvhd_timescale is None:
             raise SystemExit(f"{path}: no mvhd box")
         # Already-correct fields are left unwritten: the recorders' startup
-        # tail re-scan hits a correct file on every service restart, and a
-        # rewrite would bump its mtime — which the panel reads as
-        # "recording alive" (newest-segment mtime vs STALE_SECS), so a
-        # crash-looping recorder would pin its health OK forever.
+        # tail re-scan, and the boot sweep, both hit already-correct files
+        # routinely, and there is no reason to touch the card for them.
         patched = 0
         for off, data in writes:
             if buf[off:off + len(data)] != data:
                 f.seek(off)
                 f.write(data)
                 patched += 1
+        if patched:
+            # The shutdown path patches the tail as the machine is going
+            # down: a few hundred bytes, and no reason to leave them
+            # depending on the journal commit that may not come.
+            f.flush()
+            os.fsync(f.fileno())
+    if patched:
+        # Restore the mtime we just bumped (see the module docstring): the
+        # panel's liveness check and retention's ordering both read it, and
+        # neither should see a repaired segment as freshly written.
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
     return patched
+
+
+MOOV_PREFIX = 1 << 18   # 256 KiB — ftyp+moov are the first few KiB of a
+                        # fragmented MP4, so this always covers them
+
+
+def declared_durations_ns(path):
+    """EVERY duration the file declares — mvhd, mehd, and each track's tkhd
+    and mdhd — normalized to ns, reading only the head of the file. Empty
+    list when no moov is reachable in the prefix (truncated, or moov at the
+    end: the caller then falls back to a full scan).
+
+    All four and not just mvhd, because patch() writes them as four separate
+    non-atomic writes, mvhd first: a power cut mid-patch leaves a file whose
+    mvhd is right and whose tkhd/mdhd are stale. Reading only mvhd would
+    call that file healthy and never look at it again."""
+    with open(path, "rb") as f:
+        buf = f.read(MOOV_PREFIX)
+    moov = None
+    for typ, off, hdr, body, end in boxes(buf, 0, len(buf)):
+        if typ == b"moov":
+            moov = (body, end)
+            break
+    if moov is None:
+        return []
+
+    out = []
+    movie_ts = None       # mvhd is moov's first child, so this is set before
+                          # the mehd/tkhd below need it (both are in movie
+                          # timescale); if it somehow is not, they are skipped
+                          # and the file reads as inconsistent, i.e. repaired.
+    for typ, off, hdr, body, end in boxes(buf, *moov):
+        if typ == b"mvhd":
+            ver, p = full_box(buf, body)
+            if ver == 1:
+                movie_ts = struct.unpack_from(">I", buf, p + 16)[0]
+                dur = struct.unpack_from(">Q", buf, p + 20)[0]
+            else:
+                movie_ts = struct.unpack_from(">I", buf, p + 8)[0]
+                dur = struct.unpack_from(">I", buf, p + 12)[0]
+            if movie_ts:
+                out.append(dur * 1_000_000_000 // movie_ts)
+        elif typ == b"mvex" and movie_ts:
+            for t2, o2, h2, b2, e2 in boxes(buf, body, end):
+                if t2 == b"mehd":
+                    ver, p = full_box(buf, b2)
+                    dur = struct.unpack_from(">Q" if ver == 1 else ">I", buf, p)[0]
+                    out.append(dur * 1_000_000_000 // movie_ts)
+        elif typ == b"trak":
+            for t2, o2, h2, b2, e2 in boxes(buf, body, end):
+                if t2 == b"tkhd" and movie_ts:
+                    ver, p = full_box(buf, b2)
+                    dur = (struct.unpack_from(">Q", buf, p + 24)[0] if ver == 1
+                           else struct.unpack_from(">I", buf, p + 16)[0])
+                    out.append(dur * 1_000_000_000 // movie_ts)
+                elif t2 == b"mdia":
+                    for t3, o3, h3, b3, e3 in boxes(buf, b2, e2):
+                        if t3 != b"mdhd":
+                            continue
+                        ver, p = full_box(buf, b3)
+                        if ver == 1:
+                            ts = struct.unpack_from(">I", buf, p + 16)[0]
+                            dur = struct.unpack_from(">Q", buf, p + 20)[0]
+                        else:
+                            ts = struct.unpack_from(">I", buf, p + 8)[0]
+                            dur = struct.unpack_from(">I", buf, p + 12)[0]
+                        if ts:
+                            out.append(dur * 1_000_000_000 // ts)
+    return out
+
+
+# A segment's declared duration is believable only if it is in a narrow band
+# AND the boxes agree with each other. All three ways it goes wrong fail one
+# of those:
+#   0          the muxer never finalized the file (power cut / SIGKILL) — the
+#              moov it wrote up front still says zero.
+#   >> 60 s    the muxer DID finalize, hitting the qtmux absolute-running-time
+#              bug this tool exists for, and nothing patched it afterwards.
+#   disagree   a patch was interrupted partway through its four writes.
+# (Segment 00000 is immune to the second one: for the first file the muxer's
+# absolute running time IS its duration, so it lands inside the band and is
+# left alone — correctly, because it is already right.)
+PLAUSIBLE_SLACK_NS = 30 * 10**9
+# Values we wrote all derive from one dur_ns and differ only by timescale
+# truncation, i.e. well under a millisecond. Anything above this is a real
+# disagreement, never rounding.
+CONSISTENT_SLACK_NS = 100 * 10**6
+
+
+def durations_are_plausible(durs, segment_ns):
+    if not durs:
+        return False
+    if max(durs) - min(durs) > CONSISTENT_SLACK_NS:
+        return False                      # half-patched
+    return 0 < min(durs) <= segment_ns + PLAUSIBLE_SLACK_NS
 
 
 def scan_duration_ns(path):
@@ -174,7 +296,17 @@ def scan_duration_ns(path):
 
 if __name__ == "__main__":
     if len(sys.argv) != 3:
-        raise SystemExit("usage: mp4-set-duration FILE {DURATION_NS|scan}")
-    dur = scan_duration_ns(sys.argv[1]) if sys.argv[2] == "scan" else int(sys.argv[2])
-    n = patch(sys.argv[1], dur)
-    print(f"{os.path.basename(sys.argv[1])}: patched {n} duration fields to {dur / 1e9:.3f}s")
+        raise SystemExit("usage: mp4-set-duration FILE {DURATION_NS|scan|repair}")
+    path, mode = sys.argv[1], sys.argv[2]
+    name = os.path.basename(path)
+    if mode == "repair":
+        # SEGMENT_NS comes from /etc/dashberry.conf via the caller's
+        # environment; the default matches the shipped 60 s segment.
+        segment_ns = int(os.environ.get("SEGMENT_NS") or 60 * 10**9)
+        declared = declared_durations_ns(path)
+        if durations_are_plausible(declared, segment_ns):
+            print(f"{name}: declares {min(declared) / 1e9:.3f}s, left alone")
+            raise SystemExit(0)
+    dur = scan_duration_ns(path) if mode in ("scan", "repair") else int(mode)
+    n = patch(path, dur)
+    print(f"{name}: patched {n} duration fields to {dur / 1e9:.3f}s")

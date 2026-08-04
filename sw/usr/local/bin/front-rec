@@ -18,8 +18,10 @@ START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.mp4$/ { if ($1 + 1 > s)
 # The previous run of THIS session may have died mid-segment (crash restart):
 # that tail file's fragments are fine but its declared duration was never
 # corrected (see below) — recover it from the sample tables before we start.
-TAIL=$(ls "$OUT" 2>/dev/null | grep -E '^[0-9]+\.mp4$' | sort -n | tail -1)
-[ -n "$TAIL" ] && mp4-set-duration "$OUT/$TAIL" scan || true
+# This covers a restart WITHIN this boot only. The tail left by the PREVIOUS
+# boot sits in a different session dir, which nothing here can see;
+# tail-repair.service sweeps those once at boot.
+tail-repair current front || true
 
 # Timestamps travel IN-BAND: the encoder's
 # own PTS/DTS ride the pipe inside an MPEG-TS container (--codec libav,

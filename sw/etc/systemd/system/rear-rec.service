@@ -15,6 +15,11 @@ RestartSec=2
 KillMode=control-group
 KillSignal=SIGINT
 TimeoutStopSec=10
+# Repair the in-flight segment's declared duration once the cgroup is dead
+# (the watcher that normally does it is inside that cgroup) — see
+# front-rec.service. `current rear` so a front-rec restart can never touch
+# a segment this recorder is still writing.
+ExecStopPost=/usr/local/bin/tail-repair current rear
 
 [Install]
 WantedBy=dashberry.target
