@@ -16,10 +16,14 @@ mkdir -p /run/dashberry
 # is before anything guarantees that clock is right. The DS3231 sets it when
 # its driver (a udev-loaded module) probes, and this unit is only ordered
 # after basic.target: usually the RTC wins, not always. Losing that race mints
-# a session named from whatever came before — on a read-only card that is
-# fake-hwclock restoring the install date, on a fresh one 1970 — and the wrong
-# name then outlives the drive (nothing revisits it). Details, and how to tell
-# the three timestamp faults apart on a pulled card: INVESTIGATE-TIMESTAMPS.md.
+# a session named from whatever came before — which, since firstinstall masks
+# fake-hwclock, is now 1970 and nothing else. That is deliberate: fake-hwclock
+# used to hand over a wrong-but-PLAUSIBLE time (the last save), and the floor
+# test below cannot see a clock that is merely hours off, so the fault stayed
+# invisible. An absurd clock trips the floor and announces itself; a plausible
+# one does not. The wrong name still outlives the drive (nothing revisits it).
+# Details, and how to tell the timestamp faults apart on a pulled card:
+# INVESTIGATE-TIMESTAMPS.md.
 clock_ok() { [ "$(date +%s)" -ge "${CLOCK_FLOOR:-0}" ]; }
 if ! clock_ok && [ "${BYPASS_TIME:-0}" != 1 ]; then
     # Re-read the RTC ourselves (same read the kernel does at probe) and give
@@ -37,8 +41,10 @@ if ! clock_ok; then
     # retention delete the newest footage first.
     echo "session-init: WARNING clock reads $(date -u '+%F %T') UTC, before the" >&2
     echo "  CLOCK_FLOOR sanity floor. This session's name and directory" >&2
-    echo "  timestamps will be wrong. Causes: a DS3231 that was never set or" >&2
-    echo "  has a dead cell, or a --bypass-time card with no GPS fix yet." >&2
+    echo "  timestamps will be wrong. Causes: a DS3231 that was never set" >&2
+    echo "  (not fitted when firstinstall ran — it is the only thing that" >&2
+    echo "  ever writes it) or has a dead cell, or a --bypass-time card with" >&2
+    echo "  no GPS fix yet. On the Pi: hwclock -r" >&2
 fi
 
 # Boot counter: atomic increment (tmp -> fsync -> rename), garbage-tolerant.

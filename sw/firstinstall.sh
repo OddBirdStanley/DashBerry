@@ -154,6 +154,35 @@ if [ "$BYPASS_TIME" = "1" ]; then
     printf 'makestep 1 -1\n' >> /etc/chrony/conf.d/gps-refclock.conf
 fi
 
+echo "disabling fake-hwclock..."
+# fake-hwclock is stock on Pi OS and is actively harmful on this card. At
+# boot it restores the last SAVED timestamp, so an offline card comes up
+# reading "real time as of the last save" — behind by the last partial hour
+# plus every minute the card has spent powered off since. That value is
+# wrong but PLAUSIBLE, and plausible is the one failure this card cannot
+# cope with: CLOCK_FLOOR (session-init) and the panel's TIME state both test
+# the clock against a FLOOR, not a window, so an error of hours sails past
+# both. The card then reports healthy while stamping every session name,
+# every directory mtime and every retention decision from a clock that
+# nothing ever set. Field-observed 2026-08-04 on a card whose DS3231
+# firstinstall never wrote (it was installed with the RTC unfitted): folder
+# names hours behind the satellites, and not one check on the card noticed.
+#
+# Removing it leaves no plausible fallback, which is exactly the point. A
+# card with an unset or dead DS3231 now boots at 1970, trips CLOCK_FLOOR,
+# and SAYS SO — in the journal from session-init and on PAGE 0 from the
+# panel — instead of looking fine for months. Retention is no worse off
+# either: install-dated segments already sorted older than real footage,
+# precisely as 1970-dated ones do.
+#
+# Masked rather than merely disabled, for the same reason as gpsdctl@ above:
+# a package upgrade or reinstall must not be able to quietly bring it back
+# on a debug card. --now first, so its ExecStop (`fake-hwclock save`) runs
+# before the file it would write is removed.
+systemctl disable --now fake-hwclock.service 2>/dev/null || true
+systemctl mask fake-hwclock.service 2>/dev/null || true
+rm -f /etc/cron.hourly/fake-hwclock /etc/fake-hwclock.data
+
 echo "fetching accurate time..."
 # This is the last moment the card is guaranteed online: a production card
 # boots read-only with no network, and the GPS refclock ships noselect — so
@@ -168,12 +197,17 @@ if chronyc waitsync 12 0.5 >/dev/null 2>&1; then
     elif hwclock -w; then
         echo "clock synced: $(date -u '+%F %T') UTC written to the DS3231"
     else
-        echo "WARNING: NTP synced but writing the DS3231 failed (hwclock -w);" >&2
-        echo "         check the i2c-rtc overlay / wiring before deploying." >&2
+        echo "WARNING: NTP synced but writing the DS3231 failed (hwclock -w)." >&2
+        echo "         Is the RTC actually FITTED? This is the only moment" >&2
+        echo "         anything ever writes it, and with fake-hwclock gone the" >&2
+        echo "         card now has NO wall clock at all: it will boot at 1970" >&2
+        echo "         and warn on every session. Check the i2c-rtc overlay /" >&2
+        echo "         wiring, then re-run:  hwclock -w && hwclock -r" >&2
     fi
 else
     echo "WARNING: no NTP sync after 2 min — system (and RTC) time may be" >&2
-    echo "         wrong. Fix before deploying:" >&2
+    echo "         wrong, and nothing offline ever corrects it. Fix before" >&2
+    echo "         deploying:" >&2
     echo "         date -u -s 'YYYY-mm-dd HH:MM:SS' && hwclock -w" >&2
 fi
 
