@@ -1,0 +1,167 @@
+#!/bin/sh
+# front-focus-check — bench tool: does the front lens actually MOVE?
+#
+# front-rec pins focus with `--autofocus-mode manual --lens-position
+# $FRONT_LENS_DIOPTRE`. That option is ACCEPTED whether or not the lens can
+# be driven: rpicam-apps only applies LensPosition `if
+# (camera_->controls().count(&controls::LensPosition) > 0)`, and libcamera
+# only advertises that control when the sensor's VCM (dw9807 on the IMX708)
+# probed and the tuning file carries an "rpi.af" section. Lose either and
+# the flag is a silent no-op — no error, no journal line, footage still
+# recorded, camera still "OK" on the panel.
+#
+# What a silent no-op looks like: an undriven IMX708 VCM parks at raw
+# position 512, which is ~+2.0 dioptres on the standard lens and **~+6.0 on
+# the WIDE lens this project specifies** — a lens focused at about 17 cm.
+# Every distance a dashcam films is then far outside depth of field, at
+# every aperture, day and night. The symptom is "evenly soft everywhere",
+# and it is indistinguishable by eye from a focus pinned to the wrong
+# distance — which is why this script measures instead of squinting.
+#
+# METHOD. Capture the same scene at a bracket of lens positions and compare
+# JPEG sizes at a FIXED quality. A JPEG's size is dominated by its
+# high-frequency content, so sharper frame => bigger file. The absolute
+# numbers mean nothing; the SPREAD across the bracket is the whole result:
+#
+#   sizes vary a lot, peaking at some position  -> the VCM works. Focus is
+#                                                  a tuning problem: set
+#                                                  FRONT_LENS_DIOPTRE to
+#                                                  the peak.
+#   sizes all within a few percent              -> the lens never moved.
+#                                                  The VCM is the fault, not
+#                                                  the value. Section (2)
+#                                                  above says which half.
+#
+# Shoot a WELL-LIT, DETAILED target (a bookshelf, a brick wall, printed
+# text) filling the frame — the proxy is confounded by sensor noise, which
+# is itself high-frequency, so a dim scene inflates every size equally and
+# flattens the spread into a false negative. Point at something several
+# metres away, which is where a dashcam lives.
+set -eu
+. /etc/dashberry.conf
+
+OUT=${1:-/data/focus-check}
+
+command -v rpicam-still >/dev/null 2>&1 || {
+    echo "front-focus-check: rpicam-still not installed (needs full rpicam-apps)" >&2
+    exit 1
+}
+
+# The camera is single-owner: rpicam-still cannot open it while front-rec
+# holds it. Stop the recorder, and put it back however we exit — including
+# on Ctrl-C, which is the likely way a bench session ends.
+RESTORE=0
+if systemctl is-active --quiet front-rec 2>/dev/null; then
+    echo "==> stopping front-rec for the duration (restored on exit)"
+    systemctl stop front-rec
+    RESTORE=1
+fi
+restore() { [ "$RESTORE" = 1 ] && systemctl start front-rec || true; }
+trap restore EXIT INT TERM
+
+mkdir -p "$OUT"
+
+echo
+echo "=== 1. which camera is actually attached ==============================="
+# The AF story is only the IMX708's. A fixed-focus module (an IMX219 clone,
+# say, or a Camera Module 2) has no VCM at all, and --lens-position is
+# CORRECTLY ignored — the lens is glued where it is and this whole
+# investigation ends here with "wrong part fitted".
+rpicam-hello --list-cameras 2>&1 | sed 's/^/    /' || true
+
+echo
+echo "=== 2. did the VCM (lens driver) probe? ================================"
+# The one check that separates "the value is wrong" from "the value never
+# reached the lens". The dw9807 registers its own v4l2 subdev, so its
+# presence is readable from sysfs without media-ctl.
+found=0
+for n in /sys/class/video4linux/v4l-subdev*/name; do
+    [ -e "$n" ] || continue
+    name=$(cat "$n")
+    case $name in
+        *dw9807*|*ad5398*|*vcm*|*lens*)
+            echo "    lens subdev present: $name  (${n%/name})"
+            found=1 ;;
+    esac
+done
+[ "$found" = 1 ] || cat <<'EOF'
+    NO lens subdev found. --lens-position is a silent no-op on this card and
+    the WIDE lens is parked at ~+6 dioptres (~17 cm) — which is the reported
+    symptom. Causes, in the order worth checking:
+      - camera_auto_detect=1 in config.txt was replaced by an explicit
+        `dtoverlay=imx708,vcm=0`, which disables the lens driver outright;
+      - the module is not an AF IMX708 (see section 1);
+      - the CSI control bus is marginal. The VCM is a SEPARATE I2C target on
+        the same CSI ribbon as the sensor, so a long or lossy run — this
+        design puts the front camera on a ~2 m CSI-over-HDMI extender — can
+        enumerate the sensor and still fail the VCM. Test by rebuilding with
+        the camera on its stock short ribbon: if the subdev appears, the
+        extender is the fault, and PLAN.md's Phase 1 decision gate (swap to
+        a STARVIS UVC front camera) is the exit.
+EOF
+dmesg 2>/dev/null | grep -iE 'dw9807|imx708|vcm' | tail -20 | sed 's/^/    /' || true
+
+echo
+echo "=== 3. does rpicam even apply the control? ============================="
+# -v 2 makes rpicam-apps log the control it sets. No line here means the
+# guard above fired and the option was dropped on the floor.
+# Captured rather than piped straight to sed: sed always exits 0, so a
+# trailing `|| echo` on that pipeline could never fire.
+ctl=$(rpicam-still -v 2 -n -t 1000 --autofocus-mode manual --lens-position 0.0 \
+      -o "$OUT/probe.jpg" 2>&1 | grep -i 'lensposition\|afmode' || true)
+if [ -n "$ctl" ]; then
+    printf '%s\n' "$ctl" | sed 's/^/    /'
+else
+    echo "    (no LensPosition/AfMode line — the control was NOT applied)"
+fi
+
+echo
+echo "=== 4. focus bracket: JPEG size as a sharpness proxy ==================="
+echo "    Aim at a well-lit, detailed target several metres away."
+printf '    %-12s %-10s %s\n' "dioptre" "≈distance" "bytes"
+for d in 0.0 0.2 0.4 1.0 2.0 4.0 6.0 10.0; do
+    f="$OUT/lens-$d.jpg"
+    rpicam-still -n -t 2000 -q 90 \
+        --width "$FRONT_W" --height "$FRONT_H" \
+        --autofocus-mode manual --lens-position "$d" \
+        -o "$f" >/dev/null 2>&1 || { echo "    $d  capture FAILED"; continue; }
+    # 1/d metres; 0 dioptres is infinity.
+    dist=$(awk -v d="$d" 'BEGIN { if (d + 0 == 0) print "inf"; else printf "%.2f m", 1 / d }')
+    printf '    %-12s %-10s %s\n' "$d" "$dist" "$(stat -c %s "$f")"
+done
+
+# The reference shot: let the camera's own AF find focus. If THIS one is
+# sharp and the whole manual bracket is flat, the VCM works and the manual
+# path is broken — a different fault from a VCM that never moves.
+rpicam-still -n -t 5000 -q 90 --width "$FRONT_W" --height "$FRONT_H" \
+    --autofocus-mode auto -o "$OUT/auto-af.jpg" >/dev/null 2>&1 &&
+    printf '    %-12s %-10s %s\n' "(auto AF)" "-" "$(stat -c %s "$OUT/auto-af.jpg")" ||
+    echo "    (auto AF capture failed)"
+
+cat <<EOF
+
+=== reading the bracket ================================================
+  Sizes vary clearly and peak somewhere   the VCM works. Set
+                                          FRONT_LENS_DIOPTRE to the peak
+                                          (expect it at 0.0-0.4 aimed down
+                                          a road) and reflash.
+  All sizes within a few percent          the lens never moved. Section 2
+                                          names the cause. Confirm by eye:
+                                          lens-0.0.jpg and lens-10.0.jpg
+                                          should look wildly different and
+                                          will look identical.
+  Bracket flat but (auto AF) much larger  the VCM moves, the manual path
+                                          does not — rpicam version or
+                                          tuning-file issue, not wiring.
+  Everything small and flat, scene dim    inconclusive: the proxy needs
+                                          light and detail. Reshoot.
+
+  JPEGs kept in $OUT — open them; the file sizes only rank what your eyes
+  can confirm in one glance.
+
+  NOTE none of this measures the 2 Mbps encode. rpicam-still bypasses the
+  H.264 path entirely, so a sharp bracket here plus soft FOOTAGE means the
+  bitrate is the limit, not the lens: 1080p30 at 2 Mbps is ~0.03 bit/pixel,
+  well under the 8-15 Mbps commercial dashcams spend, and FRONT_BITRATE
+  trades directly against PLAN.md's 110-120 h retention target.
+EOF
