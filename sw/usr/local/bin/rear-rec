@@ -60,10 +60,35 @@ tail-repair current rear || true
 # change (the Zero's image stays untouched, per the project rule). Rear
 # footage lands upright, so every downstream consumer stays ignorant.
 [ "${INVERT_REAR:-0}" = 1 ] && FLIP='videoflip method=vertical-flip !' || FLIP=
+
+# REAR_GAMMA: the rear picture is too dark at night; the front (IMX708, HDR)
+# is not. The fix lands here rather than at the source for two reasons: the
+# Zero's showmewebcam image and its camera tuning are untouched by this tree
+# (project rule), and at 30 fps the sensor's exposure is already capped at
+# 33 ms — whatever its AE has left is gain, which buys the same noise this
+# does without being switchable.
+#
+# Gamma, not a brightness offset or contrast stretch, and that choice IS the
+# day/night balance: a gamma curve is pinned at both black and white, so it
+# moves near-black pixels a great deal and near-white ones almost not at all.
+# A night scene lives at the end that moves; a daylit one lives at the end
+# that doesn't. So a single static value serves both, with no metering, no
+# feedback loop, and no risk of clipping a bright sky — which a fixed
+# brightness offset (shifts everything, blows the highlights) or the camera's
+# own gain (amplifies before the encoder sees it) could not offer.
+#
+# 1.0 leaves the element out of the chain entirely rather than passing a
+# no-op filter — an untuned card runs exactly the pipeline it ran before.
+# Cost is a per-pixel LUT on the Y plane only, small next to the software
+# jpegdec already in the chain, but it is not free: see sw/README.md.
+case "${REAR_GAMMA:-1.0}" in
+    1|1.0|1.00) GAMMA= ;;
+    *)          GAMMA="gamma gamma=$REAR_GAMMA !" ;;
+esac
 stdbuf -oL gst-launch-1.0 -e -m v4l2src device="$REAR_CAM_DEV" \
     ! "image/jpeg,width=$REAR_W,height=$REAR_H,framerate=$REAR_FPS/1" \
     ! jpegdec \
-    ! $FLIP v4l2h264enc extra-controls="controls,video_bitrate=$REAR_BITRATE,h264_i_frame_period=$REAR_FPS" \
+    ! $FLIP $GAMMA v4l2h264enc extra-controls="controls,video_bitrate=$REAR_BITRATE,h264_i_frame_period=$REAR_FPS" \
     ! "video/x-h264,level=(string)4" \
     ! h264parse \
     ! splitmuxsink location="$OUT/%05d.mp4" \
