@@ -55,15 +55,60 @@ scan)
         exit 1
     fi
 
+    # `nmcli radio wifi on` returns as soon as NM has accepted the property
+    # change — the device is NOT usable yet. On a production card the radio
+    # has been off since boot (firstinstall persisted WirelessEnabled=false),
+    # so enabling it starts a full bring-up: firmware load, interface up,
+    # wlan0 unavailable -> disconnected. Scanning inside that window is the
+    # bug this wait exists to kill: NM has no scannable device, the scan
+    # comes back empty, and JW-1 says NO NETWORKS the instant the user
+    # long-presses A — identical on screen to standing out of range.
+    # Bounded well inside the panel's 25 s scan deadline.
+    i=0
+    while [ "$i" -lt 30 ]; do
+        # -t gives 'TYPE:STATE' per line; take the STATE of the first plain
+        # wifi device. sed, not awk: rf-ctl already depends on sed/grep/sort
+        # and nothing else, and this must run on a minimal card.
+        # '^wifi:' cannot match a 'wifi-p2p:' line.
+        state=$(nmcli -t -f TYPE,STATE device status 2>/dev/null |
+                sed -n 's/^wifi://p' | head -n 1)
+        case $state in
+            ''|unavailable|unmanaged) ;;
+            *) break ;;
+        esac
+        sleep 0.2
+        i=$((i + 1))
+    done
+
     # --rescan yes forces a fresh sweep instead of NM's cached list.
+    # Captured, not piped straight through: the exit status of a pipeline is
+    # its LAST command (`sort`, always 0), so piping hid every nmcli failure
+    # behind an empty list — and an empty list is a legitimate answer here,
+    # which made a broken radio and an empty sky the same screen. Now a scan
+    # that FAILS exits non-zero (JW-1: RF ERROR) and only a scan that
+    # SUCCEEDS with nothing in range prints nothing (JW-1: NO NETWORKS).
+    if ! raw=$(nmcli -t -f SSID device wifi list --rescan yes 2>&1); then
+        echo "rf-ctl: scan failed: $raw" >&2
+        exit 1
+    fi
+    # NM can return an empty list on the first sweep after a cold radio even
+    # once the device is available (the bring-up finished, the first scan
+    # did not). One retry, still inside the deadline, rather than reporting
+    # an empty sky the user can see is wrong.
+    if [ -z "$raw" ]; then
+        sleep 2
+        raw=$(nmcli -t -f SSID device wifi list --rescan yes 2>/dev/null) || true
+    fi
+
     # -t -f SSID prints one field per line, backslash-escaping ':' and
     # '\' — undo exactly those two, in that order. Hidden APs come back
     # as an empty field and are dropped: there is nothing to display and
     # nothing the JW-1 list could usefully select.
-    nmcli -t -f SSID device wifi list --rescan yes 2>/dev/null |
+    printf '%s\n' "$raw" |
         sed -e 's/\\:/:/g' -e 's/\\\\/\\/g' |
         grep -v '^[[:space:]]*$' |
         sort -u
+    exit 0
     ;;
 
 connect)
