@@ -88,10 +88,32 @@ echo "building panel daemon..."
 make -C src
 make -C src install
 
+# install_files MODE DEST FILE... — install the regular files of a payload
+# glob, skipping anything else. A bare `install -m MODE dir/* DEST/` copies
+# the files but bails on the first non-file with `install: omitting
+# directory '.../__pycache__'` AND a non-zero exit — which under `set -e`
+# takes the whole first boot down, half-installed. Dev-side junk in the
+# payload (a __pycache__ from running the PC tools over the tree, an editor
+# backup dir) must never be able to do that.
+install_files() {
+    _mode=$1
+    _dest=$2
+    shift 2
+    _n=0
+    for _f in "$@"; do
+        [ -f "$_f" ] || continue
+        install -m "$_mode" "$_f" "$_dest"
+        _n=$((_n + 1))
+    done
+    # An empty glob is not "nothing to do", it is a broken payload — fail
+    # loudly rather than booting a card with no scripts or no units.
+    [ "$_n" -gt 0 ] || { echo "no files to install into $_dest — broken payload" >&2; exit 1; }
+}
+
 echo "installing files..."
-install -m 755 usr/local/bin/* /usr/local/bin/
+install_files 755 /usr/local/bin/ usr/local/bin/*
 install -m 644 etc/dashberry.conf /etc/dashberry.conf
-install -m 644 etc/systemd/system/* /etc/systemd/system/
+install_files 644 /etc/systemd/system/ etc/systemd/system/*
 install -m 644 etc/udev/rules.d/99-dashberry.rules /etc/udev/rules.d/
 install -D -m 644 etc/chrony/conf.d/gps-refclock.conf /etc/chrony/conf.d/gps-refclock.conf
 
