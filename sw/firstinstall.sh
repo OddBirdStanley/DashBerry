@@ -22,9 +22,11 @@
 #     profile instead of Ethernet).
 #
 # Whatever the mode, the card ends this script RF-KILLED and boots that way:
-# `nmcli radio wifi off` persists WirelessEnabled=false. The one exception
-# is a debug card that was given a --wifi profile — an explicit request for
-# a card that rejoins the LAN by itself.
+# 99-dashberry-rfkill.rules blocks the wlan switch as it appears on every
+# boot, and radios_off() below takes the radios down here and proves it.
+# The one exception is a debug card that was given a --wifi profile — an
+# explicit request for a card that rejoins the LAN by itself — where the
+# rule is removed again.
 #
 # dashberry-cli (../cli) is PC-side and is deliberately NOT installed here —
 # it never ships on the image.
@@ -114,7 +116,13 @@ echo "installing files..."
 install_files 755 /usr/local/bin/ usr/local/bin/*
 install -m 644 etc/dashberry.conf /etc/dashberry.conf
 install_files 644 /etc/systemd/system/ etc/systemd/system/*
-install -m 644 etc/udev/rules.d/99-dashberry.rules /etc/udev/rules.d/
+# Both rules files: the device symlinks and the boot-time rfkill block.
+# Installing the latter is safe even on a --wifi first boot — udev reloads
+# rules on change but does not re-run them against devices that already
+# exist, and the trigger further down is subsystem-matched to tty and
+# video4linux, so the wlan switch this install may be running over is
+# never re-added underneath it. The rule takes effect on the next boot.
+install_files 644 /etc/udev/rules.d/ etc/udev/rules.d/*
 install -D -m 644 etc/chrony/conf.d/gps-refclock.conf /etc/chrony/conf.d/gps-refclock.conf
 
 echo "configuring gpsd ($GPS_DEV, static, guarded hotplug)..."
@@ -232,6 +240,50 @@ fi
 # shellcheck disable=SC2086 — word splitting is the point
 systemctl enable $enable_units
 
+# True while some wlan rfkill switch is clear BOTH ways — byte for byte the
+# condition the panel's glyph reads (rf_unblocked() in dashberry-panel.c),
+# so this check and the OLED can never disagree about what RF-ENABLED
+# means. No wlan switch at all counts as blocked, exactly as it does there.
+rf_live() {
+    for _s in /sys/class/rfkill/rfkill*; do
+        [ -d "$_s" ] || continue
+        [ "$(cat "$_s/type" 2>/dev/null)" = wlan ] || continue
+        [ "$(cat "$_s/soft" 2>/dev/null)" = 0 ]    || continue
+        [ "$(cat "$_s/hard" 2>/dev/null)" = 0 ]    || continue
+        return 0
+    done
+    return 1
+}
+
+# Take the radios down and PROVE it. Both halves, exactly like rf-ctl's
+# `down`: nmcli persists WirelessEnabled=false (NetworkManager's own boot
+# preference) and rfkill blocks the switch in the kernel now. Neither is
+# what makes later boots safe — 99-dashberry-rfkill.rules is — but this is
+# the state the card carries into its very first reboot, and on a
+# production card whatever is true when this returns is about to be frozen
+# into a read-only OS. So it is verified rather than hoped for: the old
+# `nmcli radio wifi off 2>/dev/null || true` discarded its own failure, and
+# a card that lost that one write booted RF-ENABLED for life with nothing
+# saying so. NM applies the block asynchronously, hence the bounded wait.
+radios_off() {
+    nmcli radio wifi off 2>/dev/null || true
+    rfkill block wifi 2>/dev/null || true
+    _i=0
+    while rf_live && [ "$_i" -lt 15 ]; do
+        sleep 0.2
+        _i=$((_i + 1))
+    done
+    if rf_live; then
+        echo "WARNING: the radios are STILL unblocked after 'nmcli radio wifi off'" >&2
+        echo "         and 'rfkill block wifi' — this card boots RF-ENABLED." >&2
+        if [ "$DEBUG" = 1 ]; then
+            echo "         The OS stays writable: fix and re-run, or block by hand." >&2
+        else
+            echo "         The read-only OS is about to freeze that: rebuild the card." >&2
+        fi
+    fi
+}
+
 if [ "$DEBUG" = 1 ]; then
     # DEBUG card: keep the Wi-Fi profile (the card rejoins the LAN every
     # boot), keep the journal, and make it persistent — /var/log/journal
@@ -243,26 +295,34 @@ if [ "$DEBUG" = 1 ]; then
         # A --wifi profile on a debug card is the explicit request for a
         # card that rejoins the LAN by itself: keep it, keep the regdom,
         # leave the radios live. This is the ONLY build that boots
-        # RF-ENABLED. JOIN WIFI is not armed here — the card already knows
-        # a network, and the panel's toggle would only fight this profile.
+        # RF-ENABLED, so it is also the only one that must NOT carry the
+        # boot-time block — drop the rule (the OS stays writable here, so
+        # this survives) and make sure the switch is clear right now.
+        # JOIN WIFI is not armed here — the card already knows a network,
+        # and the panel's toggle would only fight this profile.
         echo "debug card: keeping the staged Wi-Fi profile (radios stay live)"
+        rm -f /etc/udev/rules.d/99-dashberry-rfkill.rules
+        udevadm control --reload 2>/dev/null || true
+        rfkill unblock wifi 2>/dev/null || true
+        nmcli radio wifi on 2>/dev/null || true
     else
         # No network was ever named for this card, so it has nothing to
         # talk to: leave it dark rather than beaconing on the bench.
         echo "debug card: no --wifi profile — leaving the radios blocked"
-        nmcli radio wifi off 2>/dev/null || true
+        radios_off
     fi
 else
     echo "production card: wiping stored Wi-Fi credentials..."
     # Must happen BEFORE the overlay flip: anything left now is frozen into
     # the read-only OS forever. Wiped: the NM profile (holds the plaintext
     # PSK), DHCP leases and the seen-bssids cache, and — on a Wi-Fi install
-    # — the journal (NM logs the SSID; the PSK never reaches it). nmcli
-    # radio wifi off additionally persists WirelessEnabled=false into
-    # NetworkManager.state, so the card comes up RF-KILLED on this and
-    # every later boot — including a JOIN WIFI card, whose radios only ever
-    # come up from the panel and never survive the reboot.
-    nmcli radio wifi off 2>/dev/null || true
+    # — the journal (NM logs the SSID; the PSK never reaches it).
+    # radios_off persists WirelessEnabled=false into NetworkManager.state
+    # on top of blocking the switch; 99-dashberry-rfkill.rules is what
+    # makes the card come up RF-KILLED on every LATER boot — including a
+    # JOIN WIFI card, whose radios only ever come up from the panel and
+    # never survive a reboot, clean or not.
+    radios_off
     rm -f /etc/NetworkManager/system-connections/dashberry-firstboot.nmconnection
     rm -f /var/lib/NetworkManager/*.lease
     rm -f /var/lib/NetworkManager/seen-bssids

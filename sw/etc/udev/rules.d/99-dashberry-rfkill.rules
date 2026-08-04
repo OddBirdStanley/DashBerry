@@ -1,0 +1,26 @@
+# The card's radios come up BLOCKED on every boot — asserted here, not
+# inherited. This is a separate rules file from 99-dashberry.rules on
+# purpose: it is the one rule firstinstall removes, on the single build
+# that is meant to boot live (a debug card given a --wifi profile).
+#
+# Why a udev rule and not install-time state: before this rule, the boot
+# state of a JOIN WIFI card (RF_JOIN=1 — the one production build that
+# keeps its regulatory domain, so nothing hard-blocks wlan) rested
+# entirely on NetworkManager re-applying the WirelessEnabled=false that
+# firstinstall persisted. That is a single link, and a late one — the
+# kernel registers the wlan rfkill switch with soft=0 and NM does not
+# start for seconds afterwards. Worse, it is INHERITED state: the panel's
+# `rf-ctl down` only ever runs when a user asks for it, so a card whose
+# power was cut mid-JOIN-WIFI had nothing re-establish the block, and came
+# back up RF-ENABLED. Setting the switch as it appears depends on no saved
+# state, no daemon and no clean shutdown, so a crash cannot skip it.
+#
+# ACTION=="add" is load-bearing: an rfkill state change also reaches udev,
+# and an unqualified rule would re-block the radios underneath a live
+# JOIN WIFI session the instant rf-ctl unblocked them. Only the switch
+# APPEARING (boot, or a driver rebind) may force it down; rf-ctl's
+# explicit `rfkill unblock wifi` during a session is untouched.
+#
+# wlan only. The Bluetooth switch is a separate rfkill device and is not
+# in rev 8's scope — the panel's glyph reads type wlan and nothing else.
+ACTION=="add", SUBSYSTEM=="rfkill", ATTR{type}=="wlan", ATTR{soft}="1"
