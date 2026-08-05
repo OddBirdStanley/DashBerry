@@ -3,17 +3,21 @@
 # purpose: it is the one rule firstinstall removes, on the single build
 # that is meant to boot live (a debug card given a --wifi profile).
 #
-# Why a udev rule and not install-time state: before this rule, the boot
-# state of a JOIN WIFI card (RF_JOIN=1 — the one production build that
-# keeps its regulatory domain, so nothing hard-blocks wlan) rested
-# entirely on NetworkManager re-applying the WirelessEnabled=false that
-# firstinstall persisted. That is a single link, and a late one — the
-# kernel registers the wlan rfkill switch with soft=0 and NM does not
-# start for seconds afterwards. Worse, it is INHERITED state: the panel's
-# `rf-ctl down` only ever runs when a user asks for it, so a card whose
-# power was cut mid-JOIN-WIFI had nothing re-establish the block, and came
-# back up RF-ENABLED. Setting the switch as it appears depends on no saved
-# state, no daemon and no clean shutdown, so a crash cannot skip it.
+# Defense in depth, NOT the whole defense (learned 2026-08-05, the hard
+# way). Current Pi OS images ship rfkill_default.conf (`options rfkill
+# default_state=0`, raspberrypi-sys-mods 20241030+1), so the kernel
+# already registers every switch soft-blocked and this write is usually
+# 1-over-1; on an older image — or if that conf ever goes away — it is
+# what blocks a JOIN WIFI card (RF_JOIN=1, regdom kept, so nothing
+# hard-blocks wlan). Either way the add-time state is only the FIRST word
+# of a boot: systemd-rfkill's ADD-handler restore and NetworkManager's
+# persisted WirelessEnabled are both written over the switch AFTERWARDS,
+# each replaying a /var/lib state file that on a production card is a
+# frozen copy of install-time state, served identically every boot. A card
+# whose frozen state said "unblocked" therefore booted RF-ENABLED despite
+# this rule. What actually holds the boot RF-KILLED is firstinstall:
+# radios_off pins both state files to "blocked" before the overlay
+# freezes them, and a production card masks systemd-rfkill outright.
 #
 # ACTION=="add" is load-bearing: an rfkill state change also reaches udev,
 # and an unqualified rule would re-block the radios underneath a live
