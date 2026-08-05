@@ -16,7 +16,9 @@ Subcommands:
            Signal" filler, GPS trouble is labeled from the health log;
            --annotate burns time/position/speed);
            --camera both-prio-* composites the other camera picture-in-
-           picture. Always a re-encode — near-transparent x264 settings
+           picture; --timelapse speeds the result up (a factor "8x" or a
+           target length "HH:MM:SS"). Always a re-encode — near-
+           transparent x264 settings
   gpx      GPX 1.0 track (native <speed>, m/s) from the session NMEA log
 
 The health log (/data/health/<session>/<session>.log, written by
@@ -267,6 +269,33 @@ def parse_hms(s):
     if len(parts) != 3:
         die("bad time %r (want HH:MM:SS)" % s)
     return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+
+
+def timelapse_speed(spec, span):
+    """--timelapse spec -> speed factor over a rendered span of `span`
+    seconds. Two spellings: 'Vx' (a decimal factor, at least 1) or
+    'HH:MM:SS' (the target output length, at most the span itself —
+    the factor is derived as span / target)."""
+    if spec.endswith(("x", "X")):
+        try:
+            v = float(spec[:-1])
+        except ValueError:
+            die("bad --timelapse %r (want e.g. '8x' or 'HH:MM:SS')" % spec)
+        if not math.isfinite(v) or v < 1.0:
+            die("--timelapse factor must be a decimal >= 1 (got %r)" % spec)
+        return v
+    if ":" not in spec:
+        die("bad --timelapse %r (want e.g. '8x' or 'HH:MM:SS')" % spec)
+    try:
+        target = parse_hms(spec)
+    except ValueError:
+        die("bad --timelapse %r (want e.g. '8x' or 'HH:MM:SS')" % spec)
+    if target <= 0:
+        die("--timelapse length must be positive")
+    if target > span:
+        die("--timelapse length %s exceeds the rendered span %s"
+            % (spec, fmt_span(span)))
+    return span / target
 
 
 def parse_tz(s):
@@ -618,6 +647,7 @@ def cmd_render(args):
     lo, hi = max(lo, t0), min(hi, t1)
     if hi <= lo:
         die("requested range is empty")
+    speed = timelapse_speed(args.timelapse, hi - lo) if args.timelapse else 1.0
 
     def cam_wh(cam):
         wh = ffprobe_wh(segs[cam][0][0], fatal=False) if segs[cam] else None
@@ -656,6 +686,14 @@ def cmd_render(args):
         if ass:
             filter_lines.append("[%s]ass=%s[outv]" % (vid, ass))
             vid = "outv"
+        # Timelapse goes last, after the overlay is burned in, so labels
+        # stay glued to the footage they describe and simply pass faster.
+        # fps= after setpts drops the now-surplus frames instead of asking
+        # x264 to encode a sped-up frame flood at the same output rate.
+        if speed > 1.0:
+            filter_lines.append("[%s]setpts=PTS/%.6f,fps=%d[fast]"
+                                % (vid, speed, TIMELINE_FPS))
+            vid = "fast"
         script = os.path.join(tmpdir, "filter.txt")
         with open(script, "w") as f:
             f.write(";\n".join(filter_lines))
@@ -672,8 +710,9 @@ def cmd_render(args):
             die("ffmpeg not found")
         except subprocess.CalledProcessError as e:
             die("ffmpeg failed (%d)" % e.returncode)
-    print("wrote %s (%s span %s, %d segments, %d filler pieces%s)"
-          % (args.output, args.camera, fmt_span(hi - lo), idx, n_fill,
+    print("wrote %s (%s span %s%s, %d segments, %d filler pieces%s)"
+          % (args.output, args.camera, fmt_span(hi - lo),
+             " at %gx" % speed if speed > 1.0 else "", idx, n_fill,
              ", %d unreadable segments skipped" % n_bad if n_bad else ""))
 
 
@@ -764,6 +803,12 @@ def main():
                          "top-right")
     pr.add_argument("--annotate", action="store_true",
                     help="burn time/position/speed into the image")
+    pr.add_argument("--timelapse", metavar="Vx|HH:MM:SS",
+                    help="speed the output up: either a factor ('8x', a "
+                         "decimal >= 1) or the target output length "
+                         "('HH:MM:SS', at most the rendered span). "
+                         "Overlays are burned first, so they stay in "
+                         "sync and just pass faster")
     pr.add_argument("--units", choices=["MPH", "KMH"], default="MPH",
                     help="annotation speed units (default MPH)")
     add_range_opts(pr)
