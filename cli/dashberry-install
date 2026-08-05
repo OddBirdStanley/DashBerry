@@ -72,10 +72,6 @@ Options:
   --wifi SSID:PSK   run the first boot over Wi-Fi instead of Ethernet
   --wifi-country CC regulatory domain; required by --wifi and by JOIN WIFI
   -h, --help        display this help
-
-With neither --auth nor --debug the card is SEALED: read-only OS, no
-account, no sshd, no radios — the OLED and pulling the card are its only
-interfaces.
 EOF
 }
 
