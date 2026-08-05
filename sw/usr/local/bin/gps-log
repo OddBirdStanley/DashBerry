@@ -18,5 +18,6 @@ mkdir -p "$OUT"
 # (~4-8 KB = tens of seconds of NMEA at 5 Hz) — a hard power cut at impact
 # would eat the fixes that matter most, speed-at-impact included. Line
 # buffering puts every sentence in the page cache immediately; the /data
-# mount's commit=1 then bounds on-disk loss to ~1-2 s.
+# mount's nodelalloc+commit=1 (see etc/fstab.snippet) then bounds on-disk
+# loss to ~1-2 s.
 exec stdbuf -oL gpspipe -r >> "$OUT/$SESSION.nmea"

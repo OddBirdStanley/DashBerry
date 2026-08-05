@@ -2,8 +2,17 @@
 # card; OS partition goes read-only via `raspi-config` > Performance > Overlay FS).
 # cli/dashberry-install appends this automatically (by PARTUUID) when it builds
 # the card — this snippet stays as the manual-install reference.
-# data=ordered + commit=1: the 1 s journal commit forces each ~1 s MP4
-# fragment's data blocks to the card, so a hard power cut (every ignition-off,
-# and an impact that kills 12 V) loses ~1-2 s, not the ~5+ s that the default
-# commit interval leaves in the page cache.
-/dev/mmcblk0p3  /data  ext4  defaults,noatime,data=ordered,commit=1,nofail  0 2
+# nodelalloc + data=ordered + commit=1: an append allocates its blocks at
+# write() time, which puts it in the journal transaction the 1 s commit is
+# about to close, and ordered mode writes the data blocks ahead of that
+# commit — so a hard power cut (every ignition-off, and an impact that kills
+# 12 V) loses ~1-2 s of the open segment. nodelalloc is LOAD-BEARING in that
+# chain: with ext4's default delayed allocation, appended pages sit outside
+# every transaction until writeback (30 s dirty_expire, 5 s flusher pass),
+# commit=1 has nothing to order against, and a power cut leaves the open
+# segment as it was at the last writeback — 0 BYTES on the card for a tail
+# younger than ~30 s, for all that filesink wrote it unbuffered. Closed
+# segments never depended on any of this (mp4-set-duration fsyncs each one
+# while patching its duration); this line is about the segment being written
+# when the 12 V dies, which is the one with the impact on it.
+/dev/mmcblk0p3  /data  ext4  defaults,noatime,nodelalloc,data=ordered,commit=1,nofail  0 2
