@@ -805,7 +805,16 @@ function create(hw) {
         }
 
         if (ui.error) {
-            ui.a_down_ms = 0;      /* PAGE 0 is static: other input ignored */
+            /* PAGE 0 is static: input ignored — except the JOIN WIFI hold
+             * on an armed card (sshd waits behind a join, and a fault is
+             * exactly when getting in matters). Any other key, or the A
+             * release, still cancels a hold in flight. */
+            if (rf_join && key === KEY.A && press) {
+                ui.a_down_ms = now;
+                ui.a_fired = false;
+            } else {
+                ui.a_down_ms = 0;
+            }
             return;
         }
         if (!press) {
@@ -1134,7 +1143,7 @@ function create(hw) {
                     jw_connect(now);
                 else
                     jw.staged = true;
-            } else if (ui.screen === SCR.PAGE && rf_join && !ui.error &&
+            } else if (ui.screen === SCR.PAGE && rf_join &&
                        !ui.blanked && now - ui.a_down_ms >= RF_HOLD_MS) {
                 ui.a_fired = true;
                 rf_toggle(now);
