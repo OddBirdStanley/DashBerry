@@ -61,9 +61,54 @@ if [ "$FIRSTBOOT_WIFI" = 1 ]; then
     nm-online -q -t 90 || echo "network not online yet — apt will retry" >&2
 fi
 
+# Wait for a real clock BEFORE apt. Field-observed 2026-08-05: first boot
+# died on 404s for 18 .debs, apparently at random and apparently keyed to
+# the install network, and one reboot always "fixed" it. The cause is the
+# clock, not the network. The card boots at the image build date (Jun 18 on
+# the card that produced the log), and if firstinstall reaches apt before
+# systemd-timesyncd has completed its first NTP exchange, every InRelease
+# fails OpenPGP verification with sqv's "Not live until <date>" — the
+# signature is dated AFTER the card thinks it is, so it is not valid yet.
+# apt then says "The repository is not updated and the previous index files
+# will be used" and — this is the part that hurts — exits 0, because those
+# are W: not E:. The install downstream resolves against the image's
+# months-old seeded indexes and asks the archive for versions that have
+# since been superseded and deleted from pool/, which is the 404. Rebooting
+# cured it only because timesyncd persists /var/lib/systemd/timesync/clock,
+# so boot 2 starts out roughly right; and "which network" was really a race
+# against how fast that network resolves and answers NTP.
+#
+# CLOCK_FLOOR is no help here — it is 2026-01-01 and the bad clock read
+# 2026-06-18, well past the floor. A stale-but-plausible image date clears
+# every sanity check the card owns, so the gate has to be NTP sync itself.
+#
+# Not fatal on timeout: NTPSynchronized=no does not prove the clock is
+# wrong (a DS3231-fitted card can be correct offline), so a hard failure
+# here would break cards that are actually fine. --error-on=any below is
+# the real guard — it is what turns a silently-stale index into a failure.
+# BYPASS_TIME is deliberately NOT consulted: it means "no DS3231 fitted",
+# and such a card needs the network clock here more than any other.
+echo "waiting for the clock before apt (NTP)..."
+n=0
+while [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != yes ]; do
+    n=$((n + 1))
+    if [ "$n" -ge 90 ]; then      # 90 x 2 s = 3 min
+        echo "clock not NTP-synced after 3 min — continuing anyway." >&2
+        echo "(if the clock really is wrong, apt-get update below fails" >&2
+        echo " loudly on --error-on=any instead of installing 404-bait.)" >&2
+        break
+    fi
+    sleep 2
+done
+
 echo "installing packages..."
 n=0
-until apt-get update; do
+# --error-on=any: without it a repo that fails to verify is only a W: and
+# apt-get update still exits 0, so this loop would fall straight through to
+# an install resolved against stale indexes. That is exactly how the 404s
+# above got in. With it, a partial update is a failure and gets retried —
+# which also gives a late-syncing clock three more chances to land.
+until apt-get update --error-on=any; do
     n=$((n + 1))
     if [ "$n" -ge 3 ]; then
         if [ "$FIRSTBOOT_WIFI" = 1 ]; then
@@ -75,6 +120,9 @@ until apt-get update; do
             echo "(no Wi-Fi is configured on this card; fix the network and reboot" >&2
             echo " to retry, or run /opt/dashberry/sw/firstinstall.sh by hand.)" >&2
         fi
+        echo "if the errors say \"Not live until\", the card's clock is behind" >&2
+        echo "the archive signatures — NTP never landed; check the network" >&2
+        echo "allows outbound NTP (udp/123), then reboot to retry." >&2
         exit 1
     fi
     sleep 15
