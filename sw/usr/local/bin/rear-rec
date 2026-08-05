@@ -1,6 +1,6 @@
 #!/bin/sh
-# rear-rec — rear UVC (showmewebcam) MJPEG → software decode → hw H.264 →
-# 60 s fragmented MP4 segments. Exits (→ systemd Restart) if the camera is
+# rear-rec — rear UVC (showmewebcam) MJPEG → software decode → software
+# H.264 (openh264) → 60 s fragmented MP4 segments. Exits (→ systemd Restart) if the camera is
 # absent; the Zero normally beats the Pi 4 to readiness since both power on
 # ignition. Writes into the per-boot session directory minted by
 # session-init: a restart REUSES the same session dir.
@@ -34,15 +34,31 @@ tail-repair current rear || true
 # completes it, and the decoder's capture task dies SILENTLY while its
 # sink keeps eating v4l2src frames: no error, no backpressure, no files.
 #
-# The level=(string)4 caps filter is LOAD-BEARING: without it the encoder
-# auto-negotiates baseline@level-1 (QCIF-class) for 720p30 — nothing
-# downstream constrains the level, and gst tries the lowest first.
+# openh264enc (SOFTWARE, ~1 core at 720p30) — deliberately NOT
+# v4l2h264enc, and for a second, INDEPENDENT gst-v4l2 element bug on this
+# same kernel 6.18 + gst 1.26 pairing (bench 2026-08-05,
+# cam/dashberry-rear-probe.sh): the hardware encoder is healthy as
+# hardware — 325 fps fed by a non-live videotestsrc — but the
+# v4l2h264enc ELEMENT collapses to ~5 fps the moment any LIVE source
+# feeds it. Supply-independent: queues before/after, output-io-mode
+# overrides, and front-rec on/off all change nothing, so the wait is
+# internal to the element. Of every alternative probed (x264enc,
+# avenc_h264_v4l2m2m, ffmpeg h264_v4l2m2m direct, io-modes), only
+# openh264enc sustained the camera's full rate — 29.3 fps measured
+# through this exact chain while front-rec recorded.
 #
-# v4l2h264enc wants bitrate/period via extra-controls (no properties);
-# names confirmable with `v4l2-ctl -d /dev/video11 -L`. The encoder's
-# firmware context needs gpu_mem=256 alongside front's ISP+encode
-# (boot/config-snippet.txt): at the 76 MB default the extra context fails
-# as REQBUFS ENOMEM or a global VCHIQ wedge that kills front too.
+# The costs, accepted: baseline profile only (~10-20% less
+# bitrate-efficient than a high-profile hw encode — tolerable while the
+# Zero's ~25 Mbps MJPEG is the quality floor; raise REAR_BITRATE before
+# blaming the encoder) and ~1 CPU core, which the Pi 4 has idle. If a
+# thermal soak ever shows strain, complexity=low and multi-thread=N are
+# the headroom knobs. The queue ahead of the encoder decouples
+# capture+decode from encode so the software encoder pipelines across
+# cores — part of the benched configuration, not an optimization.
+# The old level=(string)4 caps filter was v4l2h264enc-specific (without
+# it THAT element auto-negotiated baseline@level-1) and leaves with it.
+# gpu_mem=256 (boot/config-snippet.txt) stays: front's ISP+encode still
+# wants it — rear simply no longer adds a firmware codec context.
 #
 # muxer= / sink= (not muxer-properties, which splitmuxsink silently ignores
 # unless async-finalize=true — the fragment-duration was never applied through
@@ -88,8 +104,8 @@ esac
 stdbuf -oL gst-launch-1.0 -e -m v4l2src device="$REAR_CAM_DEV" \
     ! "image/jpeg,width=$REAR_W,height=$REAR_H,framerate=$REAR_FPS/1" \
     ! jpegdec \
-    ! $FLIP $GAMMA v4l2h264enc extra-controls="controls,video_bitrate=$REAR_BITRATE,h264_i_frame_period=$REAR_FPS" \
-    ! "video/x-h264,level=(string)4" \
+    ! $FLIP $GAMMA queue max-size-buffers=8 \
+    ! openh264enc bitrate="$REAR_BITRATE" gop-size="$REAR_FPS" \
     ! h264parse \
     ! splitmuxsink location="$OUT/%05d.mp4" \
         start-index="$START_INDEX" \
