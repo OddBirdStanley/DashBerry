@@ -321,18 +321,20 @@ s = panel.state();
 ok(!s.health.front && !s.health.rear && !s.health.gpsok,
    "front+rear stale, GPS silent 5 s -> three ERRs");
 
-/* ERROR page: all input is dead except the button-B EVENT hold. */
+/* ERROR page: all input is dead except the button-B EVENT hold (and, on
+ * an RF_JOIN card only, the button-A JOIN WIFI hold — tested with the
+ * armed card below; this panel is unarmed). */
 press(PANEL.KEY.RIGHT); release(PANEL.KEY.RIGHT);
 ok(panel.state().page === 0, "PAGE 0 ignores the joystick");
 press(PANEL.KEY.A);
 advance(6000);
 release(PANEL.KEY.A);
 ok(panel.state().page === 0 && panel.state().screen === "PAGE",
-   "PAGE 0 ignores the A hold (no JOIN WIFI from a faulted card)");
+   "PAGE 0 ignores the A hold on an unarmed card (RF_JOIN=0)");
 {
     const before = sim.events;
     press(PANEL.KEY.B);
-    advance(2200);                 /* the one exception: EVENT still works */
+    advance(2200);                 /* EVENT still works on PAGE 0 */
     release(PANEL.KEY.B);
     ok(sim.events === before + 1, "PAGE 0 still takes the button-B EVENT hold");
     advance(2200);                 /* let the EVENT flash expire */
@@ -858,11 +860,40 @@ ok(js.error === true && js.screen === "PAGE",
 ok(js.rf_state === "killed",
    "…and that exit kills the radios too (a faulted card joins nothing)");
 
+/* The faulted card stays reachable: on an armed card PAGE 0 accepts the
+ * 5 s A hold — a production card built with --auth has sshd waiting
+ * behind a join, and a fault is exactly when getting in matters. */
+{
+    const jadvance_faulted = (ms) => { /* jadvance, minus the front feed */
+        const end = vt.now + ms;
+        while (vt.now < end) {
+            vt.now = Math.min(vt.now + PANEL.TICK_MS, end);
+            sim.rearLast = vt.now;
+            jp.gpsFix(sim.lat, sim.lon, sim.knots);
+            runRfJobs();
+            jp.tick();
+        }
+    };
+    jpress(PANEL.KEY.A); jadvance_faulted(5200); jrelease(PANEL.KEY.A);
+    js = jstate();
+    ok(js.error === true, "the fault is still standing");
+    ok(js.screen === "JW-1" && js.jw.scanning === true,
+       "…yet the 5 s A hold opens JW-1 from PAGE 0 (armed card)");
+    jadvance_faulted(2400);
+    ok(jstate().jw.scanning === false && jstate().rf_state === "idle",
+       "…and the scan lands: the faulted card can be joined for ssh");
+    jpress(PANEL.KEY.B); jadvance_faulted(200); jrelease(PANEL.KEY.B);
+    jadvance_faulted(200);
+    ok(jstate().screen === "PAGE" && jstate().error === true,
+       "button B backs out to PAGE 0, the fault still shown");
+    jadvance_faulted(5000);        /* the owed down */
+    ok(jstate().rf_state === "killed", "…and the exit still kills the radios");
+}
+
 /* …but button B still gets you out of a running scan — the joystick being
  * inert must not become a trap — and that exit still takes the radios. */
 {
-    jadvance(1600);                /* let the forced fault above clear —
-                                      PAGE 0 swallows the A hold entirely */
+    jadvance(1600);                /* let the forced fault above clear */
     ok(jstate().error === false, "recovered from the forced fault");
     jpress(PANEL.KEY.A); jadvance(5200); jrelease(PANEL.KEY.A);
     jadvance(400);                 /* scan takes 2 s: still running */

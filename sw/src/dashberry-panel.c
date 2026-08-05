@@ -1845,9 +1845,10 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
     }
 
     /* Button B: EVENT capture (~2 s hold, fired from the tick) — the one
-     * key that acts on any NON-BLANKED screen, PAGE 0 included (the
-     * deliberate exception to "PAGE 0 ignores all input": an incident
-     * that faults the system is exactly when marking the moment matters).
+     * key that acts on any NON-BLANKED screen, PAGE 0 included (an
+     * exception to "PAGE 0 ignores all input": an incident that faults
+     * the system is exactly when marking the moment matters; the JOIN
+     * WIFI hold below is the other).
      * From blank it is still a pure wake key: the waking press is
      * absorbed, the hold must restart after the wake. */
     if (key == KEY_B) {
@@ -1867,7 +1868,17 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
     }
 
     if (ui.error) {
-        ui.a_down_ms = 0;          /* PAGE 0 is static: other input ignored */
+        /* PAGE 0 is static: input ignored — except the JOIN WIFI hold on
+         * an armed card. A production card built with --auth has sshd
+         * waiting behind a join, and a fault is exactly when getting in
+         * matters, so button A stays live. Any other key (or the A
+         * release) still cancels a hold in flight. */
+        if (rf_join && key == KEY_A && press) {
+            ui.a_down_ms = now;
+            ui.a_fired = false;
+        } else {
+            ui.a_down_ms = 0;
+        }
         return;
     }
     if (!press) {
@@ -2303,7 +2314,7 @@ int main(void)
                         jw_connect(now);
                     else
                         jw.staged = true;
-                } else if (ui.screen == SCR_PAGE && rf_join && !ui.error &&
+                } else if (ui.screen == SCR_PAGE && rf_join &&
                            !ui.blanked && now - ui.a_down_ms >= RF_HOLD_MS) {
                     ui.a_fired = true;
                     rf_toggle(now);
