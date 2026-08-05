@@ -1267,14 +1267,15 @@ static int setting_top(const struct setting *s)
     return top < 0 ? 0 : top;
 }
 
-/* UP/DOWN on a settings page. Clamps at the ends like JW-1's list rather
- * than wrapping — a held key must not cycle the value back around. Every
- * accepted move applies and persists immediately: there is no staging
- * state that a power cut could catch half-committed. */
+/* UP/DOWN on a settings page. Wraps at both ends like JW-1's list and the
+ * keyboard, so either key alone reaches every choice. Every accepted move
+ * applies and persists immediately: there is no staging state that a power
+ * cut could catch half-committed. */
 static void setting_move(struct setting *s, int delta)
 {
-    int v = s->value + delta;
-    if (v < 0 || v >= setting_nopts(s) || v == s->value)
+    int n = setting_nopts(s);
+    int v = (s->value + delta + n) % n;
+    if (v == s->value)
         return;
     s->value = v;
     settings_apply();
@@ -1791,10 +1792,12 @@ static void jw_key(int key, bool press, int64_t now)
          * why the cancel path in jw_exit() still has to work. */
         if (jw.scanning)
             return;
-        if (key == KEY_UP && jw.sel > 0)
-            jw.sel--;
-        else if (key == KEY_DOWN && jw.sel + 1 < jw.n)
-            jw.sel++;
+        /* The list wraps at both ends, like the keyboard: UP from the top
+         * lands on the last SSID, DOWN from the last on the first. */
+        if (key == KEY_UP && jw.n > 0)
+            jw.sel = (jw.sel + jw.n - 1) % jw.n;
+        else if (key == KEY_DOWN && jw.n > 0)
+            jw.sel = (jw.sel + 1) % jw.n;
         else if (key == KEY_LEFT)
             jw_exit(now, true);
         else if (key == KEY_RIGHT && jw.n > 0 && !jw.scanning) {

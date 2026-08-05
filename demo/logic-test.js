@@ -433,14 +433,18 @@ advance(200);
 ok(panel.state().settings[0].value === "KMH", "DOWN selects KMH");
 ok(sim.settingsFile === "speed_unit=KMH\nalways_on=Off\n",
    `the choice is persisted immediately (got ${JSON.stringify(sim.settingsFile)})`);
-press(PANEL.KEY.DOWN); release(PANEL.KEY.DOWN);
-advance(200);
-ok(panel.state().settings[0].value === "KMH",
-   "DOWN at the end of the list clamps, it does not wrap");
 pageTo(1);
 ok(decodeRow(2) === "SPD 145 KMH",
    `PAGE 1 speed follows the setting (got "${decodeRow(2)}")`);
 pageTo(3);
+press(PANEL.KEY.DOWN); release(PANEL.KEY.DOWN);
+advance(200);
+ok(panel.state().settings[0].value === "MPH",
+   "DOWN at the end of the list wraps back to the first choice");
+press(PANEL.KEY.UP); release(PANEL.KEY.UP);
+advance(200);
+ok(panel.state().settings[0].value === "KMH",
+   "UP at the top wraps to the last choice");
 press(PANEL.KEY.UP); release(PANEL.KEY.UP);
 advance(200);
 ok(panel.state().settings[0].value === "MPH" && decodeRow(3, 15) === "",
@@ -610,17 +614,21 @@ ok(decodeCell(1, 15) === " ",
  * column 15, and both screens are uniform about it. */
 ok(decodeCell(3, 15) === " ", "the JW screens suppress the RF glyph cell");
 
-/* UP/DOWN scroll and clamp; the viewport follows past four entries. */
+/* UP/DOWN scroll and wrap at both ends; the viewport follows. */
 jtap(PANEL.KEY.UP);
-ok(jstate().jw.sel === 0, "UP at the top of the list clamps");
+js = jstate();
+ok(js.jw.sel === 4 && js.jw.top === 1,
+   "UP at the top wraps to the last SSID and drags the viewport");
+jtap(PANEL.KEY.DOWN);
+js = jstate();
+ok(js.jw.sel === 0 && js.jw.top === 0,
+   "DOWN at the end wraps back to the first, viewport home");
 for (let i = 0; i < 4; i++) jtap(PANEL.KEY.DOWN);
 js = jstate();
 ok(js.jw.sel === 4 && js.jw.top === 1,
    "DOWN past the fourth row scrolls the viewport by one");
 ok(decodeRowGlyphs(3) === "Zebra" && invMask(3) === "1111111111111111",
    "the last SSID renders on the bottom row, inverted");
-jtap(PANEL.KEY.DOWN);
-ok(jstate().jw.sel === 4, "DOWN at the end of the list clamps");
 
 /* LEFT exits JW-1 back to the pages — and backing out of the flow takes
  * the radios down with it: arming was only ever a means to joining. */

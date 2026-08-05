@@ -323,11 +323,12 @@ function create(hw) {
                                     set_value[idx] - (OPT_ROWS >> 1)));
     }
 
-    /* Clamps at the ends like JW-1's list; every accepted move applies and
-     * persists at once — nothing is ever staged. */
+    /* Wraps at both ends like JW-1's list and the keyboard; every accepted
+     * move applies and persists at once — nothing is ever staged. */
     function setting_move(idx, delta) {
-        const v = set_value[idx] + delta;
-        if (v < 0 || v >= SETTINGS[idx].opts.length || v === set_value[idx])
+        const n = SETTINGS[idx].opts.length;
+        const v = (set_value[idx] + delta + n) % n;
+        if (v === set_value[idx])
             return;
         set_value[idx] = v;
         settings_apply();
@@ -734,10 +735,12 @@ function create(hw) {
              * still the way out (and the idle timeout, and a fault). */
             if (jw.scanning)
                 return;
-            if (key === KEY.UP && jw.sel > 0)
-                jw.sel--;
-            else if (key === KEY.DOWN && jw.sel + 1 < jw.ssid.length)
-                jw.sel++;
+            /* The list wraps at both ends, like the keyboard: UP from the
+             * top lands on the last SSID, DOWN from the last on the first. */
+            if (key === KEY.UP && jw.ssid.length > 0)
+                jw.sel = (jw.sel + jw.ssid.length - 1) % jw.ssid.length;
+            else if (key === KEY.DOWN && jw.ssid.length > 0)
+                jw.sel = (jw.sel + 1) % jw.ssid.length;
             else if (key === KEY.LEFT)
                 jw_exit(now, true);
             else if (key === KEY.RIGHT && jw.ssid.length > 0 && !jw.scanning) {
