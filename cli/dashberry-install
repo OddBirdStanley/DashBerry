@@ -62,8 +62,11 @@ Usage: sudo dashberry-install [options] <image> <device>
 Options:
   --bypass-time     ignore DS3231 from system requirement and use GPS for time calibration
   --bypass-rear     ignore rear camera from system requirement
-  --invert-front    front camera is mounted upside down: flip its video
-  --invert-rear     rear camera is mounted upside down: flip its video
+  --invert-front AXES / --invert-rear AXES
+                    correct how that camera is mounted: a comma-separated
+                    list of v (mounted upside down) and h (image comes out
+                    mirrored) — "v", "h" or "v,h", either case, each axis
+                    once. Flipped at capture, so recordings need no fixing
   --root-size GIB   OS partition size in GiB (default: 8)
   --auth NAME:PASS  create this account (+ sshd). On its own it also arms
                     JOIN WIFI on the panel (needs --wifi-country)
@@ -83,8 +86,8 @@ MIN_DATA_BYTES=$((1024 * 1024 * 1024))    # refuse a /data smaller than 1 GiB
 
 BYPASS_TIME=0
 BYPASS_REAR=0
-INVERT_FRONT=0
-INVERT_REAR=0
+INVERT_FRONT=
+INVERT_REAR=
 ROOT_GIB=8
 DEBUG=0
 AUTH=0
@@ -101,8 +104,10 @@ while [ $# -gt 0 ]; do
     case $1 in
         --bypass-time) BYPASS_TIME=1 ;;
         --bypass-rear) BYPASS_REAR=1 ;;
-        --invert-front) INVERT_FRONT=1 ;;
-        --invert-rear)  INVERT_REAR=1 ;;
+        --invert-front) shift; INVERT_FRONT=${1:-}
+                        [ -n "$INVERT_FRONT" ] || die "--invert-front requires v, h or v,h" ;;
+        --invert-rear)  shift; INVERT_REAR=${1:-}
+                        [ -n "$INVERT_REAR" ] || die "--invert-rear requires v, h or v,h" ;;
         --root-size)   shift; ROOT_GIB=${1:-} ;;
         --debug)       DEBUG=1 ;;
         --auth)        shift; AUTH=1; USERSPEC=${1:-} ;;
@@ -159,6 +164,29 @@ if [ -n "$WIFISPEC" ]; then
         die "--wifi needs --wifi-country CC"
     FIRSTBOOT_WIFI=1
 fi
+
+# --invert-front/--invert-rear name the axes a camera's mounting has to be
+# corrected on: v (it is upside down) and/or h (its image comes out mirrored),
+# comma separated, in either case, each axis at most once. Validated HERE
+# rather than on the card because this is the last place a human is present to
+# read the message — the recorders run headless, and a value they cannot parse
+# costs a whole drive's footage before anyone sees the journal. Normalized to
+# one lowercase spelling ("v", "h", "v,h") so the conf carries exactly one form
+# and the two recorders can stay as simple as a case statement.
+AXES=
+parse_axes() {                     # $1 = option name, $2 = raw list → $AXES
+    local a v= h= IFS=,
+    for a in $2; do
+        case ${a,,} in
+            v) [ -z "$v" ] || die "$1: v listed twice in \"$2\""; v=v ;;
+            h) [ -z "$h" ] || die "$1: h listed twice in \"$2\""; h=h ;;
+            *) die "$1: bad axis \"$a\" — want v and/or h, comma separated" ;;
+        esac
+    done
+    case $v$h in vh) AXES=v,h ;; *) AXES=$v$h ;; esac
+}
+parse_axes --invert-front "$INVERT_FRONT"; INVERT_FRONT=$AXES
+parse_axes --invert-rear  "$INVERT_REAR";  INVERT_REAR=$AXES
 
 for t in dd sfdisk partprobe blkid mkfs.ext4 e2fsck resize2fs lsblk \
          blockdev udevadm findmnt mktemp awk sed tr wipefs; do need "$t"; done
@@ -218,8 +246,8 @@ else
 fi
 [ "$BYPASS_TIME" = 1 ] && echo "    bypass: TIME"
 [ "$BYPASS_REAR" = 1 ] && echo "    bypass: REAR"
-[ "$INVERT_FRONT" = 1 ] && echo "    invert: FRONT (camera mounted upside down)"
-[ "$INVERT_REAR" = 1 ] && echo "    invert: REAR (camera mounted upside down)"
+[ -n "$INVERT_FRONT" ] && echo "    invert: FRONT ($INVERT_FRONT)"
+[ -n "$INVERT_REAR" ] && echo "    invert: REAR ($INVERT_REAR)"
 if [ "$FIRSTBOOT_WIFI" = 1 ]; then
     echo "    wifi  : $WIFI_SSID ($WIFI_CC)"
 fi
@@ -399,13 +427,15 @@ if [ "$BYPASS_REAR" = 1 ]; then
     sed -i 's/^BYPASS_REAR=0/BYPASS_REAR=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
 fi
 # Mounting orientation: the recorders flip at capture, so the files on the
-# card are upright and nothing downstream has to know which way the camera
-# was screwed to the glass.
-if [ "$INVERT_FRONT" = 1 ]; then
-    sed -i 's/^INVERT_FRONT=0/INVERT_FRONT=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
+# card are upright and un-mirrored and nothing downstream has to know which
+# way the camera was screwed to the glass. The conf ships these EMPTY, so the
+# axis list is appended to the bare `NAME=` rather than substituted for a
+# value — which also leaves the line's trailing comment intact.
+if [ -n "$INVERT_FRONT" ]; then
+    sed -i "s/^INVERT_FRONT=/INVERT_FRONT=$INVERT_FRONT/" "$MNT/opt/dashberry/sw/etc/dashberry.conf"
 fi
-if [ "$INVERT_REAR" = 1 ]; then
-    sed -i 's/^INVERT_REAR=0/INVERT_REAR=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
+if [ -n "$INVERT_REAR" ]; then
+    sed -i "s/^INVERT_REAR=/INVERT_REAR=$INVERT_REAR/" "$MNT/opt/dashberry/sw/etc/dashberry.conf"
 fi
 if [ "$DEBUG" = 1 ]; then
     sed -i 's/^DEBUG=0/DEBUG=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
