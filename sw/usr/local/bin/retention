@@ -13,7 +13,7 @@ set -u
 avail_mb() { df -Pm "$DATA" | awk 'NR==2 {print $4}'; }
 
 while [ "$(avail_mb)" -le "$RETENTION_FLOOR_MB" ]; do
-    oldest=$(find "$DATA/front" "$DATA/rear" -name '*.mp4' -printf '%T@ %p\n' 2>/dev/null |
+    oldest=$(find "$DATA/front" "$DATA/rear" -name '*.ts' -printf '%T@ %p\n' 2>/dev/null |
              sort -n | head -n1 | cut -d' ' -f2-)
     [ -n "$oldest" ] || { echo "retention: below floor but nothing left to delete"; exit 1; }
     rm -f "$oldest" || { echo "retention: cannot delete $oldest (fs read-only?)"; exit 1; }

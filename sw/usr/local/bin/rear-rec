@@ -1,6 +1,6 @@
 #!/bin/sh
 # rear-rec — rear UVC (showmewebcam) MJPEG → software decode → software
-# H.264 (openh264) → 60 s fragmented MP4 segments. Exits (→ systemd Restart) if the camera is
+# H.264 (openh264) → 60 s MPEG-TS segments. Exits (→ systemd Restart) if the camera is
 # absent; the Zero normally beats the Pi 4 to readiness since both power on
 # ignition. Writes into the per-boot session directory minted by
 # session-init: a restart REUSES the same session dir.
@@ -16,13 +16,11 @@ mkdir -p "$OUT"
 # Restart-in-same-session: resume the %05d counter one past the highest
 # existing segment (splitmuxsink start-index), so nothing is overwritten
 # after an unplug/replug of the rear camera.
-START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.mp4$/ { if ($1 + 1 > s) s = $1 + 1 } END { print s + 0 }')
+START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.ts$/ { if ($1 + 1 > s) s = $1 + 1 } END { print s + 0 }')
 
-# Crash-restart tail: recover the previous run's last file's declared
-# duration from its sample tables (same qtmux bug as front-rec, see there).
-# Within-this-boot only — the PREVIOUS boot's tail is in another session dir
-# and belongs to tail-repair.service's boot sweep.
-tail-repair current rear || true
+# A crash-restart tail needs no repair: MPEG-TS has no header to finalize, so
+# the previous run's truncated last file is just a shorter file (see
+# front-rec for why the container changed).
 
 # jpegdec (SOFTWARE, ~1/3 core at 720p30) — deliberately NOT v4l2jpegdec.
 # The hardware decoder (bcm2835-codec, kernel 6.18) returns an empty
@@ -61,12 +59,12 @@ tail-repair current rear || true
 # wants it — rear simply no longer adds a firmware codec context.
 #
 # muxer= / sink= (not muxer-properties, which splitmuxsink silently ignores
-# unless async-finalize=true — the fragment-duration was never applied through
-# it): fragmented MP4 for power-cut recovery, unbuffered filesink so completed
-# fragments reach the card instead of dying in a 64 KB stdio buffer.
-# The -m watcher patches each closed segment's declared duration (mvhd/mehd)
-# — v4l2src's running time also grows continuously across segments, so the
-# same qtmux absolute-duration bug applies here; details in front-rec.
+# unless async-finalize=true): MPEG-TS for power-cut survivability — no index
+# to lose, so a truncated segment still reads — and an unbuffered filesink so
+# a closed segment is not sitting in a 64 KB stdio buffer when the 12 V dies.
+# Rationale in full, and the crash tail that prompted it, in front-rec.
+# The -m watcher fsyncs each closed segment (and its directory entry); it is
+# the only fsync in this capture path.
 #
 # INVERT_REAR (dashberry-install --invert-rear): the axes this camera's
 # mounting has to be corrected on — v if it is mounted upside down, h if its
@@ -128,17 +126,16 @@ stdbuf -oL gst-launch-1.0 -e -m v4l2src device="$REAR_CAM_DEV" \
     ! $FLIP $GAMMA queue max-size-buffers=8 \
     ! openh264enc bitrate="$REAR_BITRATE" gop-size="$REAR_FPS" \
     ! h264parse \
-    ! splitmuxsink location="$OUT/%05d.mp4" \
+    ! splitmuxsink location="$OUT/%05d.ts" \
         start-index="$START_INDEX" \
         max-size-time="$SEGMENT_NS" \
-        muxer="mp4mux fragment-duration=$FRAGMENT_MS" \
+        muxer=mpegtsmux \
         sink="filesink buffer-mode=unbuffered" |
 while IFS= read -r line; do
     case $line in
     *splitmuxsink-fragment-closed*)
         loc=${line#*"location=(string)"}; loc=${loc%%,*}
-        dur=${line#*"fragment-duration=(guint64)"}; dur=${dur%%[!0-9]*}
-        mp4-set-duration "$loc" "$dur" || echo "mp4-set-duration failed: $loc" >&2
+        sync "$loc" "$OUT" || echo "sync failed: $loc" >&2
         ;;
     esac
 done

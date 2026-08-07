@@ -12,7 +12,16 @@
 # commit=1 has nothing to order against, and a power cut leaves the open
 # segment as it was at the last writeback — 0 BYTES on the card for a tail
 # younger than ~30 s, for all that filesink wrote it unbuffered. Closed
-# segments never depended on any of this (mp4-set-duration fsyncs each one
-# while patching its duration); this line is about the segment being written
-# when the 12 V dies, which is the one with the impact on it.
+# segments do not depend on this line: each recorder fsyncs a segment (and
+# the directory entry) the moment splitmuxsink closes it. This line is about
+# the segment being written when the 12 V dies, which is the one with the
+# impact on it.
+#
+# What it CANNOT do is make a partially-filled 4 KB page whole. The commit
+# flushes that page with its tail zeroed, and the bytes that complete it are
+# written afterwards; if power goes before they land, the zeros stay. That is
+# survivable only because segments are MPEG-TS — the loss costs the frames it
+# covers, and the reader resyncs on the next 188-byte packet. The same holes
+# in fragmented MP4 destroyed a whole GOP each AND, once one landed on the
+# header, hid the entire file (crash tail, 2026-08-07).
 /dev/mmcblk0p3  /data  ext4  defaults,noatime,nodelalloc,data=ordered,commit=1,nofail  0 2

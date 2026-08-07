@@ -953,7 +953,10 @@ static void read_throttled(void)
         throttled = (uint32_t)strtoul(buf, NULL, 16);
 }
 
-static time_t newest_mp4_mtime(const char *base, const char *session)
+/* Segments are MPEG-TS (%05d.ts) — the ".ts" below is a 3-char suffix, so the
+ * length guard is "at least one character before it", not the 4-char form the
+ * MP4 era used. */
+static time_t newest_segment_mtime(const char *base, const char *session)
 {
     if (!*session)
         return 0;
@@ -966,7 +969,7 @@ static time_t newest_mp4_mtime(const char *base, const char *session)
     struct dirent *e;
     while ((e = readdir(d))) {
         size_t len = strlen(e->d_name);
-        if (len < 5 || strcmp(e->d_name + len - 4, ".mp4") != 0)
+        if (len < 4 || strcmp(e->d_name + len - 3, ".ts") != 0)
             continue;
         char p[768];
         snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
@@ -1197,14 +1200,14 @@ static void eval_health(int64_t now)
     }
 
     time_t t = time(NULL);
-    time_t mf = newest_mp4_mtime(FRONT_BASE, session);
+    time_t mf = newest_segment_mtime(FRONT_BASE, session);
     health.front = mf != 0 && (t - mf) <= STALE_SECS;
     /* Bypassed components (installed without the hardware) are pinned OK:
      * never ERR, so they can never reach PAGE 0 or fault the system. */
     if (bypass_rear) {
         health.rear = true;
     } else {
-        time_t mr = newest_mp4_mtime(REAR_BASE, session);
+        time_t mr = newest_segment_mtime(REAR_BASE, session);
         health.rear = mr != 0 && (t - mr) <= STALE_SECS;
     }
     health.gpsok = gps.state == GPS_UP &&
