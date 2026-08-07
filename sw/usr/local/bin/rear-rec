@@ -68,14 +68,35 @@ tail-repair current rear || true
 # — v4l2src's running time also grows continuously across segments, so the
 # same qtmux absolute-duration bug applies here; details in front-rec.
 #
-# INVERT_REAR=1 (dashberry-install --invert-rear): the camera is mounted
-# upside down. Unlike the front (where the ISP flips for free), this one
-# costs a videoflip element between the decoder and the encoder — a row
-# reversal on already-decoded I420, cheap next to the software jpegdec
-# that is already in the chain, and nothing in the UVC gadget is asked to
-# change (the Zero's image stays untouched, per the project rule). Rear
-# footage lands upright, so every downstream consumer stays ignorant.
-[ "${INVERT_REAR:-0}" = 1 ] && FLIP='videoflip method=vertical-flip !' || FLIP=
+# INVERT_REAR (dashberry-install --invert-rear): the axes this camera's
+# mounting has to be corrected on — v if it is mounted upside down, h if its
+# image arrives mirrored (plates and signs read backwards), "v,h" for both,
+# empty for neither. Unlike the front (where the ISP flips for free), this
+# one costs a videoflip element between the decoder and the encoder — a
+# reversal on already-decoded I420, cheap next to the software jpegdec that
+# is already in the chain, and nothing in the UVC gadget is asked to change
+# (the Zero's image stays untouched, per the project rule).
+#
+# Both axes at once is rotate-180 (vertical ∘ horizontal), NOT two elements,
+# so the two-axis mount costs exactly what a one-axis mount does. Horizontal
+# reverses within each row rather than reordering whole rows, so it is the
+# less cache-friendly of the two — still small beside the software decode,
+# but it is the one to name if a soak ever shows strain. Rear footage lands
+# upright and un-mirrored, so every downstream consumer stays ignorant.
+V=0 H=0
+for axis in $(printf '%s' "${INVERT_REAR:-}" | tr ',' ' ' | tr '[:upper:]' '[:lower:]'); do
+    case $axis in
+    v) V=1 ;;
+    h) H=1 ;;
+    *) echo "rear-rec: ignoring unknown INVERT_REAR axis '$axis'" >&2 ;;
+    esac
+done
+case "$V$H" in
+    11) FLIP='videoflip method=rotate-180 !' ;;
+    10) FLIP='videoflip method=vertical-flip !' ;;
+    01) FLIP='videoflip method=horizontal-flip !' ;;
+    *)  FLIP= ;;
+esac
 
 # REAR_GAMMA: the rear picture is too dark at night; the front (IMX708, HDR)
 # is not. The fix lands here rather than at the source for two reasons: the

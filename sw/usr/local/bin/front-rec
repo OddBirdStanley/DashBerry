@@ -66,11 +66,22 @@ tail-repair current front || true
 # reciprocal distance instead, 0.0 = infinity by default (VERIFY on bench:
 # sharp hood->infinity; 0.4 buys near-field at the cost of the far end).
 #
-# INVERT_FRONT=1 (dashberry-install --invert-front): the camera is mounted
-# upside down, so flip vertically AT CAPTURE — the ISP does it for free and
-# the recorded file is upright, which means every later consumer (the panel's
-# health check, dashberry-cli render, any player) needs to know nothing.
-[ "${INVERT_FRONT:-0}" = 1 ] && FLIP=--vflip || FLIP=
+# INVERT_FRONT (dashberry-install --invert-front): the axes this camera's
+# mounting has to be corrected on — v if it is screwed to the glass upside
+# down, h if its image comes out mirrored, "v,h" for both, empty for neither.
+# Flip AT CAPTURE — the ISP does it for free and the recorded file is already
+# correct, which means every later consumer (the panel's health check,
+# dashberry-cli render, any player) needs to know nothing. An axis we do not
+# recognise is announced rather than silently dropped: the value is installed
+# configuration, so a typo in it would otherwise cost a whole drive's footage.
+FLIP=
+for axis in $(printf '%s' "${INVERT_FRONT:-}" | tr ',' ' ' | tr '[:upper:]' '[:lower:]'); do
+    case $axis in
+    v) FLIP="$FLIP --vflip" ;;
+    h) FLIP="$FLIP --hflip" ;;
+    *) echo "front-rec: ignoring unknown INVERT_FRONT axis '$axis'" >&2 ;;
+    esac
+done
 rpicam-vid -t 0 -n \
     --width "$FRONT_W" --height "$FRONT_H" --framerate "$FRONT_FPS" \
     --bitrate "$FRONT_BITRATE" --intra "$FRONT_FPS" \

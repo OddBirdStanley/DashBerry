@@ -163,7 +163,7 @@ or manual configuration is ever needed.
 | `--debug` | build a DEBUG card — writable OS, journal kept and persistent, `--wifi` profile kept so it rejoins the LAN every boot. Requires `--auth`; JOIN WIFI is not armed (the card already knows a network) |
 | `--wifi SSID:PSK` | run the first boot over Wi-Fi instead of Ethernet; setup-only on a production card (the installer wipes the profile, DHCP leases and logs before the OS locks read-only), kept on a debug card |
 | `--wifi-country CC` | two-letter regulatory domain, required with `--wifi` and on a JOIN WIFI card (a stock image keeps Wi-Fi blocked without one) |
-| `--invert-front`, `--invert-rear` | that camera is mounted upside down — its video is flipped vertically at capture, so recordings are upright |
+| `--invert-front AXES`, `--invert-rear AXES` | correct how that camera is mounted: a comma-separated list of `v` (mounted upside down) and `h` (its image comes out mirrored) — `v`, `h` or `v,h`, either case, each axis once. The video is flipped at capture, so recordings are already upright and un-mirrored |
 
 Both bypass options default to off. With neither `--auth` nor `--debug` the
 card is a SEALED production card — no account, no SSH, no radios.
