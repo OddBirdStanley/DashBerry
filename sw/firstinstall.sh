@@ -292,7 +292,7 @@ udevadm control --reload
 # the next reboot, and gpsd's DEVICES= would point at nothing until then.
 udevadm trigger --action=add --subsystem-match=tty --subsystem-match=video4linux
 udevadm settle
-enable_units="dashberry.target session.service tail-repair.service \
+enable_units="dashberry.target session.service \
     gps-rate.service front-rec.service gps-log.service panel.service \
     retention.timer"
 if [ "$BYPASS_REAR" = "1" ]; then

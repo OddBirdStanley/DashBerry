@@ -82,7 +82,7 @@ def segments(data, session, camera):
         return []
     out = []
     for e in sorted(os.listdir(d)):
-        if e.endswith(".mp4"):
+        if e.endswith(".ts"):
             p = os.path.join(d, e)
             out.append((p, os.path.getmtime(p)))
     return out

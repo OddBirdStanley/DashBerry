@@ -1,5 +1,5 @@
 #!/bin/sh
-# front-rec — front CSI camera → hardware H.264 → 60 s fragmented MP4 segments.
+# front-rec — front CSI camera → hardware H.264 → 60 s MPEG-TS segments.
 # rpicam-vid does the capture+encode+TS-mux; GStreamer only demuxes and remuxes,
 # so a mux crash never touches the ISP. Writes into the per-boot session
 # directory minted by session-init: a recorder restart REUSES the same
@@ -13,15 +13,11 @@ mkdir -p "$OUT"
 
 # Restart-in-same-session: resume the %05d counter one past the highest
 # existing segment so filenames never collide (splitmuxsink start-index).
-START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.mp4$/ { if ($1 + 1 > s) s = $1 + 1 } END { print s + 0 }')
+START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.ts$/ { if ($1 + 1 > s) s = $1 + 1 } END { print s + 0 }')
 
-# The previous run of THIS session may have died mid-segment (crash restart):
-# that tail file's fragments are fine but its declared duration was never
-# corrected (see below) — recover it from the sample tables before we start.
-# This covers a restart WITHIN this boot only. The tail left by the PREVIOUS
-# boot sits in a different session dir, which nothing here can see;
-# tail-repair.service sweeps those once at boot.
-tail-repair current front || true
+# A previous run of THIS session may have died mid-segment. Nothing needs
+# doing about it: MPEG-TS has no header to finalize, so a truncated segment is
+# simply a shorter segment, readable by anything that can read a whole one.
 
 # Timestamps travel IN-BAND: the encoder's
 # own PTS/DTS ride the pipe inside an MPEG-TS container (--codec libav,
@@ -30,27 +26,38 @@ tail-repair current front || true
 # stream on the receiving side (fdsrc do-timestamp + framerate caps +
 # h264timestamper) was structurally broken: splitmuxsink prerolls async, so
 # the pipeline has no clock until data already flowed — the leading frames
-# can never be stamped, and mp4mux aborts on the first PTS-less buffer as
+# can never be stamped, and the muxer aborts on the first PTS-less buffer as
 # soon as the first GOP leaves splitmuxsink's queue (the "~1 s in" crash).
 # Needs full rpicam-apps (firstinstall.sh) — rpicam-apps-lite has no libav.
 #
-# --intra = 1 keyframe/s so splitmuxsink can cut close to the 60 s mark.
-# muxer= / sink= (not muxer-properties, which splitmuxsink silently ignores
-# unless async-finalize=true): fragment-duration keeps a power-cut segment
-# playable up to its last ~1 s fragment, and the unbuffered filesink makes
-# sure completed fragments actually reach the card instead of dying in a
-# 64 KB stdio buffer.
+# --intra = 1 keyframe/s so splitmuxsink can cut close to the 60 s mark, and
+# so a reader landing mid-file is never more than a second from a resync point.
 #
-# The -m watcher works around a GStreamer 1.26 qtmux bug: with
-# continuous input running time, each
-# segment's DECLARED duration (mvhd/mehd) is written as the muxer's absolute
-# running time — segment N claims N minutes (VLC trusts the declaration;
-# ffprobe scans and is immune), while tfdt/trun sample data is correct. A
-# fresh muxer per fragment (async-finalize) inherits the same absolute time,
-# so no splitmuxsink config avoids it. Instead: splitmuxsink posts
-# splitmuxsink-fragment-closed with the file's true duration; we patch the
-# boxes the moment each file closes. stdbuf keeps -m line-buffered so the
-# patch happens within the second, not 4 KB of messages later.
+# MPEG-TS ON THE CARD, not MP4 — the container IS the crash strategy. TS is
+# append-only and self-describing: 188-byte packets behind an 0x47 sync byte,
+# PAT/PMT repeated through the stream, no index anywhere. Nothing a power cut
+# damages can hide the bytes that survived it. Fragmented MP4 could not say
+# that, because its moof chain is load-bearing: the crash tail diagnosed on
+# 2026-08-07 lost 3.2 KB at byte 858 — one zeroed box header, which the spec
+# reads as "this box extends to EOF" — and that made all 5.7 MB unreadable to
+# ffmpeg and to every player, the 11 good seconds included. The same loss in
+# TS costs the frames it lands on and nothing else. It is also free to
+# produce: rpicam-vid already hands us MPEG-TS, so tsdemux -> mpegtsmux is a
+# repacketize rather than a decode, and what it buys is splitmuxsink's 60 s
+# keyframe-aligned cutting.
+#
+# muxer= / sink= (not muxer-properties, which splitmuxsink silently ignores
+# unless async-finalize=true), and the unbuffered filesink so a closed segment
+# is not still sitting in a 64 KB stdio buffer when the 12 V dies.
+#
+# The -m watcher is now purely durability: splitmuxsink posts
+# splitmuxsink-fragment-closed as each file closes, and we fsync that file
+# (and the directory, for its dirent) right then. Without it NOTHING in the
+# capture path would fsync — the MP4 duration patcher used to do it as a side
+# effect, and it left with the rest of the finalization machinery. stdbuf
+# keeps -m line-buffered so the fsync happens within the second rather than
+# 4 KB of messages later.
+#
 # Focus is pinned, never hunting: rain and dirt on the windshield sit far
 # inside the lens's minimum focus distance, and continuous AF would pull
 # focus off the road to chase them.
@@ -91,17 +98,16 @@ rpicam-vid -t 0 -n \
 stdbuf -oL gst-launch-1.0 -e -m fdsrc fd=0 \
     ! tsdemux \
     ! h264parse \
-    ! splitmuxsink location="$OUT/%05d.mp4" \
+    ! splitmuxsink location="$OUT/%05d.ts" \
         start-index="$START_INDEX" \
         max-size-time="$SEGMENT_NS" \
-        muxer="mp4mux fragment-duration=$FRAGMENT_MS" \
+        muxer=mpegtsmux \
         sink="filesink buffer-mode=unbuffered" |
 while IFS= read -r line; do
     case $line in
     *splitmuxsink-fragment-closed*)
         loc=${line#*"location=(string)"}; loc=${loc%%,*}
-        dur=${line#*"fragment-duration=(guint64)"}; dur=${dur%%[!0-9]*}
-        mp4-set-duration "$loc" "$dur" || echo "mp4-set-duration failed: $loc" >&2
+        sync "$loc" "$OUT" || echo "sync failed: $loc" >&2
         ;;
     esac
 done
