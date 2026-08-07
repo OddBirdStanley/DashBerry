@@ -558,18 +558,40 @@ def build_timeline_filter(pieces, idx0, w, h, label):
     return inputs, lines, i
 
 
+def ticking_spans(spans, epoch0, text):
+    """Chop spans into one event per displayed second, each stamped with
+    its own clock. A Dialogue's text is fixed for the life of the event,
+    so a clock that ticks has to be one event per tick. epoch0 is the
+    display epoch of timeline zero (lo + shift); cuts land on whole
+    display seconds so the digits never change mid-event."""
+    out = []
+    for a, b in spans:
+        t = a
+        while t < b - 1e-6:
+            sec = math.floor(epoch0 + t + 1e-6)
+            nxt = min(b, sec + 1 - epoch0)
+            shown = dt.datetime.fromtimestamp(sec, dt.timezone.utc)
+            out.append((t, nxt, "%s  %s"
+                        % (shown.strftime("%Y-%m-%d %H:%M:%S"), text)))
+            t = nxt
+    return out
+
+
 def write_timeline_ass(fixes, health, lo, hi, shift, units, annotate, tmpdir):
     """.ass overlay for a timeline render, or None if there is nothing to
-    say. With annotate: one event per fix, as in write_ass, but capped at
-    2 s so a stale data line never lingers into a GPS hole. GPS trouble
-    labels: health-log gps ERR spans read "GPS Error", no-fix spans "GPS
-    No Signal" (ERR wins where they overlap — a dead gpsd also drops the
-    fix). Without a health log, holes > 2 s in the RMC timeline stand in
-    for the no-fix spans. Trouble spans yield to annotate events (a fix
-    on screen is precise data; span edges are heartbeat-coarse, and
-    synthesized no-fix spans start at the last fix itself): at most one
-    event is active at any instant, so libass never collision-stacks the
-    overlay onto a second line."""
+    say. With annotate: one event per fix, capped at 2 s so a stale data
+    line never lingers into a GPS hole. GPS trouble labels: health-log
+    gps ERR spans read "GPS Error", no-fix spans "GPS No Signal" (ERR
+    wins where they overlap — a dead gpsd also drops the fix). Without a
+    health log, holes > 2 s in the RMC timeline stand in for the no-fix
+    spans. Trouble spans yield to annotate events (a fix on screen is
+    precise data; span edges are heartbeat-coarse, and synthesized no-fix
+    spans start at the last fix itself): at most one event is active at
+    any instant, so libass never collision-stacks the overlay onto a
+    second line. Trouble labels carry the clock too — chopped one event
+    per second by ticking_spans, since the 2 s annotate cap means a hole
+    would otherwise show no time at all. That clock is the timeline's own
+    (RTC/health-log derived), which survives a dead GPS."""
     factor, label = ((KNOTS_TO_KMH, "KMH") if units == "KMH"
                      else (KNOTS_TO_MPH, "MPH"))
     if health:
@@ -603,10 +625,8 @@ def write_timeline_ass(fixes, health, lo, hi, shift, units, annotate, tmpdir):
                 int(knots * factor + 0.5), label)))
     err = spans_subtract([(a - lo, b - lo) for a, b in err], ann)
     nofix = spans_subtract([(a - lo, b - lo) for a, b in nofix], ann)
-    for a, b in err:
-        lines.append((a, b, "GPS Error"))
-    for a, b in nofix:
-        lines.append((a, b, "GPS No Signal"))
+    lines += ticking_spans(err, lo + shift, "GPS Error")
+    lines += ticking_spans(nofix, lo + shift, "GPS No Signal")
     if not lines:
         return None
     lines.sort()
