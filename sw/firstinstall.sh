@@ -22,21 +22,110 @@
 #     profile instead of Ethernet).
 #
 # Whatever the mode, the card ends this script RF-KILLED and boots that way.
-# What makes later boots safe is the STATE the card boots from, not the
-# take-down here: radios_off() below blocks the radios AND pins the two
-# state files that boot-time daemons replay over the switch every boot
-# (NetworkManager's WirelessEnabled, systemd-rfkill's saved soft state),
-# then proves all of it; a production card additionally masks
-# systemd-rfkill, and 99-dashberry-rfkill.rules blocks the switch as it
-# appears as defense in depth. The one exception is a debug card that was
-# given a --wifi profile — an explicit request for a card that rejoins the
-# LAN by itself — where the rule is removed again.
+# What makes LATER boots RF-KILLED is dashberry-rfkill.service, which
+# asserts the block after NetworkManager — after the last thing that can
+# speak for the switch. Everything else is depth beneath it: radios_off()
+# below pins the two state files boot daemons replay (NetworkManager's
+# WirelessEnabled, systemd-rfkill's saved soft state) and proves it, a
+# production card masks systemd-rfkill, and 99-dashberry-rfkill.rules
+# blocks the switch as it appears. That layering is deliberate — the state
+# files only decide a boot while the OS is really read-only, and a card
+# whose overlay silently failed to arm proved that is not something to bet
+# the RF guarantee on (2026-08-08). The one exception, for the service and
+# the udev rule alike, is a debug card given a --wifi profile — an explicit
+# request for a card that rejoins the LAN by itself.
+#
+# Every run appends to an install log on the BOOT partition (see the block
+# below) — the card's black box, and the only record of this script that
+# outlives it.
 #
 # dashberry-cli (../cli) is PC-side and is deliberately NOT installed here —
 # it never ships on the image.
 set -eu
 
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
+
+# --- the install log ------------------------------------------------------
+# The journal cannot be this script's record. On a production card journald
+# is volatile (Storage=auto, no /var/log/journal) and this script ENDS BY
+# REBOOTING, so a successful install destroys its own log; only a FAILED
+# install leaves one behind, in the boot it died in. That asymmetry is not
+# academic — it is why the overlay step's output had never once been read
+# (2026-08-08), while the apt failure of 2026-08-05 was captured easily.
+#
+# The boot partition is the one place that survives both: FAT, written
+# before the overlay exists, NOT covered by the read-only overlay
+# afterwards, and readable by pulling the card into any PC — no ssh, no
+# account, no working card required. /data would survive too, but a card
+# that fails early may not have reached it.
+#
+# Appended, never truncated: a card that dies at apt runs this again on the
+# next boot, and the sequence of attempts is itself evidence. One rotation
+# at 4 MB, because a card that boot-loops must not fill the partition the
+# kernel and firmware live on.
+#
+# WHAT MAY BE IN THIS FILE — it ships on every card, and the boot partition
+# is FAT (mode bits do not survive), so treat it as readable by anyone
+# holding the card. That is the same threat model the credential wipe
+# answers, so the log must never weaken it:
+#   NEVER: a Wi-Fi passphrase or SSID, the account name or its hash, the
+#   contents of any keyfile, /etc/shadow, userconf.txt, or NM profile.
+#   Nothing in this script reads any of them — the PSK is handled PC-side
+#   by dashberry-install and at runtime by rf-ctl, neither of which writes
+#   here — and every nmcli/rfkill/journalctl call is output-suppressed so a
+#   future error string cannot carry one in.
+#   ALLOWED, and deliberate: package names and mirror URLs, device paths,
+#   unit names, timings, the DS3231 sync, the overlay evidence, and
+#   cmdline.txt verbatim (regdom included — a country code names no
+#   network, and that file sits in this very directory, so quoting it adds
+#   no exposure).
+#   KNOWN EDGE: apt error text quotes whatever mirror or proxy the install
+#   network injected, so a captive portal can put a local hostname in here.
+#   Named rather than hidden; wipe the file if that matters for a card.
+#
+# The tee re-execs this script once, with DB_INSTALL_LOG=1 marking the
+# inner run. The journal and console still receive everything (tee's own
+# stdout is this process's stdout) — the log is an addition, not a
+# diversion. Two known effects, both accepted: stderr is folded into stdout
+# for the inner run (the journal stops distinguishing them), and if the
+# boot partition is not writable the tee is skipped silently and the script
+# behaves exactly as it did before.
+BOOTFW=/boot/firmware
+[ -d "$BOOTFW" ] || BOOTFW=/boot
+INSTALL_LOG=$BOOTFW/dashberry-install.log
+if [ "$(stat -c %s "$INSTALL_LOG" 2>/dev/null || echo 0)" -gt 4194304 ]; then
+    mv -f "$INSTALL_LOG" "$INSTALL_LOG.1" 2>/dev/null || true
+fi
+if [ "${DB_INSTALL_LOG:-0}" != 1 ] && touch "$INSTALL_LOG" 2>/dev/null; then
+    DB_INSTALL_LOG=1
+    export DB_INSTALL_LOG
+    # A pipeline's status is its LAST command's (tee, always 0), so the
+    # real one rides in a file — systemd must still see this script fail.
+    # `set +e` is needed for that handoff to run at all, and is confined to
+    # the subshell the pipeline's left side already is.
+    _rc_file=/run/dashberry-firstinstall.rc
+    rm -f "$_rc_file"
+    {
+        echo
+        echo "===== firstinstall $(date -u '+%Y-%m-%dT%H:%M:%SZ') UTC ====="
+        # Card clock, and it is allowed to be wrong: an install that runs at
+        # the image build date is exactly the apt-404 fingerprint.
+        set +e
+        "$0" "$@"
+        echo "$?" > "$_rc_file"
+    } 2>&1 | tee -a "$INSTALL_LOG"
+    if [ -s "$_rc_file" ]; then
+        _st=$(cat "$_rc_file")
+    else
+        _st=1   # no status file: the inner run died before the handoff
+    fi
+    rm -f "$_rc_file"
+    # The script's last act is `systemctl --no-block reboot`, which returns
+    # before the log is on the card. Nothing else would flush FAT in time.
+    sync
+    exit "$_st"
+fi
+
 cd "$(dirname "$0")"
 
 FROM_UNIT=0
@@ -144,6 +233,21 @@ done
 # only moment the card is online, so a binary missing here is missing for
 # the life of the card. util-linux is named alongside it so the pair reads
 # as one stated requirement rather than an assumed base package.
+# overlayroot is the read-only OS itself, and it is listed HERE — with the
+# network guaranteed up — on purpose. raspi-config (20260522, trixie) no
+# longer builds a custom initramfs for `boot=overlay`: enable_overlayfs()
+# now runs `is_installed overlayroot || apt-get install -y overlayroot` and
+# writes `overlayroot=tmpfs` to the cmdline. That apt-get is the trap. It
+# runs deep inside the production branch, and on a --wifi card
+# radios_off has already taken the only network down three lines earlier,
+# so it dies on DNS — and its failure is swallowed by the `||`, leaving
+# raspi-config to write an inert token and exit 0. Field-observed
+# 2026-08-08: a JOIN WIFI card that reported "overlay armed" and had been
+# running read-WRITE ever since, which is what let a JOIN WIFI session's
+# WirelessEnabled=true persist and boot the card RF-ENABLED for life.
+# Installing it here makes raspi-config's is_installed short-circuit, so
+# the overlay step needs no network at all. Costs ~3.4 MB with its
+# cryptsetup dependencies.
 # The last four are the diagnostic toolchain, and they go on EVERY card —
 # production included, not just --debug. The apt step is the card's only
 # online moment, so a tool missing here is missing for the life of that
@@ -178,7 +282,7 @@ done
 apt-get install -y --no-install-recommends \
     rpicam-apps gstreamer1.0-tools gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad gpsd gpsd-clients chrony gcc make \
-    util-linux util-linux-extra \
+    util-linux util-linux-extra overlayroot \
     ffmpeg v4l-utils gstreamer1.0-libav gstreamer1.0-plugins-ugly
 
 echo "building panel daemon..."
@@ -332,6 +436,16 @@ if [ "$BYPASS_REAR" = "1" ]; then
 else
     enable_units="$enable_units rear-rec.service"
 fi
+# The boot-time RF assert goes on every card that is supposed to boot
+# RF-KILLED — which is every card except the one build that is meant to
+# come up live, a debug card given a --wifi profile. That is byte for byte
+# the condition under which the udev rule is removed below, deliberately:
+# the two layers must never disagree about which card is allowed radios.
+if [ "$DEBUG" = 1 ] && [ "$FIRSTBOOT_WIFI" = 1 ]; then
+    echo "debug card with --wifi: dashberry-rfkill.service stays disabled"
+else
+    enable_units="$enable_units dashberry-rfkill.service"
+fi
 # shellcheck disable=SC2086 — word splitting is the point
 systemctl enable $enable_units
 
@@ -412,6 +526,55 @@ radios_off() {
     fi
 }
 
+# Everything a later reader needs to decide whether the overlay ACTUALLY
+# armed — dumped into the install log, which outlives the reboot and the
+# seal. It cannot be decided HERE: `raspi-config nonint do_overlayfs 0`
+# only edits files, and whether those files produce a read-only root is not
+# known until the next boot. So this records the inputs to that boot rather
+# than judging them, and the log settles it afterwards.
+#
+# The two config.txt paths are the point. Since bookworm the firmware reads
+# the BOOT PARTITION's config.txt (/boot/firmware/config.txt); /boot is an
+# ordinary directory on the root filesystem, and an `initramfs` line landing
+# there is read by nobody. `boot=overlay` on the kernel cmdline is inert
+# without an initramfs actually loaded, so a card can arm the overlay,
+# report success, and still boot read-write for its whole life. Hence also
+# the verbatim dump of this card's own enable_overlayfs(): which file it
+# writes is the question, and the answer is different per raspi-config
+# version.
+#
+# Nothing here may abort the install — every probe absorbs its own failure.
+overlay_evidence() {
+    echo "--- overlay evidence (raspi-config exit $1) ---"
+    echo "raspi-config version: $(dpkg-query -W -f='${Version}' raspi-config \
+        2>/dev/null || echo unknown)"
+    for _f in /boot/config.txt "$BOOTFW/config.txt"; do
+        printf 'initramfs line in %s: %s\n' "$_f" \
+            "$(grep -i '^[[:space:]]*initramfs' "$_f" 2>/dev/null || echo NONE)"
+    done
+    # Both naming conventions: initrd.img-<kernel> is what the kernel hooks
+    # build into /boot, initramfs8 / initramfs_2712 is what the raspi
+    # firmware hook copies onto the boot partition and what auto_initramfs
+    # actually loads. The first pass of this dump globbed only the former
+    # and reported the latter "absent", which proved nothing.
+    for _i in /boot/initrd.img-* "$BOOTFW"/initrd.img-* "$BOOTFW"/initramfs*; do
+        if [ -e "$_i" ]; then ls -l "$_i"; else echo "absent: $_i"; fi
+    done
+    printf 'overlayroot package: %s\n' \
+        "$(dpkg-query -W -f='${Status}' overlayroot 2>/dev/null || echo 'not installed')"
+    # Verbatim, not grepped for one token: this is the file the firmware
+    # reads, it lives on the same partition as this log, and which token
+    # means "overlay" has already changed once under us.
+    printf 'cmdline: %s\n' "$(cat "$CMDLINE" 2>/dev/null || echo unreadable)"
+    # Still the pre-flip mount, always — recorded as the baseline the next
+    # boot has to change.
+    printf 'root now: %s\n' "$(findmnt -no SOURCE,FSTYPE / 2>/dev/null || echo unknown)"
+    echo "--- raspi-config enable_overlayfs() as installed ---"
+    sed -n '/^enable_overlayfs()/,/^}/p' /usr/bin/raspi-config 2>/dev/null ||
+        echo "(raspi-config not readable)"
+    echo "--- end overlay evidence ---"
+}
+
 if [ "$DEBUG" = 1 ]; then
     # DEBUG card: keep the Wi-Fi profile (the card rejoins the LAN every
     # boot), keep the journal, and make it persistent — /var/log/journal
@@ -440,6 +603,73 @@ if [ "$DEBUG" = 1 ]; then
         radios_off
     fi
 else
+    # THE OVERLAY IS ARMED FIRST, WHILE THE CARD IS STILL ONLINE. It used
+    # to be the last step, after radios_off had taken the network down, and
+    # on trixie that ordering is fatal: raspi-config's enable_overlayfs now
+    # begins `is_installed overlayroot || apt-get install -y overlayroot`,
+    # so the step needs a network — and on a --wifi card there is none left
+    # by then. It died on DNS, the `||` swallowed the failure, and
+    # raspi-config wrote an inert token and exited 0 (field-observed
+    # 2026-08-08, see the apt step). Ordering costs nothing to fix: arming
+    # only edits the cmdline and installs a package, and the overlay does
+    # not take effect until the next boot — so nothing this branch does
+    # afterwards is any less frozen for having armed early. The apt step
+    # also installs overlayroot outright, so this is belt AND braces.
+    echo "enabling the read-only OS overlay..."
+    # 0 = enable in raspi-config's nonint convention. Its exit status is
+    # taken separately from the token check below so the log can tell
+    # "raspi-config refused" from "raspi-config claimed success and the
+    # token is missing" — they were one branch, and the difference is the
+    # whole diagnosis.
+    if raspi-config nonint do_overlayfs 0; then
+        _rc_overlay=0
+    else
+        _rc_overlay=$?
+    fi
+    overlay_evidence "$_rc_overlay"
+    # raspi-config's exit status is known to lie (0 with the package
+    # install failed), so the postcondition is checked here rather than
+    # trusted. Two mechanisms are accepted because the image changed one
+    # under us without notice and may again: trixie's raspi-config writes
+    # `overlayroot=tmpfs` and needs the overlayroot package to implement
+    # it; older ones wrote `boot=overlay` and built their own initramfs.
+    # Whichever is in play, a token alone is inert — hence the package
+    # test, and hence the next-boot VERIFY that no install-time check can
+    # stand in for.
+    _overlay_ok=0
+    if grep -q 'overlayroot=tmpfs' "$CMDLINE" 2>/dev/null; then
+        # Two independent tests, because a false negative here would warn on
+        # every good card and train the reader to ignore the warning: the
+        # dpkg status field, and the binary the package actually ships. The
+        # status test matches 'ok installed' rather than the full
+        # 'install ok installed' so a held package still counts as present.
+        if dpkg-query -W -f='${Status}' overlayroot 2>/dev/null |
+                grep -q 'ok installed' ||
+                command -v overlayroot-chroot >/dev/null 2>&1; then
+            _overlay_ok=1
+        else
+            echo "WARNING: cmdline says overlayroot=tmpfs but the overlayroot" >&2
+            echo "         package is NOT installed — the token is inert and" >&2
+            echo "         this card will boot READ-WRITE." >&2
+        fi
+    elif grep -q 'boot=overlay' "$CMDLINE" 2>/dev/null; then
+        _overlay_ok=1
+    fi
+    if [ "$_rc_overlay" = 0 ] && [ "$_overlay_ok" = 1 ]; then
+        echo "overlay armed (to make the OS writable again: raspi-config nonint do_overlayfs 1 + reboot)"
+        # Armed is not sealed. Everything above is a precondition; whether
+        # the root actually mounts read-only is only true at the next boot,
+        # and this is the check that has never been run on any card.
+        echo "VERIFY after the reboot: 'findmnt -no FSTYPE /' must say overlay."
+    else
+        echo "WARNING: could not enable the overlay noninteractively —" >&2
+        echo "         this card's OS will stay WRITABLE, which also means a" >&2
+        echo "         JOIN WIFI session's credential and radio state survive" >&2
+        echo "         reboots. Read the overlay evidence above in" >&2
+        echo "         $INSTALL_LOG, then run" >&2
+        echo "         'sudo raspi-config' > Performance > Overlay FS by hand." >&2
+    fi
+
     echo "production card: wiping stored Wi-Fi credentials..."
     # Must happen BEFORE the overlay flip: anything left now is frozen into
     # the read-only OS forever. Wiped: the NM profile (holds the plaintext
@@ -480,16 +710,6 @@ else
     if [ "$FIRSTBOOT_WIFI" = 1 ]; then
         journalctl --rotate --vacuum-time=1s >/dev/null 2>&1 || true
     fi
-
-    echo "enabling the read-only OS overlay..."
-    # nonint do_overlayfs works headless — 0 = enable in raspi-config's
-    # convention; takes effect at the next boot.
-    if raspi-config nonint do_overlayfs 0 && grep -q boot=overlay "$CMDLINE"; then
-        echo "overlay armed (to make the OS writable again: raspi-config nonint do_overlayfs 1 + reboot)"
-    else
-        echo "WARNING: could not enable the overlay noninteractively;" >&2
-        echo "         run 'sudo raspi-config' > Performance > Overlay FS by hand." >&2
-    fi
 fi
 
 # self-remove: this must never run twice (and never ships in the runtime)
@@ -499,6 +719,8 @@ rm -f /etc/systemd/system/dashberry-firstinstall.service \
 
 echo
 echo "firstinstall done."
+echo "install log: $INSTALL_LOG (survives the reboot and the overlay; also"
+echo "             readable by pulling the card into any PC)"
 if [ "$FROM_UNIT" = 1 ]; then
     echo "rebooting into the installed system..."
     systemctl --no-block reboot

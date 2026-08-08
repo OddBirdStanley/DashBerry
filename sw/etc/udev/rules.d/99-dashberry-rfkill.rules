@@ -15,9 +15,12 @@
 # each replaying a /var/lib state file that on a production card is a
 # frozen copy of install-time state, served identically every boot. A card
 # whose frozen state said "unblocked" therefore booted RF-ENABLED despite
-# this rule. What actually holds the boot RF-KILLED is firstinstall:
-# radios_off pins both state files to "blocked" before the overlay
-# freezes them, and a production card masks systemd-rfkill outright.
+# this rule. What actually holds the boot RF-KILLED is
+# dashberry-rfkill.service, ordered after NetworkManager so it speaks last;
+# firstinstall's radios_off (pinning both state files before the overlay
+# freezes them) and the systemd-rfkill mask sit underneath it, and were on
+# their own until 2026-08-08 — when a card whose overlay never armed showed
+# that frozen state decides a boot only while the OS is really read-only.
 #
 # ACTION=="add" is load-bearing: an rfkill state change also reaches udev,
 # and an unqualified rule would re-block the radios underneath a live

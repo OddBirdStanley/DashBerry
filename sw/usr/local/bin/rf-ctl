@@ -15,6 +15,8 @@
 #   rf-ctl connect     read SSID then passphrase from STDIN (one per line),
 #                      write a 0600 keyfile and bring it up
 #   rf-ctl down        drop the profile and block the radios again
+#   rf-ctl boot-kill   assert the block at boot, after every replayer, and
+#                      prove it (dashberry-rfkill.service — not the panel)
 #
 # The passphrase arrives on stdin and is written under umask 077 — it is
 # never an argument (argv is world-readable through /proc), never echoed,
@@ -28,7 +30,10 @@ PROFILE=/etc/NetworkManager/system-connections/$PROFILE_ID.nmconnection
 
 command -v nmcli >/dev/null 2>&1 || {
     echo "rf-ctl: nmcli not found — this card has no NetworkManager" >&2
-    exit 1
+    # boot-kill must fail CLOSED. Blocking the kernel switch does not need
+    # NetworkManager, and a card with no nmcli is the last one that should
+    # be left with its radios up because a helper was missing.
+    [ "${1:-}" = boot-kill ] || exit 1
 }
 
 # Remove the profile whether or not it is up. Never fatal: `down` must
@@ -38,6 +43,22 @@ drop_profile() {
     nmcli connection down "$PROFILE_ID" >/dev/null 2>&1 || true
     rm -f "$PROFILE"
     nmcli connection reload >/dev/null 2>&1 || true
+}
+
+# True while some wlan rfkill switch is clear BOTH ways — byte for byte the
+# condition the panel's glyph reads (rf_unblocked() in dashberry-panel.c)
+# and the one firstinstall's radios_off proves against, so no two of them
+# can ever disagree about what RF-ENABLED means. No wlan switch at all
+# counts as blocked, exactly as it does there.
+rf_live() {
+    for _s in /sys/class/rfkill/rfkill*; do
+        [ -d "$_s" ] || continue
+        [ "$(cat "$_s/type" 2>/dev/null)" = wlan ] || continue
+        [ "$(cat "$_s/soft" 2>/dev/null)" = 0 ]    || continue
+        [ "$(cat "$_s/hard" 2>/dev/null)" = 0 ]    || continue
+        return 0
+    done
+    return 1
 }
 
 case "${1:-}" in
@@ -160,8 +181,60 @@ down)
     rfkill block wifi 2>/dev/null || true
     ;;
 
+boot-kill)
+    # Once per boot, from dashberry-rfkill.service, ordered after the last
+    # thing that can speak for the wlan switch. Until this existed a boot's
+    # RF state was decided entirely by STATE — the frozen
+    # NetworkManager.state and rfkill state files — with nothing asserting
+    # it afterwards, so any card whose OS turned out to be writable (an
+    # overlay that silently failed to arm, a debug card, a card someone
+    # unsealed) carried a JOIN WIFI session's WirelessEnabled=true across
+    # every later boot, permanently, with no code path on the card able to
+    # undo it (field-observed 2026-08-08). This makes RF-KILLED-at-boot
+    # true by assertion instead of inferred from three layers cooperating.
+    #
+    # No drop_profile: the panel writes that keyfile after boot, and a
+    # session the user opens later is not this unit's business — it runs
+    # once, latched by RemainAfterExit.
+    #
+    # `nmcli radio wifi off` leads for its side effect as much as its
+    # effect: on a writable OS it rewrites WirelessEnabled=false into
+    # NetworkManager.state, so a card poisoned by an earlier session heals
+    # on this boot instead of replaying that session forever.
+    nmcli radio wifi off >/dev/null 2>&1 || true
+    rfkill block wifi 2>/dev/null || true
+
+    # Winning the ordering race is not winning the write: NM applies the
+    # killswitch asynchronously and can assert an unblock a moment after
+    # ours lands. So re-assert while anything brings the switch back, and
+    # only believe it once it has stayed down for 5 straight polls (1 s).
+    # Capped at 5 s. A quiet boot leaves this loop after ~1 s, and nothing
+    # is ordered after this unit, so no part of the drive waits on it.
+    i=0
+    quiet=0
+    while [ "$i" -lt 25 ] && [ "$quiet" -lt 5 ]; do
+        if rf_live; then
+            nmcli radio wifi off >/dev/null 2>&1 || true
+            rfkill block wifi 2>/dev/null || true
+            quiet=0
+        else
+            quiet=$((quiet + 1))
+        fi
+        sleep 0.2
+        i=$((i + 1))
+    done
+
+    if rf_live; then
+        # Reported, not fatal — the card must still record. The panel's
+        # glyph reads the switch directly, so the OLED already says so.
+        echo "rf-ctl: wlan is STILL live after boot-kill — this card came" >&2
+        echo "        up RF-ENABLED and something is re-asserting it" >&2
+        exit 1
+    fi
+    ;;
+
 *)
-    echo "usage: rf-ctl scan|connect|down" >&2
+    echo "usage: rf-ctl scan|connect|down|boot-kill" >&2
     exit 2
     ;;
 esac
