@@ -626,6 +626,31 @@ else
     else
         _rc_overlay=$?
     fi
+    # recurse=0 IS THE DIFFERENCE BETWEEN A DASHCAM AND A RAM DISK.
+    # raspi-config writes a bare `overlayroot=tmpfs`, and overlayroot's
+    # `recurse` defaults to **1**: "if set to 1, then all filesystems will
+    # be mounted read-only" — every filesystem, /data included. A card that
+    # booted that way mounted the footage partition under a tmpfs upper, so
+    # every segment front-rec and rear-rec wrote went into RAM and died with
+    # the ignition, the ext4 partition stayed empty, and df drained as video
+    # filled memory. The kernel says so out loud ("overlayfs: upperdir is
+    # in-use as upperdir/workdir of another mount, accessing files from both
+    # mounts will result in undefined behavior") and the recorders' own
+    # `sync` could not find segments gst had just closed. Field-observed
+    # 2026-08-08, on the first card where the overlay actually worked —
+    # footage from those boots is unrecoverable.
+    #
+    # recurse=0 is the documented case for exactly this layout: "only root
+    # will be set to read-only, and changes to other filesystems will be
+    # permenant [sic] ... if /home is on a separate partition from / and
+    # recurse set to 0 then changes to /home will go through to the original
+    # device". /data is that partition, and it must go through.
+    if grep -q 'overlayroot=tmpfs' "$CMDLINE" 2>/dev/null &&
+            ! grep -q 'recurse=' "$CMDLINE" 2>/dev/null; then
+        sed -i 's/\(^\| \)overlayroot=tmpfs\( \|$\)/\1overlayroot=tmpfs:recurse=0\2/' \
+            "$CMDLINE"
+        echo "overlay: pinned overlayroot=tmpfs:recurse=0 (/data must stay writable)"
+    fi
     overlay_evidence "$_rc_overlay"
     # raspi-config's exit status is known to lie (0 with the package
     # install failed), so the postcondition is checked here rather than
@@ -643,7 +668,15 @@ else
         # dpkg status field, and the binary the package actually ships. The
         # status test matches 'ok installed' rather than the full
         # 'install ok installed' so a held package still counts as present.
-        if dpkg-query -W -f='${Status}' overlayroot 2>/dev/null |
+        if ! grep -q 'overlayroot=tmpfs:recurse=0' "$CMDLINE" 2>/dev/null; then
+            # Refuse to call this armed. A card that seals its root but also
+            # swallows /data records into RAM and loses every drive, which is
+            # worse than never sealing at all.
+            echo "WARNING: overlayroot is set WITHOUT recurse=0 — it would" >&2
+            echo "         overlay /data too and every recording would go to" >&2
+            echo "         RAM and die with the ignition. Fix cmdline.txt to" >&2
+            echo "         'overlayroot=tmpfs:recurse=0' before deploying." >&2
+        elif dpkg-query -W -f='${Status}' overlayroot 2>/dev/null |
                 grep -q 'ok installed' ||
                 command -v overlayroot-chroot >/dev/null 2>&1; then
             _overlay_ok=1
