@@ -144,10 +144,42 @@ done
 # only moment the card is online, so a binary missing here is missing for
 # the life of the card. util-linux is named alongside it so the pair reads
 # as one stated requirement rather than an assumed base package.
+# The last four are the diagnostic toolchain, and they go on EVERY card —
+# production included, not just --debug. The apt step is the card's only
+# online moment, so a tool missing here is missing for the life of that
+# card, and a card in a vehicle is exactly where the interesting faults
+# happen: a sealed card that cannot be interrogated has to come home and be
+# rebuilt before anyone can even ask it a question.
+#
+# That rule has already cost this project a wrong conclusion. On 2026-08-05
+# cam/dashberry-rear-probe.sh probed four alternative encoders for the rear
+# frame-rate collapse; three of them (x264enc from plugins-ugly,
+# avenc_h264_v4l2m2m from libav, and ffmpeg itself) were on no card, so the
+# script took its "not installed — skipped" branch for each and openh264enc
+# won unopposed. IMPL.md recorded the three as probed-and-rejected. The
+# decisive one was ffmpeg's h264_v4l2m2m: an independent userspace driver of
+# the SAME kernel encoder, the one test that separates "gst's v4l2h264enc
+# element is broken" from "the kernel driver is broken" — and it never ran.
+#
+# What each buys: ffmpeg/ffprobe (segment forensics in the field — durations,
+# counted frames, a readable/unreadable verdict on a crash tail — and every
+# quality measurement in cam/dashberry-quality-probe.sh), v4l-utils
+# (v4l2-ctl is the only way to ask the Zero what formats it actually
+# offers), gstreamer1.0-libav + gstreamer1.0-plugins-ugly (the alternative
+# encoders, so an encoder question can be answered on the card that has the
+# problem rather than only on a bench card that does not).
+#
+# Cost, accepted: ~100 MB of image that production does not execute in
+# normal operation. It also settles a live question by pre-emption — if
+# quality-probe names avenc_h264_v4l2m2m as the rear encoder, libav is
+# already there and no card needs rebuilding for it. dashberry-cli is still
+# PC-side and still not installed: the runtime footprint rule bars an
+# INTERPRETER on the image, which these are not.
 apt-get install -y --no-install-recommends \
     rpicam-apps gstreamer1.0-tools gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad gpsd gpsd-clients chrony gcc make \
-    util-linux util-linux-extra
+    util-linux util-linux-extra \
+    ffmpeg v4l-utils gstreamer1.0-libav gstreamer1.0-plugins-ugly
 
 echo "building panel daemon..."
 make -C src

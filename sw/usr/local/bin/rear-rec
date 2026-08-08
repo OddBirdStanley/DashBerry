@@ -40,10 +40,19 @@ START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.ts$/ { if ($1 + 1 > s) 
 # v4l2h264enc ELEMENT collapses to ~5 fps the moment any LIVE source
 # feeds it. Supply-independent: queues before/after, output-io-mode
 # overrides, and front-rec on/off all change nothing, so the wait is
-# internal to the element. Of every alternative probed (x264enc,
-# avenc_h264_v4l2m2m, ffmpeg h264_v4l2m2m direct, io-modes), only
-# openh264enc sustained the camera's full rate — 29.3 fps measured
-# through this exact chain while front-rec recorded.
+# internal to the element. openh264enc sustained the camera's full rate —
+# 29.3 fps measured through this exact chain while front-rec recorded —
+# and that is why this chain is what it is.
+#
+# CORRECTION 2026-08-07: the CAUSE is NOT established. The three
+# alternatives once listed here as rejected (x264enc, avenc_h264_v4l2m2m,
+# ffmpeg h264_v4l2m2m direct) were never installed on any card —
+# plugins-ugly, libav and ffmpeg are absent from firstinstall's package
+# list — so the probe skipped all three and openh264enc won unopposed. A
+# skipped test is not a negative one, so "internal to the element" above
+# is an inference the evidence does not support: the kernel driver has
+# never been tested independently of gst. See IMPL.md and
+# cam/dashberry-quality-probe.sh.
 #
 # The costs, accepted: baseline profile only (~10-20% less
 # bitrate-efficient than a high-profile hw encode — tolerable while the
