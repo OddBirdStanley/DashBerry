@@ -1,0 +1,30 @@
+[Unit]
+Description=DashBerry boot-time RF kill (asserted after the last replayer)
+# The whole point is to run LAST. Every other layer that decides a boot's
+# wlan state speaks earlier and gets overwritten:
+#   - 99-dashberry-rfkill.rules writes the switch as it APPEARS, which is
+#     the first word of a boot, not the last;
+#   - systemd-rfkill restores its saved state seconds later (masked on a
+#     production card, but not on a debug one);
+#   - NetworkManager starts last and asserts the WirelessEnabled it loaded
+#     from NetworkManager.state onto every wlan killswitch.
+# Ordering after NetworkManager puts this after all three. rf-ctl then
+# re-asserts for a bounded window, because NM applies the killswitch
+# asynchronously and this unit can win the ordering race and still lose the
+# write.
+After=NetworkManager.service systemd-rfkill.service
+PartOf=dashberry.target
+
+[Service]
+Type=oneshot
+# Latched: nothing may run this a second time and kill the radios out from
+# under a live JOIN WIFI session the user opened after boot.
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/rf-ctl boot-kill
+# A failure here is allowed to show as a failed unit: nothing Requires it,
+# so the drive is unaffected, and a card that could not block its radios
+# should say so. The panel's glyph reads the switch directly, so the OLED
+# reports the same fact without needing this unit's status.
+
+[Install]
+WantedBy=dashberry.target
