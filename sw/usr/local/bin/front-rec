@@ -19,6 +19,38 @@ START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.ts$/ { if ($1 + 1 > s) 
 # doing about it: MPEG-TS has no header to finalize, so a truncated segment is
 # simply a shorter segment, readable by anything that can read a whole one.
 
+# OPEN-SEGMENT SYNCER (2026-08-09). The fragment-closed fsync below covers
+# every segment except the one that matters most: the one being written when
+# the 12 V dies, which never closes and so was never fsynced at all. Nothing
+# else in the chain forces it out, and the gap was not theoretical — see
+# etc/fstab.snippet for the 7 zeroed holes measured in a single 48.9 s final
+# segment. This loop fsyncs the newest segment once a second, so a
+# partially-filled tail page that the journal commit flushed with its
+# remainder zeroed is rewritten WHOLE before the next commit.
+#
+# It does not make the guarantee on its own, and is not meant to: the page
+# straddling the last fsync is still an unforced overwrite, so a cut inside
+# that ~1 s window can still leave ONE interior hole. data=journal is what
+# closes that; this loop is the backstop for a card that lies about
+# cache-flush, and it narrows the window from ~17 s to ~1 s even if the mount
+# option is ever reverted.
+#
+# Newest file = highest %05d = last in lexical order, which is why the counter
+# is zero-padded. `sync FILE` is fsync(2) on that file; the recorder does not
+# hold the fd, but fsync flushes the inode's dirty pages whoever dirtied them.
+# Guarded for `set -e`: an empty glob must not kill the loop.
+open_segment_syncer() {
+    while sleep 1; do
+        newest=$(ls "$OUT"/*.ts 2>/dev/null | tail -n 1)
+        if [ -n "$newest" ]; then
+            sync "$newest" 2>/dev/null || true
+        fi
+    done
+}
+open_segment_syncer &
+SYNCER_PID=$!
+trap 'kill "$SYNCER_PID" 2>/dev/null || true' EXIT INT TERM
+
 # Timestamps travel IN-BAND: the encoder's
 # own PTS/DTS ride the pipe inside an MPEG-TS container (--codec libav,
 # hardware h264_v4l2m2m underneath, --libav-format mpegts), and tsdemux hands
@@ -30,8 +62,28 @@ START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.ts$/ { if ($1 + 1 > s) 
 # soon as the first GOP leaves splitmuxsink's queue (the "~1 s in" crash).
 # Needs full rpicam-apps (firstinstall.sh) — rpicam-apps-lite has no libav.
 #
-# --intra = 1 keyframe/s so splitmuxsink can cut close to the 60 s mark, and
-# so a reader landing mid-file is never more than a second from a resync point.
+# --intra = FRONT_GOP frames so splitmuxsink can cut close to the 60 s mark,
+# and so a reader landing mid-file is never far from a resync point.
+#
+# FRONT_GOP is 27, NOT FRONT_FPS (changed 2026-08-09), and the 0.9 s that buys
+# is not the point — breaking a phase lock is. At exactly 1 keyframe/s the
+# encoder's IDR cadence and ext4's commit=1 journal tick are BOTH 1 Hz, so
+# they beat against each other at a nearly fixed offset: whichever part of the
+# second the commit lands in, it keeps landing there. It landed in the IDR,
+# and it stayed there — all 7 holes in the measured front segment and all 3 in
+# the rear one hit that second's IDR, 10 for 10, with the rear offset drifting
+# only 376 bytes/s (a 0.14% clock difference). Since an IDR is only ~19% of a
+# second's bytes, 10/10 is not chance; it is two locked clocks. Detuning to
+# 0.9 s sweeps the phase through a full cycle every 9 s, so a hole lands where
+# the bytes are rather than always on the frame the whole GOP depends on.
+#
+# This is the WEAKEST of the three changes and is not a fix: it does not
+# prevent a single hole, it only spreads them. Losing a P-frame still breaks
+# every P-frame after it in the GOP, so the expected cost falls from 30 frames
+# (always the IDR) to roughly 17 — call it 1.7x, not the order of magnitude a
+# first reading suggests. It is here because it is nearly free and because
+# clustered loss is worse than spread loss for a dashcam: 7 consecutive dead
+# seconds around an impact is a different failure from 7 scattered ones.
 #
 # MPEG-TS ON THE CARD, not MP4 — the container IS the crash strategy. TS is
 # append-only and self-describing: 188-byte packets behind an 0x47 sync byte,
@@ -52,11 +104,13 @@ START_INDEX=$(ls "$OUT" 2>/dev/null | awk -F. '/^[0-9]+\.ts$/ { if ($1 + 1 > s) 
 #
 # The -m watcher is now purely durability: splitmuxsink posts
 # splitmuxsink-fragment-closed as each file closes, and we fsync that file
-# (and the directory, for its dirent) right then. Without it NOTHING in the
-# capture path would fsync — the MP4 duration patcher used to do it as a side
-# effect, and it left with the rest of the finalization machinery. stdbuf
-# keeps -m line-buffered so the fsync happens within the second rather than
-# 4 KB of messages later.
+# (and the directory, for its dirent) right then. It used to be the ONLY
+# fsync in the capture path — the MP4 duration patcher did it as a side
+# effect, and it left with the rest of the finalization machinery — which is
+# exactly why the segment that never closes was the one that got corrupted;
+# the open-segment syncer above is the other half. stdbuf keeps -m
+# line-buffered so the fsync happens within the second rather than 4 KB of
+# messages later.
 #
 # Focus is pinned, never hunting: rain and dirt on the windshield sit far
 # inside the lens's minimum focus distance, and continuous AF would pull
@@ -91,7 +145,7 @@ for axis in $(printf '%s' "${INVERT_FRONT:-}" | tr ',' ' ' | tr '[:upper:]' '[:l
 done
 rpicam-vid -t 0 -n \
     --width "$FRONT_W" --height "$FRONT_H" --framerate "$FRONT_FPS" \
-    --bitrate "$FRONT_BITRATE" --intra "$FRONT_FPS" \
+    --bitrate "$FRONT_BITRATE" --intra "${FRONT_GOP:-27}" \
     --autofocus-mode manual --lens-position "${FRONT_LENS_DIOPTRE:-0.0}" \
     $FLIP \
     --codec libav --libav-format mpegts -o - |

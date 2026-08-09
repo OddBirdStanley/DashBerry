@@ -375,8 +375,9 @@ mkdir -p "$MNT/data"
 cat >> "$MNT/etc/fstab" <<EOF
 # DashBerry footage partition (dashberry-install; options per etc/fstab.snippet
 # — nodelalloc makes the 1 s commit carry the open segment's appends, bounding
-# a hard power cut to ~1-2 s of lost footage)
-PARTUUID=$DATA_PARTUUID  /data  ext4  defaults,noatime,nodelalloc,data=ordered,commit=1,nofail  0  2
+# a hard power cut to ~1-2 s of lost footage; data=journal keeps that loss at
+# the TAIL instead of leaving zeroed holes mid-segment)
+PARTUUID=$DATA_PARTUUID  /data  ext4  defaults,noatime,nodelalloc,data=journal,commit=1,nofail  0  2
 EOF
 
 info "Merging boot/config-snippet.txt into config.txt..."
