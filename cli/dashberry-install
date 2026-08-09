@@ -449,7 +449,29 @@ wait_part "$ROOTP"
 
 [ "$(blkid -o value -s TYPE "$BOOTP")" = vfat ] || die "$BOOTP is not vfat"
 [ "$(blkid -o value -s TYPE "$ROOTP")" = ext4 ] || die "$ROOTP is not ext4"
-[ ! -b "$DATAP" ] || die "Image already carries a 3rd partition (expected a stock 2-partition Pi OS image)"
+# Ask the flashed TABLE, not the device node. The intent of this check is
+# "the image should be a stock 2-partition Pi OS image", and until `keep`
+# existed the node was a faithful proxy: the device had been wiped, so a
+# third node could only have come from the image. Under `keep` that stops
+# being true. The old layout's /dev/...p3 is not wiped, and its node can
+# outlive the partprobe that dropped it from the table — on loop devices
+# especially — so a perfectly good stock image was being rejected as
+# "already carries a 3rd partition". The table is the thing this actually
+# means to ask, and it has no such race.
+flashed_parts=$(sfdisk_parts "$(sfdisk -d "$DEV" 2>/dev/null || true)")
+[ "$flashed_parts" -le 2 ] || \
+    die "Image carries $flashed_parts partitions (expected a stock 2-partition Pi OS image)"
+# A stale node would still confuse the re-adopt below, so insist it is gone
+# before going near it — with a short grace period for udev to catch up.
+if [ "$KEEP_DATA" = 1 ]; then
+    for _ in $(seq 1 20); do
+        [ -b "$DATAP" ] || break
+        partprobe "$DEV" 2>/dev/null || true
+        udevadm settle || true
+        sleep 0.5
+    done
+    [ ! -b "$DATAP" ] || die "stale $DATAP node did not clear after flashing"
+fi
 
 # --- partitions: right-size the (to-be-read-only) OS, add /data ------------
 # Under `keep` the OS size is not a choice: p2 must end exactly one sector

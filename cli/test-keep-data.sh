@@ -284,9 +284,16 @@ before_diskid=$(diskid "$CARD")
 [ -n "$before_start" ] && [ -n "$before_uuid" ] || die "could not read the fixture's p3 start/UUID"
 echo "  fixture: p3 at sector $before_start, fs UUID $before_uuid, MBR id $before_diskid"
 
+case1_fail_before=$fail
 run_installer "$CARD" > "$WORK/out.log" 2>&1
 echo "  installer exit $? (non-zero expected with the stand-in)"
 assert_ran "$WORK/out.log" "CASE 1"
+# The installer's own words, always. Without this the harness reports a wall
+# of red and throws away the one line that says why — which is exactly what
+# happened when it died at a check nobody could see.
+if grep -q "Fatal Error" "$WORK/out.log"; then
+    echo "  installer said: $(grep -m1 "Fatal Error" "$WORK/out.log")"
+fi
 
 # POSITIVE evidence that the installer did the work. Without these, every
 # assertion below is also satisfied by an installer that never started —
@@ -324,6 +331,17 @@ fi
 rmdir "$m" 2>/dev/null || true
 p2end=$(sfdisk -d "$CARD" | awk '$1 ~ /p2$/ {for(i=3;i<=NF;i++){if($i=="start="){s=$(i+1);sub(/,$/,"",s)}; if($i=="size="){z=$(i+1);sub(/,$/,"",z)}}; print s+z; exit}')
 ck "OS partition abuts /data exactly" "$(p3start "$CARD")" "$p2end"
+
+# Anything failed in CASE 1? Then the installer's transcript is the evidence,
+# not the assertion list. Print enough of it to diagnose without a re-run.
+if [ "$fail" -gt "$case1_fail_before" ]; then
+    echo
+    echo "  ---- installer transcript (last 30 lines) ----"
+    tail -30 "$WORK/out.log" | sed 's/^/  | /'
+    echo "  ---- partition table now ----"
+    sfdisk -d "$CARD" 2>&1 | sed 's/^/  | /'
+    echo "  ---------------------------------------------"
+fi
 
 # ==========================================================================
 echo
