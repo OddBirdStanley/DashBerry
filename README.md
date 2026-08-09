@@ -161,7 +161,7 @@ or manual configuration is ever needed.
 | `--root-size N` | OS partition size in GiB (default 8, minimum 8) |
 | `--auth NAME:PASS` | create this login account and enable SSH. On its own (no `--debug`) the card stays PRODUCTION — read-only OS, no stored network credentials — but the panel's JOIN WIFI screen is armed, so you can bring the card onto a network by hand and ssh in; requires `--wifi-country` |
 | `--debug` | build a DEBUG card — writable OS, journal kept and persistent, `--wifi` profile kept so it rejoins the LAN every boot. Requires `--auth`; JOIN WIFI is not armed (the card already knows a network) |
-| `--wifi SSID:PSK` | run the first boot over Wi-Fi instead of Ethernet; setup-only on a production card (the installer wipes the profile, DHCP leases and logs before the OS locks read-only), kept on a debug card |
+| `--wifi SSID[:PSK]` | run the first boot over Wi-Fi instead of Ethernet; setup-only on a production card (the installer wipes the profile, DHCP leases and logs before the OS locks read-only), kept on a debug card. Omit `:PSK` (or leave it empty) for an OPEN network — the confirmation summary says `OPEN - no passphrase` before anything is written, so a forgotten passphrase is caught there rather than at a first boot that never associates |
 | `--wifi-country CC` | two-letter regulatory domain, required with `--wifi` and on a JOIN WIFI card (a stock image keeps Wi-Fi blocked without one) |
 | `--invert-front AXES`, `--invert-rear AXES` | correct how that camera is mounted: a comma-separated list of `v` (mounted upside down) and `h` (its image comes out mirrored) — `v`, `h` or `v,h`, either case, each axis once. The video is flipped at capture, so recordings are already upright and un-mirrored |
 
