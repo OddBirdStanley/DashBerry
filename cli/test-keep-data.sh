@@ -170,6 +170,40 @@ FAKE
     else
         fail=$((fail+1)); echo "  FAIL script(1) missing — the pty runner cannot work"
     fi
+
+    # --- OS sizing across an image layout shift, and the /data-first order --
+    # The bug: a card built by an image with p1 at sector 8192, reflashed with
+    # Trixie which puts p1 at 16384, leaves the OS 4 MiB under 8 GiB — and the
+    # floor rejected it outright, after the flash had already erased the old
+    # table. All arithmetic, all checkable here.
+    echo "== self-test: OS sizing and /data-first ordering =="
+    fstart() { sfdisk -d "$1" 2>/dev/null | awk -v n="$2" '$1==n{for(i=3;i<=NF;i++) if($i=="start="){v=$(i+1);sub(/,$/,"",v);print v;exit}}'; }
+    fend()   { sfdisk -d "$1" 2>/dev/null | awk -v n="$2" '$1==n{for(i=3;i<=NF;i++){if($i=="start="){s=$(i+1);sub(/,$/,"",s)};if($i=="size="){z=$(i+1);sub(/,$/,"",z)}};print s+z;exit}'; }
+
+    old_p2=$((8192 + P1_SIZE)); new_p2=$((16384 + P1_SIZE))
+    read -r _ card_p3 card_p3z <<<"$(geom 20480 8192)"
+    derived=$((card_p3 - new_p2))
+    target=$((8 * 1024 * 1024 * 1024)); slack=$((64 * 1024 * 1024))
+    ck "image shifts p2 by 4 MiB"     8192 "$((new_p2 - old_p2))"
+    ck "derived OS size (MiB)"        8188 "$((derived * 512 / 1024 / 1024))"
+    ck "shifted card is ACCEPTED"     yes \
+       "$([ $((derived * 512)) -ge $((target - slack)) ] && echo yes || echo no)"
+    read -r _ small_p3 _ <<<"$(geom 20480 4096)"
+    small=$((small_p3 - new_p2))
+    ck "genuine 4 GiB card REFUSED"   yes \
+       "$([ $((small * 512)) -lt $((target - slack)) ] && echo yes || echo no)"
+
+    o="$t/order.img"; truncate -s 20G "$o"
+    printf 'label: dos\n%s1 : start=16384, size=%s, type=c\n%s2 : start=%s, size=4751360, type=83\n' \
+        "$o" "$P1_SIZE" "$o" "$new_p2" > "$t/o.in"
+    sfdisk -q "$o" < "$t/o.in" >/dev/null 2>&1
+    echo "$card_p3,$card_p3z,L" | sfdisk -q --wipe-partitions never -a "$o" >/dev/null 2>&1
+    ck "/data entry restorable post-flash" "$card_p3" "$(fstart "$o" "${o}3")"
+    echo ", $derived" | sfdisk -q -N 2 "$o" >/dev/null 2>&1
+    ck "OS then grows to abut /data"       "$card_p3" "$(fend "$o" "${o}2")"
+    if echo ", $((derived + 2048))" | sfdisk -q -N 2 "$o" >/dev/null 2>&1; then over=no; else over=yes; fi
+    ck "oversized OS refused by sfdisk"    yes "$over"
+    ck "/data survived the refusal"        "$card_p3" "$(fstart "$o" "${o}3")"
     echo; echo "passed $pass, failed $fail"; [ "$fail" -eq 0 ]; exit $?
 fi
 
@@ -311,6 +345,12 @@ partprobe "$CARD" 2>/dev/null; udevadm settle
 # change, which the installer documents as expected.
 ck "MBR disk id changed (flash landed)" changed \
    "$([ "$(diskid "$CARD")" != "$before_diskid" ] && echo changed || echo "same:$before_diskid")"
+# THE invariant, and it holds whether the installer succeeded or bailed: once
+# the flash has erased the old table, /data must never be left without an
+# entry pointing at it. `keep` cannot recover from that by itself — it learns
+# the start sector by reading the old table — so a card in that state has
+# footage that is physically present, addressable only by hand, and invisible
+# to a retry. An OS-size check used to fail inside exactly that window.
 ck "p3 start sector unchanged"    "$before_start" "$(p3start "$CARD")"
 ck "p3 filesystem UUID unchanged" "$before_uuid"  "$(blkid -p -o value -s UUID "${CARD}p3" 2>/dev/null || echo MISSING)"
 
