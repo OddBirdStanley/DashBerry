@@ -173,12 +173,12 @@
       <div class="slider">SoC temp
         <input type="range" id="cputemp" min="-20" max="90" step="0.487" value="42.1">
         <span class="val" id="cputempval"></span></div>
-      <div class="slider">get_throttled
-        <select id="throttled">
-          <option value="0">0 — PWR OK</option>
-          <option value="65536">bit 16 — PWR UV SEEN</option>
-          <option value="1">bit 0 — PWR UV NOW</option>
-          <option value="">read failure — PWR ---</option>
+      <div class="slider">in0_lcrit_alarm (1 then back to 0 → PWR UV SEEN,
+        the latch earns it — there is no UV SEEN setting)
+        <select id="uvalarm">
+          <option value="0">0 — rail fine</option>
+          <option value="1">1 — under-voltage now</option>
+          <option value="">node absent — PWR ---</option>
         </select></div>
     </div>
 
@@ -326,8 +326,8 @@ const hw = {
     cpuTempMc: () => $("thermal").checked
         ? Math.round(parseFloat($("cputemp").value) * 1000)
         : null,
-    throttled: () => $("throttled").value === "" ? null
-                                                 : parseInt($("throttled").value, 10),
+    uvAlarm: () => $("uvalarm").value === "" ? null
+                                             : parseInt($("uvalarm").value, 10),
     statvfs: () => {
         if (!$("mounted").checked) return null;
         const pct = parseFloat($("free").value);

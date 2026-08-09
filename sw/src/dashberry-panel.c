@@ -87,7 +87,15 @@
 #define DATA_MNT      "/data"
 #define RTC_EPOCH     "/sys/class/rtc/rtc0/since_epoch"
 #define CPU_TEMP      "/sys/class/thermal/thermal_zone0/temp"  /* milli-degC */
-#define GET_THROTTLED "/sys/devices/platform/soc/soc:firmware/get_throttled"
+/* Under-voltage comes from raspberrypi-hwmon, not from the firmware node
+ * this used to read: rpi-6.12.y — the kernel Trixie ships — does not expose
+ * get_throttled under soc:firmware at all, so that open failed on every
+ * tick and PAGE 2 sat on PWR --- for the life of the card. hwmon numbering
+ * follows probe order, so the node is resolved by driver name, the same
+ * rule the framebuffer already uses. */
+#define VOLT_HWMON    "/sys/class/hwmon"
+#define VOLT_DRIVER   "rpi_volt"                /* raspberrypi-hwmon's name */
+#define VOLT_ALARM    "in0_lcrit_alarm"
 #define HEALTH_BASE   "/data/health"
 #define SETTINGS_PATH "/data/settings.conf"     /* panel-chosen, persistent */
 #define SETTINGS_TMP  "/data/settings.conf.tmp"
@@ -974,21 +982,70 @@ static int cpu_temp_c(void)
     return (cpu_temp_mc + (cpu_temp_mc >= 0 ? 500 : -500)) / 1000;
 }
 
-/* Firmware throttle flags for the PAGE 2 PWR line — the same bitmask
- * vcgencmd get_throttled reports, read from the firmware driver's sysfs
- * node: bit 0 = under-voltage NOW,
- * bit 16 = under-voltage occurred since boot. Like TMP, informational
- * only — a failed read shows PWR --- and never faults the system. */
-static uint32_t throttled;
-static bool     throttled_valid;
+/* Under-voltage for the PAGE 2 PWR line, from raspberrypi-hwmon's low-crit
+ * alarm. The driver polls the firmware every 2 s and hands it the
+ * sticky-clear mask, so the alarm reads "under-voltage during the last poll
+ * window" and drops back to 0 once the rail recovers; sampling it at 1 Hz
+ * therefore cannot step over a window.
+ *
+ * That read-and-clear is also why UV SEEN is latched here rather than read:
+ * the firmware's own since-boot bit is consumed by the driver before
+ * userspace can see it, so nothing can still report it. The latch makes UV
+ * SEEN mean "since the panel started", which is the narrower claim — a dip
+ * during the seconds of boot before the panel is up will not be caught.
+ * Like TMP, informational only: a failed read shows PWR --- and never
+ * faults the system. */
+static bool uv_now;                     /* alarm asserted on the last read */
+static bool uv_seen;                    /* latched: asserted at least once */
+static bool uv_valid;                   /* the alarm node answered */
+static char uv_path[PATH_MAX];          /* empty until resolved */
 
-static void read_throttled(void)
+/* hwmonN is assigned in probe order, so match on the driver's name. The
+ * driver can also probe after the panel is up, which is why a failure here
+ * is retried on the next tick rather than settled once at startup. */
+static bool uv_resolve(void)
 {
-    char buf[32];
-    throttled_valid = read_small(GET_THROTTLED, buf, sizeof buf) > 0 &&
-                      isxdigit((unsigned char)buf[0]);
-    if (throttled_valid)
-        throttled = (uint32_t)strtoul(buf, NULL, 16);
+    DIR *d = opendir(VOLT_HWMON);
+    if (!d)
+        return false;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, "hwmon", 5) != 0 ||
+            !isdigit((unsigned char)e->d_name[5]))
+            continue;
+        char path[PATH_MAX], name[32];
+        snprintf(path, sizeof path, VOLT_HWMON "/%s/name", e->d_name);
+        if (read_small(path, name, sizeof name) <= 0)
+            continue;
+        name[strcspn(name, "\n")] = '\0';
+        if (strcmp(name, VOLT_DRIVER) != 0)
+            continue;
+        snprintf(uv_path, sizeof uv_path, VOLT_HWMON "/%s/" VOLT_ALARM,
+                 e->d_name);
+        closedir(d);
+        return true;
+    }
+    closedir(d);
+    return false;
+}
+
+static void read_undervoltage(void)
+{
+    char buf[16];
+    if (!uv_path[0] && !uv_resolve()) {
+        uv_valid = false;
+        return;
+    }
+    if (read_small(uv_path, buf, sizeof buf) <= 0 ||
+        !isdigit((unsigned char)buf[0])) {
+        uv_path[0] = '\0';              /* stale node — resolve again next tick */
+        uv_valid = false;
+        return;
+    }
+    uv_valid = true;
+    uv_now   = buf[0] != '0';
+    if (uv_now)
+        uv_seen = true;                 /* the latch holds for the session */
 }
 
 /* Segments are MPEG-TS (%05d.ts) — the ".ts" below is a 3-char suffix, so the
@@ -1260,7 +1317,7 @@ static void eval_health(int64_t now)
         settings_apply();
     }
     read_cpu_temp();               /* 1 Hz, off the 5 Hz paint path */
-    read_throttled();
+    read_undervoltage();
     rf_refresh();                  /* glyph truth, not a health state */
     hlog_sync(session, now);
 }
@@ -2450,18 +2507,18 @@ static void compose(struct frame *f, int64_t now)
 
     if (pages[ui.page_idx] == 2) {
         /* PAGE 2 — line 1: Pi 4 SoC temperature, whole degrees C
-         * (negative-safe round-to-nearest); line 2: firmware power flags
-         * (under-voltage now beats latched); remaining lines reserved */
+         * (negative-safe round-to-nearest); line 2: rail under-voltage
+         * (now beats latched); remaining lines reserved */
         if (cpu_temp_valid) {
             snprintf(f->rows[0], sizeof f->rows[0], "TMP %d C", cpu_temp_c());
         } else {
             snprintf(f->rows[0], sizeof f->rows[0], "TMP ---");
         }
-        if (!throttled_valid)
+        if (!uv_valid)
             snprintf(f->rows[1], sizeof f->rows[1], "PWR ---");
-        else if (throttled & 0x1u)
+        else if (uv_now)
             snprintf(f->rows[1], sizeof f->rows[1], "PWR UV NOW");
-        else if (throttled & 0x10000u)
+        else if (uv_seen)
             snprintf(f->rows[1], sizeof f->rows[1], "PWR UV SEEN");
         else
             snprintf(f->rows[1], sizeof f->rows[1], "PWR OK");
