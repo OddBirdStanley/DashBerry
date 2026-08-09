@@ -49,6 +49,40 @@ ck()  { if [ "$2" = "$3" ]; then pass=$((pass+1)); printf '  ok   %-42s = %s\n' 
         else fail=$((fail+1)); printf '  FAIL %-42s expected %s, got %s\n' "$1" "$2" "$3"; fi; }
 die() { echo "FIXTURE ERROR: $*" >&2; exit 1; }
 
+# run_installer LOOPDEV -> stdout is the whole session, return is the exit code.
+#
+# The installer demands a real terminal (`[ -t 0 ] || die`) before it will
+# accept the typed device-path confirmation, and it is right to: that check is
+# the last thing standing between a typo and a wiped card. A plain
+# `printf ... | installer` therefore does NOT test this tool, it dies at the
+# gate — which is exactly what happened, and worse, it died SILENTLY as far as
+# CASE 1 was concerned: with the installer never running, "p3 start unchanged"
+# and "footage byte-identical" were trivially true. The whole case was green
+# for the reason it should have been red.
+#
+# So allocate a pty with script(1) instead of weakening the installer. The
+# confirmation is piped into script, which relays it to the child through the
+# pty, so `[ -t 0 ]` is true and `read` still gets the answer. -e propagates
+# the child's exit status; %q survives paths with spaces.
+# Returns the INSTALLER's exit code, not tr's — the cleanup is done off a
+# temp file rather than in the pipeline, or `$?` would always be 0.
+run_installer() {
+    local dev=$1 cmd rc
+    cmd=$(printf '%q --root-size keep %q %q' "$INSTALLER" "$IMG" "$dev")
+    printf '%s\n' "$dev" | script -qec "$cmd" /dev/null > "$WORK/raw.log" 2>&1
+    rc=$?
+    tr -d '\r' < "$WORK/raw.log"
+    return "$rc"
+}
+
+# Any run that dies at the terminal gate is a HARNESS fault, not a result.
+# Never let it be scored.
+assert_ran() {   # assert_ran LOGFILE LABEL
+    grep -q "must be run on a visual terminal" "$1" && \
+        die "$2: the installer never ran — no pty (is script(1) present?)"
+    return 0
+}
+
 # --- self-test: no root, no loop devices -----------------------------------
 if [ "${1:-}" = --self-test ]; then
     echo "== self-test: fixture geometry (plain files, no root) =="
@@ -94,11 +128,58 @@ if [ "${1:-}" = --self-test ]; then
     read -r _ over_p3s   _ <<<"$(geom 20480 512)"
     ck "stand-in clears a normal /data"  yes "$([ "$synth_total" -lt "$normal_p3s" ] && echo yes || echo no)"
     ck "stand-in reaches an early /data" yes "$([ "$synth_total" -gt "$over_p3s"   ] && echo yes || echo no)"
+
+    # --- the pty runner ----------------------------------------------------
+    # The bug this guards: the harness fed the confirmation down a PIPE, so
+    # the installer's `[ -t 0 ]` gate killed every run before it did anything,
+    # and CASE 1's "nothing changed" assertions all passed on a card the
+    # installer had never touched. Checkable with no root at all, using a
+    # stand-in that behaves like the gate.
+    echo "== self-test: pty runner =="
+    if command -v script >/dev/null 2>&1; then
+        WORK="$t"
+        INSTALLER="$t/fake-installer"; IMG="$t/fake.img"; : > "$IMG"
+        # Stands in for the installer's gate only: same [ -t 0 ] refusal, same
+        # prompt-then-read. Echoes what it read so the assertion can check the
+        # confirmation actually arrived, and exits 3 to prove the code carries
+        # back through script(1).
+        cat > "$INSTALLER" <<'FAKE'
+#!/bin/sh
+[ -t 0 ] || { echo "Fatal Error: This script must be run on a visual terminal"; exit 1; }
+dev=$4
+printf 'Type the device path (%s) to continue: ' "$dev"
+read -r answer
+[ "$answer" = "$dev" ] || { echo "Aborted (got '$answer' want '$dev')"; exit 1; }
+echo "confirmed=$answer"
+exit 3
+FAKE
+        chmod +x "$INSTALLER"
+        out=$(run_installer /dev/fake-loop9); rc=$?
+        ck "installer sees a terminal"    yes \
+           "$(printf '%s' "$out" | grep -q "visual terminal" && echo no || echo yes)"
+        ck "confirmation reaches read(1)" yes \
+           "$(printf '%s' "$out" | grep -q "confirmed=/dev/fake-loop9" && echo yes || echo no)"
+        ck "child exit code propagates"   3 "$rc"
+        printf '%s\n' "$out" > "$t/gate.log"
+        ck "assert_ran passes a real run" yes \
+           "$(assert_ran "$t/gate.log" self-test >/dev/null 2>&1 && echo yes || echo no)"
+        # And it must FAIL loudly on a gated run, rather than scoring it.
+        echo "Fatal Error: This script must be run on a visual terminal" > "$t/gated.log"
+        ck "assert_ran rejects a gated run" yes \
+           "$( ( assert_ran "$t/gated.log" self-test ) >/dev/null 2>&1 && echo no || echo yes)"
+    else
+        fail=$((fail+1)); echo "  FAIL script(1) missing — the pty runner cannot work"
+    fi
     echo; echo "passed $pass, failed $fail"; [ "$fail" -eq 0 ]; exit $?
 fi
 
 # --- full run: needs root ---------------------------------------------------
 [ "$(id -u)" = 0 ] || { echo "run as root (losetup/mount), or --self-test" >&2; exit 1; }
+# script(1) is not optional garnish: it is how the installer gets the terminal
+# it insists on. Without it every run dies at the confirmation gate.
+for t in losetup sfdisk partprobe blkid mkfs.ext4 mkfs.vfat e2fsck udevadm script awk; do
+    command -v "$t" >/dev/null 2>&1 || die "missing tool: $t"
+done
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 INSTALLER="$HERE/dashberry-install"
 [ -x "$INSTALLER" ] || die "not found: $INSTALLER"
@@ -185,6 +266,7 @@ EOF
 }
 
 p3start() { sfdisk -d "$1" 2>/dev/null | awk '$1 ~ /p3$/ {for(i=3;i<=NF;i++) if($i=="start="){v=$(i+1);sub(/,$/,"",v);print v;exit}}'; }
+diskid()  { sfdisk -d "$1" 2>/dev/null | awk '$1 == "label-id:" { print $2; exit }'; }
 
 IMG=${USER_IMG:-$(synth_image)}
 echo "image: $IMG"
@@ -198,15 +280,30 @@ validate_card "$CARD" dashberry-data
 plant_footage "$CARD"
 before_start=$(p3start "$CARD")
 before_uuid=$(blkid -p -o value -s UUID "${CARD}p3")
+before_diskid=$(diskid "$CARD")
 [ -n "$before_start" ] && [ -n "$before_uuid" ] || die "could not read the fixture's p3 start/UUID"
-echo "  fixture: p3 at sector $before_start, fs UUID $before_uuid"
+echo "  fixture: p3 at sector $before_start, fs UUID $before_uuid, MBR id $before_diskid"
 
-printf '%s\n' "$CARD" | "$INSTALLER" --root-size keep "$IMG" "$CARD" > "$WORK/out.log" 2>&1
+run_installer "$CARD" > "$WORK/out.log" 2>&1
 echo "  installer exit $? (non-zero expected with the stand-in)"
-grep -q "keeping ${CARD}p3" "$WORK/out.log" && echo "  wipe was skipped for p3"
-grep -q "Re-adopting the existing /data" "$WORK/out.log" && echo "  /data was re-adopted, not formatted"
+assert_ran "$WORK/out.log" "CASE 1"
+
+# POSITIVE evidence that the installer did the work. Without these, every
+# assertion below is also satisfied by an installer that never started —
+# which is precisely how this case passed while doing nothing.
+ck "reached the wipe (past the confirmation)" yes \
+   "$(grep -q "Wiping the old partition" "$WORK/out.log" && echo yes || echo no)"
+ck "spared p3 from the wipe"                  yes \
+   "$(grep -q "keeping ${CARD}p3" "$WORK/out.log" && echo yes || echo no)"
+ck "re-adopted /data (did not mkfs it)"       yes \
+   "$(grep -q "Re-adopting the existing /data" "$WORK/out.log" && echo yes || echo no)"
 
 partprobe "$CARD" 2>/dev/null; udevadm settle
+# The MBR disk id comes from the flashed image, so a changed id is proof the
+# flash really landed — and it is the same mechanism that makes PARTUUID
+# change, which the installer documents as expected.
+ck "MBR disk id changed (flash landed)" changed \
+   "$([ "$(diskid "$CARD")" != "$before_diskid" ] && echo changed || echo "same:$before_diskid")"
 ck "p3 start sector unchanged"    "$before_start" "$(p3start "$CARD")"
 ck "p3 filesystem UUID unchanged" "$before_uuid"  "$(blkid -p -o value -s UUID "${CARD}p3" 2>/dev/null || echo MISSING)"
 
@@ -231,12 +328,17 @@ ck "OS partition abuts /data exactly" "$(p3start "$CARD")" "$p2end"
 # ==========================================================================
 echo
 echo "== CASE 2..5: refusals =="
+# Same pty runner as CASE 1: the /data-overlap refusal happens AFTER the
+# confirmation, so a pipe-fed run never reaches it and the case fails for the
+# wrong reason. The label/count/GPT refusals come before the gate and would
+# pass either way — which is what made the discrepancy so easy to misread.
 neg() {   # neg LABEL LOOPDEV EXPECTED_SUBSTRING
-    local out; out=$(printf '%s\n' "$2" | "$INSTALLER" --root-size keep "$IMG" "$2" 2>&1)
-    if printf '%s' "$out" | grep -qi -- "$3"; then
+    run_installer "$2" > "$WORK/neg.log" 2>&1
+    assert_ran "$WORK/neg.log" "$1"
+    if grep -qi -- "$3" "$WORK/neg.log"; then
         pass=$((pass+1)); printf '  ok   %-42s refused\n' "$1"
     else
-        fail=$((fail+1)); printf '  FAIL %-42s no "%s" in:\n%s\n' "$1" "$3" "$(printf '%s' "$out" | tail -3)"
+        fail=$((fail+1)); printf '  FAIL %-42s no "%s" in:\n%s\n' "$1" "$3" "$(tail -3 "$WORK/neg.log")"
     fi
 }
 
