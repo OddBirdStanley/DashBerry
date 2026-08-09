@@ -22,9 +22,10 @@
 #      three modes, set by --auth and --debug (see below);
 #   6. (--wifi) stages a first-boot Wi-Fi profile plus the regulatory
 #      domain that stock Pi OS (Trixie) needs before it will unblock wlan,
-#      so boot 2 can run without Ethernet. The staged credential is always
-#      wiped on a non-debug card before the overlay freezes the OS; DEBUG
-#      keeps the profile so the card rejoins the LAN on every boot.
+#      so boot 2 can run without Ethernet. WPA-PSK or open, per --wifi. The
+#      staged profile is always wiped on a non-debug card before the overlay
+#      freezes the OS; DEBUG keeps it so the card rejoins the LAN on every
+#      boot.
 #
 # The three modes (--debug requires --auth; the account is --auth's job now,
 # it is no longer --debug's parameter):
@@ -77,7 +78,8 @@ Options:
                     JOIN WIFI on the panel (needs --wifi-country)
   --debug           build a debug card: writable OS, journal kept and made
                     persistent. Requires --auth; JOIN WIFI is not armed
-  --wifi SSID:PSK   run the first boot over Wi-Fi instead of Ethernet
+  --wifi SSID[:PSK] run the first boot over Wi-Fi instead of Ethernet. Omit
+                    :PSK (or leave it empty) to join an OPEN network
   --wifi-country CC regulatory domain; required by --wifi and by JOIN WIFI
   -h, --help        display this help
 EOF
@@ -102,6 +104,8 @@ USERSPEC=
 WIFISPEC=
 WIFI_CC=
 WIFI_SSID=
+WIFI_PSK=
+WIFI_OPEN=0
 FIRSTBOOT_WIFI=0
 IMG=
 DEV=
@@ -171,13 +175,24 @@ if [ -n "$WIFI_CC" ]; then
         die "--wifi-country needs --wifi or a JOIN WIFI card (--auth without --debug)"
 fi
 if [ -n "$WIFISPEC" ]; then
-    case $WIFISPEC in *:*) ;; *) die "--wifi requires SSID:PSK" ;; esac
-    WIFI_SSID=${WIFISPEC%%:*}          # split at the FIRST ':' — the PSK may
-    WIFI_PSK=${WIFISPEC#*:}            # contain colons, the SSID may not
+    # SSID[:PSK], split at the FIRST ':' — the PSK may contain colons, the
+    # SSID may not. No colon at all, or nothing after it, is an OPEN network:
+    # there is no passphrase to carry, and the profile below omits
+    # [wifi-security] entirely. That is the same shape rf-ctl writes when the
+    # panel's JOIN WIFI keyboard is submitted empty, so both ways onto a
+    # network agree on what "open" looks like on disk.
+    case $WIFISPEC in
+        *:*) WIFI_SSID=${WIFISPEC%%:*}; WIFI_PSK=${WIFISPEC#*:} ;;
+        *)   WIFI_SSID=$WIFISPEC;       WIFI_PSK= ;;
+    esac
     [ -n "$WIFI_SSID" ] && [ "${#WIFI_SSID}" -le 32 ] || \
         die "--wifi SSID must be 1-32 characters and must not contain :"
-    [ "${#WIFI_PSK}" -ge 8 ] && [ "${#WIFI_PSK}" -le 64 ] || \
-        die "--wifi PSK must be a 8-63 char passphrase or 64 hex digits"
+    if [ -n "$WIFI_PSK" ]; then
+        [ "${#WIFI_PSK}" -ge 8 ] && [ "${#WIFI_PSK}" -le 64 ] || \
+            die "--wifi PSK must be a 8-63 char passphrase or 64 hex digits"
+    else
+        WIFI_OPEN=1
+    fi
     [ -n "$WIFI_CC" ] || \
         die "--wifi needs --wifi-country CC"
     FIRSTBOOT_WIFI=1
@@ -355,7 +370,15 @@ fi
 [ -n "$INVERT_FRONT" ] && echo "    invert: FRONT ($INVERT_FRONT)"
 [ -n "$INVERT_REAR" ] && echo "    invert: REAR ($INVERT_REAR)"
 if [ "$FIRSTBOOT_WIFI" = 1 ]; then
-    echo "    wifi  : $WIFI_SSID ($WIFI_CC)"
+    # OPEN is called out HERE, at the only gate a human passes before the
+    # wipe: a forgotten passphrase (`--wifi MyNet` when MyNet is WPA) is
+    # otherwise a silent downgrade that only shows up as a first boot which
+    # never associates, hours later, with the card already flashed.
+    if [ "$WIFI_OPEN" = 1 ]; then
+        echo "    wifi  : $WIFI_SSID ($WIFI_CC, OPEN - no passphrase)"
+    else
+        echo "    wifi  : $WIFI_SSID ($WIFI_CC)"
+    fi
 fi
 echo
 printf 'Type the device path (%s) to continue: ' "$DEV"
@@ -677,19 +700,27 @@ if [ -n "$WIFI_CC" ]; then
     sed -i "1s/\$/ cfg80211.ieee80211_regdom=$WIFI_CC/" "$BOOTDIR/cmdline.txt"
 fi
 if [ "$FIRSTBOOT_WIFI" = 1 ]; then
-    info "Staging first-boot Wi-Fi '$WIFI_SSID'..."
+    info "Staging first-boot Wi-Fi '$WIFI_SSID'$( [ "$WIFI_OPEN" = 1 ] && echo ' (open)' )..."
     NMFILE="$MNT/etc/NetworkManager/system-connections/dashberry-firstboot.nmconnection"
     mkdir -p "${NMFILE%/*}"
     # printf, not a heredoc: the PSK must land byte-for-byte ($, \, %s-safe);
     # umask 077 so the plaintext PSK is never world-readable, even briefly
-    # (NM refuses keyfiles that are not 600 anyway)
+    # (NM refuses keyfiles that are not 600 anyway). The mode stays 600 on an
+    # open profile too — there is no secret in it, but the SSID is still a
+    # record of where this card was built to go.
     (
         umask 077
         {
             printf '[connection]\nid=dashberry-firstboot\nuuid=%s\ntype=wifi\nautoconnect=true\n\n' \
                 "$(cat /proc/sys/kernel/random/uuid)"
             printf '[wifi]\nmode=infrastructure\nssid=%s\n\n' "$WIFI_SSID"
-            printf '[wifi-security]\nkey-mgmt=wpa-psk\npsk=%s\n\n' "$WIFI_PSK"
+            # An open network gets NO [wifi-security] section: its ABSENCE is
+            # how the keyfile format says "unencrypted". key-mgmt=wpa-psk with
+            # an empty psk= would instead be a WPA profile carrying a key NM
+            # rejects, and the first boot would never associate.
+            if [ "$WIFI_OPEN" = 0 ]; then
+                printf '[wifi-security]\nkey-mgmt=wpa-psk\npsk=%s\n\n' "$WIFI_PSK"
+            fi
             printf '[ipv4]\nmethod=auto\n\n[ipv6]\nmethod=auto\n'
         } > "$NMFILE"
     )
