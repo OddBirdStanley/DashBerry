@@ -68,6 +68,11 @@ Options:
                     mirrored) — "v", "h" or "v,h", either case, each axis
                     once. Flipped at capture, so recordings need no fixing
   --root-size GIB   OS partition size in GiB (default: 8)
+  --root-size keep  REFLASH, KEEPING THE FOOTAGE. Re-adopts the /data
+                    partition already on the card instead of rebuilding it:
+                    boot and OS are replaced as usual, /data is left byte for
+                    byte where it is and the OS is sized to land exactly in
+                    front of it. Needs a card this tool already built
   --auth NAME:PASS  create this account (+ sshd). On its own it also arms
                     JOIN WIFI on the panel (needs --wifi-country)
   --debug           build a debug card: writable OS, journal kept and made
@@ -89,6 +94,7 @@ BYPASS_REAR=0
 INVERT_FRONT=
 INVERT_REAR=
 ROOT_GIB=8
+KEEP_DATA=0
 DEBUG=0
 AUTH=0
 RF_JOIN=0
@@ -124,12 +130,24 @@ done
 
 [ -n "$IMG" ] && [ -n "$DEV" ] || { usage >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "Run this script as root"
-case $ROOT_GIB in *[!0-9]*|'') die "--root-size requires a whole number of GiB" ;; esac
-[ "$ROOT_GIB" -ge 8 ] || die "--root-size must be at least 8GiB"
+# --root-size takes a GiB count or the word `keep`. `keep` is not a size: it
+# means "derive the size from the card so the /data already on it survives",
+# and the number is only known once the old partition table has been read
+# (KEEP block below). Growing the OS PAST the existing /data would mean
+# relocating the footage, so keep derives the size rather than accepting one.
+case $ROOT_GIB in
+    keep|KEEP)   KEEP_DATA=1 ;;
+    *[!0-9]*|'') die "--root-size requires a whole number of GiB, or 'keep'" ;;
+    *)           [ "$ROOT_GIB" -ge 8 ] || die "--root-size must be at least 8GiB" ;;
+esac
 # The device must hold boot (512 MiB) + the OS + a useful /data — checked
 # up front because the wipe below is the point of no return. The default
-# 8 GiB OS means a 16 GB card in practice.
-MIN_DEV_BYTES=$((512 * 1024 * 1024 + ROOT_GIB * 1024 * 1024 * 1024 + MIN_DATA_BYTES))
+# 8 GiB OS means a 16 GB card in practice. Meaningless under `keep`: the card
+# demonstrably already holds a layout, and the real constraint there is the
+# derived OS size, checked against the recorded /data start instead.
+if [ "$KEEP_DATA" = 0 ]; then
+    MIN_DEV_BYTES=$((512 * 1024 * 1024 + ROOT_GIB * 1024 * 1024 * 1024 + MIN_DATA_BYTES))
+fi
 # The account moved out of --debug into --auth, so the three modes are a
 # plain truth table: --debug needs an account to be worth anything, and
 # --auth alone is the JOIN WIFI card.
@@ -222,21 +240,109 @@ if lsblk -no MOUNTPOINT "$DEV" 2>/dev/null | grep -q .; then
     die "$DEV has mounted partitions"
 fi
 
+# Partition node names depend only on the device name, and `keep` needs them
+# BEFORE the wipe (to spare /data) — so they are derived here rather than
+# after the flash.
+P=""
+case $devname in *[0-9]) P=p ;; esac      # sdb2 vs mmcblk0p2 / nvme0n1p2
+BOOTP="${DEV}${P}1"
+ROOTP="${DEV}${P}2"
+DATAP="${DEV}${P}3"
+
 devbytes=$(blockdev --getsize64 "$DEV")
-[ "$devbytes" -ge "$MIN_DEV_BYTES" ] || \
-    die "$DEV is $((devbytes / 1000000000)) GB (boot + ${ROOT_GIB} GiB OS + 1 GiB /data needs at least $(((MIN_DEV_BYTES + 999999999) / 1000000000)) GB)"
+if [ "$KEEP_DATA" = 0 ]; then
+    [ "$devbytes" -ge "$MIN_DEV_BYTES" ] || \
+        die "$DEV is $((devbytes / 1000000000)) GB (boot + ${ROOT_GIB} GiB OS + 1 GiB /data needs at least $(((MIN_DEV_BYTES + 999999999) / 1000000000)) GB)"
+fi
+
+# --- --root-size keep: read the layout we are about to preserve -------------
+# `sfdisk -d` is the machine-readable dump (`unit: sectors`), parsed with awk
+# rather than -J because this script is deliberately pure shell orchestration
+# and carries no JSON parser. Its partition lines look like:
+#
+#     /dev/sdb3 : start=    17833984, size=   204472320, type=83
+#
+# so the value sits one whitespace-token past the `start=` / `size=` token,
+# with a trailing comma to strip.
+sfdisk_label() { printf '%s\n' "$1" | awk '$1 == "label:" { print $2; exit }'; }
+sfdisk_parts() { printf '%s\n' "$1" | awk '$2 == ":" && $1 ~ "^/dev/" { n++ } END { print n + 0 }'; }
+sfdisk_field() {          # $1=dump  $2=partition node  $3=start|size
+    printf '%s\n' "$1" | awk -v node="$2" -v key="$3=" '
+        $1 == node && $2 == ":" {
+            for (i = 3; i <= NF; i++)
+                if ($i == key) { v = $(i + 1); sub(/,$/, "", v); print v; exit }
+        }'
+}
+
+if [ "$KEEP_DATA" = 1 ]; then
+    info "Reading the existing DashBerry layout on $DEV..."
+    OLD_TABLE=$(sfdisk -d "$DEV" 2>/dev/null) || \
+        die "--root-size keep: $DEV has no readable partition table. It needs a card this tool already built; use --root-size N to build one from scratch."
+
+    # MBR only. Pi OS images are msdos-labelled, and this also settles the one
+    # question a GPT card would raise: whether the whole-disk wipefs below
+    # (which clears a BACKUP GPT from the last sector of the disk) could clip
+    # the tail of the very partition we are trying to preserve.
+    old_label=$(sfdisk_label "$OLD_TABLE")
+    [ "$old_label" = dos ] || \
+        die "--root-size keep: $DEV has a '$old_label' partition table, expected 'dos'. Not a card this tool built."
+
+    old_nparts=$(sfdisk_parts "$OLD_TABLE")
+    [ "$old_nparts" = 3 ] || \
+        die "--root-size keep: $DEV has $old_nparts partitions, expected 3 (boot | OS | /data). Not a card this tool built."
+
+    KEEP_DATA_START=$(sfdisk_field "$OLD_TABLE" "$DATAP" start)
+    KEEP_DATA_SIZE=$(sfdisk_field "$OLD_TABLE" "$DATAP" size)
+    case $KEEP_DATA_START in *[!0-9]*|'') die "--root-size keep: could not read the start sector of $DATAP" ;; esac
+    case $KEEP_DATA_SIZE  in *[!0-9]*|'') die "--root-size keep: could not read the size of $DATAP" ;; esac
+
+    # Refuse to adopt a third partition that is not OURS. Without the label
+    # check this mode would happily preserve a stranger's partition and write
+    # an fstab pointing at it.
+    keep_type=$(blkid -p -o value -s TYPE  "$DATAP" 2>/dev/null || true)
+    keep_label=$(blkid -p -o value -s LABEL "$DATAP" 2>/dev/null || true)
+    KEEP_DATA_UUID=$(blkid -p -o value -s UUID "$DATAP" 2>/dev/null || true)
+    [ "$keep_type" = ext4 ] || \
+        die "--root-size keep: $DATAP is '${keep_type:-unrecognised}', expected ext4"
+    [ "$keep_label" = dashberry-data ] || \
+        die "--root-size keep: $DATAP is labelled '${keep_label:-(none)}', expected 'dashberry-data'. Refusing to adopt a partition this tool did not create."
+    [ -n "$KEEP_DATA_UUID" ] || die "--root-size keep: could not read the filesystem UUID of $DATAP"
+
+    # Check the filesystem NOW, while nothing has been destroyed yet: this is
+    # the last moment at which "your /data is broken" is still free advice.
+    info "Checking the /data filesystem before adopting it..."
+    rc=0; e2fsck -f -p "$DATAP" || rc=$?
+    [ "$rc" -le 2 ] || \
+        die "e2fsck on $DATAP failed (exit $rc) — repair it before reflashing, or use --root-size N to start clean"
+
+    KEEP_DATA_BYTES=$((KEEP_DATA_SIZE * 512))
+    # Provisional only: the OS size is fixed by where the NEW image puts p2,
+    # which is not known until after the flash. Recomputed and reported then.
+    old_root_start=$(sfdisk_field "$OLD_TABLE" "$ROOTP" start)
+    case $old_root_start in *[!0-9]*|'') old_root_start=0 ;; esac
+    KEEP_ROOT_GIB_APPROX=$(( (KEEP_DATA_START - old_root_start) * 512 / 1024 / 1024 / 1024 ))
+fi
 
 # --- the point of no return: a typed confirmation, nothing softer ----------
 [ -t 0 ] || die "This script must be run on a visual terminal"
 echo "################################################################"
 echo "#                          WARNING                             #"
+if [ "$KEEP_DATA" = 1 ]; then
+echo "#   BOOT AND OS ERASED — /data (THE FOOTAGE) IS PRESERVED      #"
+else
 echo "#   ALL DATA ON THE DEVICE BELOW WILL BE PERMANENTLY ERASED    #"
+fi
 echo "################################################################"
 echo
 lsblk -o NAME,MODEL,SIZE,TYPE,MOUNTPOINT "$DEV" | sed 's/^/    /'
 echo
 echo "    image : $IMG"
-echo "    layout: boot | OS ${ROOT_GIB} GiB$( [ $DEBUG = 0 ] && echo ' (read-only)' ) | /data"
+if [ "$KEEP_DATA" = 1 ]; then
+    echo "    layout: boot | OS ~${KEEP_ROOT_GIB_APPROX} GiB$( [ $DEBUG = 0 ] && echo ' (read-only)' ) | /data (KEPT, $((KEEP_DATA_BYTES / 1024 / 1024 / 1024)) GiB)"
+    echo "    keep  : $DATAP at sector $KEEP_DATA_START, fs UUID $KEEP_DATA_UUID"
+else
+    echo "    layout: boot | OS ${ROOT_GIB} GiB$( [ $DEBUG = 0 ] && echo ' (read-only)' ) | /data"
+fi
 if [ "$DEBUG" = 1 ]; then
     echo "    mode  : debug"
 elif [ "$RF_JOIN" = 1 ]; then
@@ -266,8 +372,18 @@ info "Wiping the old partition signatures and table on $DEV..."
 # partition through its node while the old table still provides them, THEN
 # the table itself (MBR, GPT primary+backup).
 while read -r part; do
+    # `keep`: this is destruction step 1 of 3 for the footage — wiping the
+    # ext4 signature off /data. Skip it. (The other two are the sfdisk
+    # --wipe-partitions and the mkfs, both further down.)
+    if [ "$KEEP_DATA" = 1 ] && [ "$part" = "$DATAP" ]; then
+        info "  keeping $part (the footage)"
+        continue
+    fi
     if [ -b "$part" ]; then wipefs -a -q "$part"; fi
 done < <(lsblk -nro TYPE,PATH "$DEV" | awk '$1 == "part" {print $2}')
+# Whole-disk: clears the MBR, which dd rewrites immediately below. Safe under
+# `keep` because the table is msdos (asserted above), so there is no backup
+# GPT at the end of the disk for this to reach into.
 wipefs -a -q "$DEV"
 partprobe "$DEV" 2>/dev/null || true
 udevadm settle
@@ -279,11 +395,24 @@ sync
 partprobe "$DEV"
 udevadm settle
 
-P=""
-case $devname in *[0-9]) P=p ;; esac      # sdb2 vs mmcblk0p2 / nvme0n1p2
-BOOTP="${DEV}${P}1"
-ROOTP="${DEV}${P}2"
-DATAP="${DEV}${P}3"
+# `keep`: the flash is the only thing that could have physically reached the
+# footage, and whether it did is a question about the image's length, which
+# varies by format and is a nuisance to determine ahead of time. So ask the
+# disk instead: probe the ext4 superblock where /data starts (blkid -O takes
+# a byte offset and needs no partition node, which is just as well — the
+# table now says two partitions) and require the same filesystem UUID we
+# recorded. This runs BEFORE the partition table is touched, so a failure
+# here costs nothing further.
+if [ "$KEEP_DATA" = 1 ]; then
+    info "Verifying the preserved /data survived the flash..."
+    post_uuid=$(blkid -p -O "$((KEEP_DATA_START * 512))" -o value -s UUID "$DEV" 2>/dev/null || true)
+    [ "$post_uuid" = "$KEEP_DATA_UUID" ] || die \
+"the image overwrote /data — expected fs UUID $KEEP_DATA_UUID at sector $KEEP_DATA_START, found '${post_uuid:-nothing}'.
+       The footage on this card is gone and nothing can bring it back. The
+       card has NOT been partitioned; rerun with --root-size N to build it
+       clean. (This means the image was larger than the $((KEEP_DATA_START * 512 / 1024 / 1024)) MiB
+       ahead of /data, which a stock Pi OS Lite image is not.)"
+fi
 
 wait_part() {
     for _ in $(seq 1 20); do
@@ -300,6 +429,29 @@ wait_part "$ROOTP"
 [ ! -b "$DATAP" ] || die "Image already carries a 3rd partition (expected a stock 2-partition Pi OS image)"
 
 # --- partitions: right-size the (to-be-read-only) OS, add /data ------------
+# Under `keep` the OS size is not a choice: p2 must end exactly one sector
+# before the /data we are preserving. Its START comes from the freshly
+# flashed image (which need not match the card's previous one), so the size
+# is only computable here, after the flash.
+if [ "$KEEP_DATA" = 1 ]; then
+    NEW_TABLE=$(sfdisk -d "$DEV")
+    new_root_start=$(sfdisk_field "$NEW_TABLE" "$ROOTP" start)
+    case $new_root_start in *[!0-9]*|'') die "Could not read the start sector of $ROOTP after flashing" ;; esac
+    [ "$new_root_start" -lt "$KEEP_DATA_START" ] || die \
+        "the flashed OS partition starts at sector $new_root_start, at or past the preserved /data at $KEEP_DATA_START"
+    root_sectors=$((KEEP_DATA_START - new_root_start))
+    root_bytes=$((root_sectors * 512))
+    [ "$root_bytes" -ge $((8 * 1024 * 1024 * 1024)) ] || die \
+        "--root-size keep: this card leaves only $((root_bytes / 1024 / 1024 / 1024)) GiB for the OS, under the 8 GiB minimum. Rebuild it with --root-size N."
+    info "Sizing OS partition to $((root_bytes / 1024 / 1024 / 1024)) GiB (sectors $new_root_start..$((KEEP_DATA_START - 1)), ending where /data begins)..."
+    echo ", ${root_sectors}" | sfdisk -q -N 2 "$DEV"
+    partprobe "$DEV"
+    udevadm settle
+    rc=0
+    e2fsck -f -p "$ROOTP" || rc=$?
+    [ "$rc" -le 2 ] || die "e2fsck on $ROOTP failed (exit $rc)"
+    resize2fs "$ROOTP"
+else
 root_bytes=$((ROOT_GIB * 1024 * 1024 * 1024))
 cur_bytes=$(blockdev --getsize64 "$ROOTP")
 if [ "$cur_bytes" -lt "$root_bytes" ]; then
@@ -314,32 +466,66 @@ if [ "$cur_bytes" -lt "$root_bytes" ]; then
 else
     info "Image OS partition already >= ${ROOT_GIB} GiB"
 fi
+fi
 
-info "Creating /data partition..."
-# The flashed image can leave a small free gap BEFORE the boot partition
-# (bootfs starts at 4 MiB), and sfdisk with no start sector appends into the
-# first free area — i.e. that gap, yielding a few-MiB /data. Start explicitly
-# on the first 1 MiB boundary after the OS partition instead.
 root_end=$(sfdisk -l -o Device,End "$DEV" | awk -v p="$ROOTP" '$1 == p {print $2}')
 case $root_end in *[!0-9]*|'') die "Could not read the end sector of $ROOTP" ;; esac
-data_start=$(( (root_end / 2048 + 1) * 2048 ))
-# --wipe-partitions: erase any stale fs signature where the new partition
-# lands (belt-and-braces to the pre-dd wipe — covers cards whose old table
-# was already gone, leaving signatures with no node to wipe them through)
-echo "${data_start},,L" | sfdisk -q --wipe-partitions always -a "$DEV"
-partprobe "$DEV"
-udevadm settle
-wait_part "$DATAP"
-[ "$(blockdev --getsize64 "$DATAP")" -ge "$MIN_DATA_BYTES" ] || \
-    die "/data would be under 1 GiB, lower --root-size or use a bigger card"
-mkfs.ext4 -q -F -L dashberry-data "$DATAP"
+
+if [ "$KEEP_DATA" = 1 ]; then
+    info "Re-adopting the existing /data partition (NOT formatting it)..."
+    [ "$root_end" -lt "$KEEP_DATA_START" ] || die \
+        "the OS partition now ends at sector $root_end, overlapping the preserved /data at $KEEP_DATA_START"
+    # Exact original geometry, and --wipe-partitions NEVER: destruction step
+    # 2 of 3 for the footage is sfdisk helpfully erasing the fs signature it
+    # finds where the partition lands. Here that signature IS the payload.
+    echo "${KEEP_DATA_START},${KEEP_DATA_SIZE},L" | sfdisk -q --wipe-partitions never -a "$DEV"
+    partprobe "$DEV"
+    udevadm settle
+    wait_part "$DATAP"
+    # Step 3 of 3 — the mkfs — is simply not run. Verify instead.
+    rc=0; e2fsck -f -p "$DATAP" || rc=$?
+    [ "$rc" -le 2 ] || die "e2fsck on the re-adopted $DATAP failed (exit $rc)"
+    readopted_uuid=$(blkid -p -o value -s UUID "$DATAP" 2>/dev/null || true)
+    [ "$readopted_uuid" = "$KEEP_DATA_UUID" ] || die \
+        "re-adopted $DATAP has fs UUID '${readopted_uuid:-none}', expected $KEEP_DATA_UUID"
+else
+    info "Creating /data partition..."
+    # The flashed image can leave a small free gap BEFORE the boot partition
+    # (bootfs starts at 4 MiB), and sfdisk with no start sector appends into the
+    # first free area — i.e. that gap, yielding a few-MiB /data. Start explicitly
+    # on the first 1 MiB boundary after the OS partition instead.
+    data_start=$(( (root_end / 2048 + 1) * 2048 ))
+    # --wipe-partitions: erase any stale fs signature where the new partition
+    # lands (belt-and-braces to the pre-dd wipe — covers cards whose old table
+    # was already gone, leaving signatures with no node to wipe them through)
+    echo "${data_start},,L" | sfdisk -q --wipe-partitions always -a "$DEV"
+    partprobe "$DEV"
+    udevadm settle
+    wait_part "$DATAP"
+    [ "$(blockdev --getsize64 "$DATAP")" -ge "$MIN_DATA_BYTES" ] || \
+        die "/data would be under 1 GiB, lower --root-size or use a bigger card"
+    mkfs.ext4 -q -F -L dashberry-data "$DATAP"
+fi
+# PARTUUID is expected to CHANGE under keep: for an msdos table it derives
+# from the MBR disk id, which came from the freshly flashed image. Harmless —
+# fstab is written from this value a few steps below, every time.
 DATA_PARTUUID=$(blkid -o value -s PARTUUID "$DATAP")
 [ -n "$DATA_PARTUUID" ] || die "Could not read PARTUUID of $DATAP"
 
 info "Creating /data directory skeleton..."
 DMNT=$(mktemp -d)
 mount "$DATAP" "$DMNT"
+# mkdir -p, so this is equally the "the skeleton is already there" path that
+# a re-adopted /data takes.
 mkdir -p "$DMNT/front" "$DMNT/rear" "$DMNT/gps"
+if [ "$KEEP_DATA" = 1 ]; then
+    # `|| true` on both: the script runs under `set -euo pipefail`, and a
+    # find that trips over anything would otherwise abort the install at the
+    # very last, purely cosmetic, step.
+    kept_sessions=$( (find "$DMNT/front" -mindepth 1 -maxdepth 1 -type d 2>/dev/null || true) | wc -l)
+    kept_segs=$( (find "$DMNT/front" "$DMNT/rear" -name '*.ts' 2>/dev/null || true) | wc -l)
+    info "  /data preserved: $kept_sessions front session(s), $kept_segs segment(s) still on the card"
+fi
 umount "$DMNT"
 rmdir "$DMNT"
 
