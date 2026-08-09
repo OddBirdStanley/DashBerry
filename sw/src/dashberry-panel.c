@@ -1963,7 +1963,6 @@ static struct {
     pid_t   pid;                   /* the stop job, then the script */
     bool    reaped;
     int     status;
-    bool    to_journal;            /* the /data log could not be opened */
     int64_t started_ms;            /* RUNNING since — the elapsed counter */
     int64_t deadline_ms;           /* STOPPING watchdog only */
 } scr;
@@ -2095,7 +2094,6 @@ static void script_enter(int64_t now)
     ui.last_key_ms = now;
     ui.flash_until_ms = 0;         /* an EVENT flash must not overlay this */
 
-    scr.to_journal = false;
     scr.reaped = false;
     scr.status = -1;
     scr.state = SCRST_STOPPING;
@@ -2117,7 +2115,6 @@ static void script_run(int64_t now)
         return;
 
     int logfd = script_log_open(scr.name[scr.sel]);
-    scr.to_journal = logfd < 0;
 
     char *const argv[] = { scr.name[scr.sel], NULL };
     scr.pid = script_fork(path, argv, logfd, true);
@@ -2366,7 +2363,8 @@ static void script_label(char *dst, size_t len, const char *name)
 }
 
 /* PAGE SCRIPTS. STOPPING borrows the full-screen shape EVENT and CONNECTING
- * use; LIST borrows JW-1's INVERTED bar; DONE spells out the only exit. */
+ * use; LIST borrows JW-1's INVERTED bar; RUNNING and DONE share a two-row
+ * word-over-number shape. */
 static void compose_script(struct frame *f, int64_t now)
 {
     if (scr.state == SCRST_STOPPING) {
@@ -2389,6 +2387,10 @@ static void compose_script(struct frame *f, int64_t now)
         }
         return;
     }
+    /* RUNNING and DONE are the same two-row shape — a word on row 1, its
+     * one number on row 2 — so the screen does not reflow when the child
+     * exits; only the two lines' contents change. Rows 0 and 3 stay empty,
+     * which is what centres the pair on a four-line display. */
     if (scr.state == SCRST_RUNNING) {
         /* The elapsed counter is the liveness report: a script with nothing
          * to say still visibly has not finished. Clamped so the row cannot
@@ -2398,27 +2400,26 @@ static void compose_script(struct frame *f, int64_t now)
             secs = 0;
         if (secs > 9999)
             secs = 9999;
-        snprintf(f->rows[0], sizeof f->rows[0], "RUNNING %ds", secs);
-        script_label(f->rows[1], sizeof f->rows[1], scr.name[scr.sel]);
+        snprintf(f->rows[1], sizeof f->rows[1], "RUNNING");
+        snprintf(f->rows[2], sizeof f->rows[2], "%ds", secs);
         return;
     }
 
+    snprintf(f->rows[1], sizeof f->rows[1], "DONE");
+    /* A signal is not an exit status, so it keeps its own spelling rather
+     * than being folded into 128+n — on a card you reboot to leave, the
+     * difference between "the script returned 9" and "something killed it"
+     * is the whole reason you are reading this row. */
     if (!scr.reaped || scr.status < 0)
-        snprintf(f->rows[0], sizeof f->rows[0], "DONE rc=?");
+        snprintf(f->rows[2], sizeof f->rows[2], "EXIT ?");
     else if (WIFEXITED(scr.status))
-        snprintf(f->rows[0], sizeof f->rows[0], "DONE rc=%d",
+        snprintf(f->rows[2], sizeof f->rows[2], "EXIT %d",
                  WEXITSTATUS(scr.status));
     else if (WIFSIGNALED(scr.status))
-        snprintf(f->rows[0], sizeof f->rows[0], "DONE sig=%d",
+        snprintf(f->rows[2], sizeof f->rows[2], "EXIT SIG%d",
                  WTERMSIG(scr.status));
     else
-        snprintf(f->rows[0], sizeof f->rows[0], "DONE rc=?");
-    script_label(f->rows[1], sizeof f->rows[1], scr.name[scr.sel]);
-    /* Where to look, not the full path — 16 columns cannot hold
-     * "/data/scripts/<name>.log" and the docs carry the rest. */
-    snprintf(f->rows[2], sizeof f->rows[2], "%s",
-             scr.to_journal ? "LOG: JOURNAL" : "LOG: /data");
-    snprintf(f->rows[3], sizeof f->rows[3], "REBOOT TO EXIT");
+        snprintf(f->rows[2], sizeof f->rows[2], "EXIT ?");
 }
 
 static void compose(struct frame *f, int64_t now)

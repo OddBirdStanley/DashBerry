@@ -41,7 +41,7 @@ const sim = {
               "sample-grid", "zz-last"],
     scriptStopMs: 2000, scriptRunMs: 3000,
     scriptRc: 0, scriptSignal: null,
-    scriptLogOk: true, scriptMark: false,
+    scriptMark: false,
     scriptRuns: [],
     logs: [],
     presented: null,
@@ -85,7 +85,6 @@ const hw = {
         sim.pending.push({ h, cmd: "script", at: vt.now + sim.scriptRunMs });
         return h;
     },
-    scriptLogOk: () => sim.scriptLogOk,
     scriptMarkGet: () => sim.scriptMark,
     scriptMarkSet: () => { sim.scriptMark = true; },
     present: (view) => { sim.presented = { blanked: view.blanked,
@@ -1196,25 +1195,31 @@ ok(js.rf_state === "killed",
     ok(sstate().screen === "SCRIPTS", "button A is absorbed too");
 
     /* --- run it ---------------------------------------------------------- */
-    sim.scriptRc = 7; sim.scriptSignal = null; sim.scriptLogOk = true;
+    sim.scriptRc = 7; sim.scriptSignal = null;
     shold(PANEL.KEY.CENTER, 200);
     sadvance(400);
     ok(sstate().scripts.state === "RUNNING", "CENTER runs the selected script");
     ok(sim.scriptRuns.length === 1 && sim.scriptRuns[0] === "01-first",
        `…the selected one (ran ${JSON.stringify(sim.scriptRuns)})`);
-    ok(decodeRow(0).startsWith("RUNNING "),
-       `…and RUNNING shows an elapsed counter (got "${decodeRow(0)}")`);
+    /* RUNNING is two rows and nothing else: the word on line 2, its elapsed
+     * seconds on line 3, and rows 0/3 left empty to centre the pair. */
+    ok(decodeRow(1) === "RUNNING",
+       `…and RUNNING names itself on line 2 (got "${decodeRow(1)}")`);
+    ok(/^\d+s$/.test(decodeRow(2)),
+       `…with the elapsed counter alone on line 3 (got "${decodeRow(2)}")`);
+    ok(decodeRow(0) === "" && decodeRow(3, 15) === "",
+       "…and prints nothing else");
 
     sadvance(3200);
     ok(sstate().scripts.state === "DONE", "the child exits -> DONE");
-    ok(decodeRow(0) === "DONE rc=7", `…with its exit code (got "${decodeRow(0)}")`);
-    ok(decodeRow(1) === "01-first", "…the script it ran");
-    ok(decodeRow(2) === "LOG: /data", `…where the log went (got "${decodeRow(2)}")`);
-    /* maxc=15: the bottom-right cell is the reserved RF glyph, which
-     * decodes as '?' like it does on every other page. "REBOOT TO EXIT" is
-     * 14 columns, so it clears that cell with one to spare. */
-    ok(decodeRow(3, 15) === "REBOOT TO EXIT",
-       `…and the only way out (got "${decodeRow(3, 15)}")`);
+    /* DONE keeps RUNNING's shape exactly, so the screen does not reflow. */
+    ok(decodeRow(1) === "DONE", `…saying so on line 2 (got "${decodeRow(1)}")`);
+    ok(decodeRow(2) === "EXIT 7",
+       `…with the exit code on line 3 (got "${decodeRow(2)}")`);
+    ok(decodeRow(0) === "" && decodeRow(3, 15) === "",
+       "…and nothing else: no name, no log hint, no exit hint");
+    /* maxc=15 on row 3: the bottom-right cell is the reserved RF glyph,
+     * which decodes as '?' like it does on every other page. */
     ok(decodeCell(3, 14) === " ", "…without touching the glyph cell's neighbour");
     ok([0, 1, 2, 3].every(r => decodeRow(r).length <= 16),
        "every DONE row fits 16 columns");
@@ -1228,9 +1233,9 @@ ok(js.rf_state === "killed",
     ok(sstate().screen === "SCRIPTS" && sstate().blanked === false,
        "…and still will not blank or leave");
 
-    /* --- a signalled child, and a log that could not be opened ---------- */
+    /* --- a signalled child ---------------------------------------------- */
     sim.scriptMark = false; sim.frontWriting = true; sim.rearWriting = true;
-    sim.scriptRc = null; sim.scriptSignal = 9; sim.scriptLogOk = false;
+    sim.scriptRc = null; sim.scriptSignal = 9;
     sim.scriptRuns = [];
     sp.boot("MPH", false, true);
     sadvance(1400);
@@ -1238,14 +1243,18 @@ ok(js.rf_state === "killed",
     sadvance(2400);
     shold(PANEL.KEY.CENTER, 200);
     sadvance(3600);
-    ok(decodeRow(0) === "DONE sig=9",
-       `a killed child reports its signal (got "${decodeRow(0)}")`);
-    ok(decodeRow(2) === "LOG: JOURNAL",
-       `an unwritable /data falls back to the journal (got "${decodeRow(2)}")`);
+    /* A signal keeps its own spelling rather than folding into 128+n — on a
+     * card you reboot to leave, "returned 9" and "was killed" must not read
+     * the same. It still lives on line 3, in DONE's one slot. */
+    ok(decodeRow(1) === "DONE", `…still DONE on line 2 (got "${decodeRow(1)}")`);
+    ok(decodeRow(2) === "EXIT SIG9",
+       `a killed child reports its signal (got "${decodeRow(2)}")`);
+    ok(decodeRow(0) === "" && decodeRow(3, 15) === "",
+       "…and a signalled DONE prints nothing else either");
 
     /* --- entry from PAGE 0, and from a blanked screen -------------------- */
     sim.scriptMark = false; sim.frontWriting = false; sim.rearWriting = false;
-    sim.scriptRc = 0; sim.scriptSignal = null; sim.scriptLogOk = true;
+    sim.scriptRc = 0; sim.scriptSignal = null;
     sp.boot("MPH", false, true);
     sadvance(12000);               /* recorders down -> PAGE 0 */
     ok(sstate().error === true && sstate().page === 0,
