@@ -80,8 +80,41 @@ run_installer() {
 assert_ran() {   # assert_ran LOGFILE LABEL
     grep -q "must be run on a visual terminal" "$1" && \
         die "$2: the installer never ran — no pty (is script(1) present?)"
+    # An EMPTY transcript is never a result either. It meant the log itself
+    # could not be written (the workspace was full), and the run was then
+    # scored against a card whose state nobody could explain.
+    [ -s "$1" ] || die "$2: the installer produced no output at all — workspace full, or script(1) failed"
     return 0
 }
+
+# --- bookkeeping helpers (needed by the self-test too) ----------------------
+# register_loop writes to a FILE and not a shell array, because make_card is
+# called as $( ) — a SUBSHELL — and an array append inside one is discarded
+# the instant it returns. That is why every run leaked its loop devices, each
+# pinning a backing file it had already unlinked, until the workspace filled
+# and sfdisk started reporting "fsync device failed: Input/output error".
+register_loop() { printf '%s\n' "$1" >> "$LOOPFILE"; }
+
+# Release a fixture the moment its case is done, rather than holding all five
+# to the end. Peak disk is then one card (~4 GiB once an image is flashed
+# into it), not the sum of them.
+release_card() {   # release_card LOOPDEV BACKING_FILE
+    [ -n "${1:-}" ] && losetup -d "$1" 2>/dev/null
+    [ -n "${2:-}" ] && rm -f "$2"
+    return 0
+}
+
+# make_card and synth_image die inside a subshell, which only kills the
+# subshell — the caller carried on with an empty variable and then ran
+# `mkfs.ext4 ... p3` on the literal string "p3". Every fixture is claimed
+# through this, so a failure stops the run.
+claim() {          # claim VARNAME COMMAND...
+    local _var=$1; shift
+    local _dev; _dev=$("$@") || { echo "FIXTURE ERROR: $* failed" >&2; exit 1; }
+    [ -b "$_dev" ] || { echo "FIXTURE ERROR: $* gave no block device ('$_dev')" >&2; exit 1; }
+    printf -v "$_var" '%s' "$_dev"
+}
+
 
 # --- self-test: no root, no loop devices -----------------------------------
 if [ "${1:-}" = --self-test ]; then
@@ -204,6 +237,29 @@ FAKE
     if echo ", $((derived + 2048))" | sfdisk -q -N 2 "$o" >/dev/null 2>&1; then over=no; else over=yes; fi
     ck "oversized OS refused by sfdisk"    yes "$over"
     ck "/data survived the refusal"        "$card_p3" "$(fstart "$o" "${o}3")"
+
+    # --- loop-device bookkeeping across a subshell -------------------------
+    # make_card hands its device back through $( ), so anything it records in
+    # a shell VARIABLE is discarded when that subshell exits. The harness kept
+    # its loop devices in an array, so cleanup detached none of them: every
+    # run leaked, each leak pinned an unlinked backing file, and the workspace
+    # filled until sfdisk began failing with "fsync device failed:
+    # Input/output error". This pins both halves — the loss and the fix.
+    echo "== self-test: loop bookkeeping and fixture claiming =="
+    LOOPFILE="$t/loops"; : > "$LOOPFILE"
+    arr=()
+    probe() { arr+=("/dev/fake$1"); register_loop "/dev/fake$1"; echo "/dev/fake$1"; }
+    got=$(probe 7)
+    ck "subshell returns the device"       /dev/fake7 "$got"
+    ck "array append LOST in subshell"     0 "${#arr[@]}"
+    ck "file record SURVIVES subshell"     1 "$(grep -c . "$LOOPFILE")"
+    # claim() must abort the run when a fixture cannot be built, rather than
+    # letting die()'s subshell-only exit leave an empty variable behind — the
+    # path that ended in `mkfs.ext4` being handed the literal string "p3".
+    if ( claim _X false ) >/dev/null 2>&1; then claimed=no; else claimed=yes; fi
+    ck "claim aborts on a failed fixture"  yes "$claimed"
+    if ( claim _X echo "not-a-device" ) >/dev/null 2>&1; then claimed=no; else claimed=yes; fi
+    ck "claim rejects a non-device"        yes "$claimed"
     echo; echo "passed $pass, failed $fail"; [ "$fail" -eq 0 ]; exit $?
 fi
 
@@ -219,9 +275,50 @@ INSTALLER="$HERE/dashberry-install"
 [ -x "$INSTALLER" ] || die "not found: $INSTALLER"
 USER_IMG=${1:-}
 
-WORK=$(mktemp -d); LOOPS=()
+WORK=$(mktemp -d "${HARNESS_WORK:-${TMPDIR:-/tmp}}/keepdata.XXXXXX")
+
+# Loop devices leaked by EARLIER runs of this harness (the subshell bug below)
+# still pin backing files that were unlinked long ago, so the space they hold
+# is invisible to du and never comes back on its own. Say so, with the command
+# that clears exactly those and nothing else — "(deleted)" is the kernel's own
+# marker for a backing file with no remaining name.
+leaked=$(losetup -l 2>/dev/null | grep -c '(deleted)' || true)
+if [ "${leaked:-0}" -gt 0 ]; then
+    echo "NOTE: $leaked leaked loop device(s) from earlier runs are still holding deleted files."
+    echo "      Reclaim that space with:"
+    echo "          sudo losetup -l | awk '/\\(deleted\\)/ {print \$1}' | xargs -r sudo losetup -d"
+    echo
+fi
+
+# Each flashed card costs roughly the image's uncompressed size plus the
+# metadata resize2fs writes, and fixtures are released as they finish, so the
+# peak is about one card. Refuse up front rather than failing mid-flash with
+# "fsync device failed: Input/output error", which is what ENOSPC looks like
+# through sfdisk and is not a phrase anyone should have to decode.
+avail_mib=$(df -Pm "$WORK" | awk 'NR==2 {print $4}')
+NEED_MIB=8192
+if [ "${avail_mib:-0}" -lt "$NEED_MIB" ]; then
+    die "only ${avail_mib} MiB free on $(df -Pm "$WORK" | awk 'NR==2 {print $6}') — need ~${NEED_MIB} MiB.
+       Point the harness somewhere roomier:  sudo HARNESS_WORK=/var/tmp $0 $*"
+fi
+echo "workspace: $WORK (${avail_mib} MiB free)"
+
+# Loop devices are recorded in a FILE, not a shell array. make_card runs
+# inside $( ) to hand back the device path, and a command substitution is a
+# SUBSHELL — so `LOOPS+=(...)` inside it evaporated the moment the function
+# returned, and cleanup detached nothing. Every run leaked its loop devices;
+# each one pinned the backing file it had already unlinked, so the space was
+# never reclaimed either. That is what eventually produced
+# "sfdisk: fsync device failed: Input/output error" (ENOSPC by another name)
+# and an installer transcript that could not be written at all. A file
+# survives the subshell.
+LOOPFILE="$WORK/loops"; : > "$LOOPFILE"
 cleanup() {
-    for l in "${LOOPS[@]:-}"; do [ -n "$l" ] && losetup -d "$l" 2>/dev/null; done
+    if [ -f "$LOOPFILE" ]; then
+        while read -r l; do
+            [ -n "$l" ] && losetup -d "$l" 2>/dev/null
+        done < "$LOOPFILE"
+    fi
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -234,7 +331,7 @@ make_card() {
     read -r p2z p3s p3z <<<"$(geom 20480 "$root_mib")"
     truncate -s 20G "$path" || die "truncate $path"
     lo=$(losetup --show -f -P "$path") || die "losetup $path"
-    LOOPS+=("$lo")
+    register_loop "$lo"
     {
         echo "label: dos"
         echo "${lo}p1 : start=$P1_START, size=$P1_SIZE, type=c"
@@ -286,6 +383,7 @@ synth_image() {
     p2z=$((2048 * SECT_PER_MIB - P2_START - SECT_PER_MIB))
     truncate -s 2G "$img" || die "truncate stand-in"
     lo=$(losetup --show -f -P "$img") || die "losetup stand-in"
+    register_loop "$lo"
     out=$(sfdisk -q "$lo" 2>&1 <<EOF
 label: dos
 ${lo}p1 : start=$P1_START, size=$P1_SIZE, type=c
@@ -309,7 +407,7 @@ echo "image: $IMG"
 # ==========================================================================
 echo
 echo "== CASE 1: normal card, footage must survive =="
-CARD=$(make_card "$WORK/card.img" 8192 3)
+claim CARD make_card "$WORK/card.img" 8192 3
 validate_card "$CARD" dashberry-data
 plant_footage "$CARD"
 before_start=$(p3start "$CARD")
@@ -385,6 +483,9 @@ fi
 
 # ==========================================================================
 echo
+# CASE 1 is finished with: give its ~4 GiB back before building the next one.
+release_card "$CARD" "$WORK/card.img"
+
 echo "== CASE 2..5: refusals =="
 # Same pty runner as CASE 1: the /data-overlap refusal happens AFTER the
 # confirmation, so a pipe-fed run never reaches it and the case fails for the
@@ -400,17 +501,19 @@ neg() {   # neg LABEL LOOPDEV EXPECTED_SUBSTRING
     fi
 }
 
-lo2=$(make_card "$WORK/two.img" 8192 2)
+claim lo2 make_card "$WORK/two.img" 8192 2
 neg "two-partition card" "$lo2" "expected 3"
+release_card "$lo2" "$WORK/two.img"
 
-lo3=$(make_card "$WORK/badl.img" 8192 3)
+claim lo3 make_card "$WORK/badl.img" 8192 3
 mkfs.ext4 -q -F -L someone-elses "${lo3}p3" || die "relabel fixture"
 neg "third partition with a foreign label" "$lo3" "labelled 'someone-elses'"
+release_card "$lo3" "$WORK/badl.img"
 
 # GPT fixture: sfdisk -X gpt is enough; no dependency on sgdisk being present.
 truncate -s 20G "$WORK/gpt.img"
 lo4=$(losetup --show -f -P "$WORK/gpt.img") || die "losetup gpt"
-LOOPS+=("$lo4")
+register_loop "$lo4"
 read -r g2z g3s g3z <<<"$(geom 20480 8192)"
 sfdisk -q -X gpt "$lo4" >/dev/null 2>&1 <<EOF
 start=$P1_START, size=$P1_SIZE
@@ -421,12 +524,14 @@ partprobe "$lo4"; udevadm settle
 [ "$(sfdisk -d "$lo4" 2>/dev/null | awk '$1=="label:"{print $2}')" = gpt ] || die "gpt fixture is not gpt"
 mkfs.ext4 -q -F -L dashberry-data "${lo4}p3" 2>/dev/null || true
 neg "GPT-labelled card" "$lo4" "has a 'gpt' partition table"
+release_card "$lo4" "$WORK/gpt.img"
 
 # /data deliberately at ~1 GiB so the 2 GiB stand-in lands on top of it.
-lo5=$(make_card "$WORK/over.img" 512 3)
+claim lo5 make_card "$WORK/over.img" 512 3
 validate_card "$lo5" dashberry-data
 plant_footage "$lo5"
 neg "image would overwrite /data" "$lo5" "overwrote /data"
+release_card "$lo5" "$WORK/over.img"
 
 echo
 echo "passed $pass, failed $fail"
