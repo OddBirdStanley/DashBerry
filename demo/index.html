@@ -193,9 +193,52 @@
         default — a PAGE 3 choice outranks it)</span>
       <label class="row"><input type="checkbox" id="rfjoin">
         RF_JOIN=1 card (arms the 5 s button-A JOIN WIFI hold)</label>
+      <label class="row"><input type="checkbox" id="riskyscripts">
+        RISKY_SCRIPTS=1 card (arms the 5 s CENTER hold — <code>--debug</code>
+        cards only)</label>
       <button class="act" id="restart">restart panel daemon</button>
+      <button class="act" id="powercycle">power cycle</button>
       <span style="color:var(--dim);font-size:11.5px">(conf is read at boot,
-        as in the C; a reboot always lands RF-KILLED)</span>
+        as in the C; a reboot always lands RF-KILLED. The two buttons differ
+        for PAGE SCRIPTS only: its <code>/run</code> marker is on tmpfs, so a
+        daemon RESTART lands back on the page and a POWER CYCLE does not)</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>PAGE SCRIPTS (--risky-scripts stand-in)</h2>
+    <div class="grp">
+      <div style="color:var(--dim);font-size:11.5px">What
+        <code>dashberry-install --risky-scripts DIR</code> deposited at
+        <code>/usr/local/lib/dashberry/scripts</code>. One name per line,
+        already filtered to executables and sorted, as the panel's own scan
+        leaves them. A 5 s CENTER hold stops both recorders and opens the
+        list; CENTER runs one; the only way out is a reboot.</div>
+      <textarea id="scriptlist" rows="4" style="width:100%;background:#232a33;
+        color:var(--ink);border:1px solid var(--edge);border-radius:6px;
+        font:12px ui-monospace,monospace;padding:6px"
+      >01-first
+a-very-long-script-name
+sample-grid</textarea>
+    </div>
+    <div class="grp">
+      <div class="slider">how long the script runs
+        <input type="range" id="scriptms" min="200" max="20000" step="200"
+               value="4000">
+        <span class="val" id="scriptmsval"></span></div>
+      <label class="row">it exits with
+        <select id="scriptrc">
+          <option value="0">rc=0 (success)</option>
+          <option value="1">rc=1</option>
+          <option value="7">rc=7</option>
+          <option value="sig9">killed by SIGKILL (sig=9)</option>
+        </select></label>
+      <label class="row"><input type="checkbox" id="scriptlogfail">
+        <code>/data</code> cannot take the log (DONE says LOG: JOURNAL)</label>
+      <div class="slider">how long <code>systemctl stop</code> takes
+        <input type="range" id="stopms" min="200" max="12000" step="200"
+               value="2000">
+        <span class="val" id="stopmsval"></span></div>
     </div>
   </div>
 
@@ -252,6 +295,12 @@ const sim = {
      * serves. A fresh boot is always RF-KILLED, like the real card. */
     rfBlocked: true, rfLinked: false, pending: [], events: 0,
     settingsFile: null,            /* /data/settings.conf; survives a reboot */
+    /* PAGE SCRIPTS. recordersStopped is what entry does to the card, and it
+     * stays true until a power cycle — which is why the page suppresses
+     * PAGE 0: health goes ERR by construction the moment it is entered.
+     * scriptMark is /run/dashberry/script-mode, on tmpfs: it survives a
+     * daemon restart and not a power cycle. */
+    recordersStopped: false, scriptMark: false,
 };
 
 const logEl = $("log");
@@ -302,6 +351,32 @@ const hw = {
                               logLine("settings saved: " +
                                       text.trim().replace(/\n/g, "  "), true);
                               return true; },
+    /* PAGE SCRIPTS. The list stands in for readdir+X_OK+qsort; the two job
+     * handles stand in for `systemctl stop front-rec rear-rec` and for
+     * fork+setsid+exec, and are completed by runRfJobs() on the same clock
+     * the rf-ctl children use. */
+    scriptList: () => $("scriptlist").value.split("\n")
+                          .map(s => s.trim()).filter(Boolean).slice(0, 32),
+    recordersStop: () => {
+        const h = { done: false };
+        sim.pending.push({ h, cmd: "stoprec",
+                           at: performance.now() +
+                               parseInt($("stopms").value, 10) });
+        logLine("systemctl stop front-rec rear-rec", true);
+        return h;
+    },
+    scriptRun: (name) => {
+        const h = { done: false, rc: null, signal: null };
+        sim.pending.push({ h, cmd: "script",
+                           at: performance.now() +
+                               parseInt($("scriptms").value, 10) });
+        logLine(`running ${name} as root, detached (setsid)`, true);
+        return h;
+    },
+    scriptLogOk: () => !$("scriptlogfail").checked,
+    scriptMarkGet: () => sim.scriptMark,
+    scriptMarkSet: () => { sim.scriptMark = true;
+                           logLine("touched /run/dashberry/script-mode"); },
     present: (view) => blit(view),
     notify: (msg) => { if (msg === "READY=1") logLine("sd_notify: READY=1"); },
     log: (msg) => logLine(msg, true),
@@ -321,6 +396,19 @@ function runRfJobs() {
             sim.rfBlocked = true;
             sim.rfLinked = false;
             j.h.ok = true;
+        } else if (j.cmd === "stoprec") {
+            /* Both recorders down, and down until a power cycle: this is
+             * what makes PAGE SCRIPTS destructive rather than merely modal,
+             * and it is what drives FRONT/REAR to ERR underneath it. */
+            sim.recordersStopped = true;
+            logLine("front-rec, rear-rec stopped", true);
+        } else if (j.cmd === "script") {
+            const v = $("scriptrc").value;
+            if (v === "sig9") { j.h.signal = 9; j.h.rc = null; }
+            else              { j.h.rc = parseInt(v, 10); j.h.signal = null; }
+            logLine("script exited " +
+                    (j.h.signal !== null ? `on signal ${j.h.signal}`
+                                         : `rc=${j.h.rc}`), true);
         } else if (j.cmd === "connect") {
             const [ssid, psk] = String(j.stdinText).split("\n");
             sim.rfLinked = psk === $("goodpsk").value;
@@ -393,8 +481,11 @@ addEventListener("keyup", (e) => {
 
 setInterval(() => {
     const now = performance.now();
-    if ($("front").checked) sim.frontLast = now;
-    if ($("rear").checked)  sim.rearLast = now;
+    /* recordersStopped outranks the checkboxes: once PAGE SCRIPTS has
+     * stopped them, nothing short of a power cycle starts them writing
+     * again — which is exactly the state the page has to survive. */
+    if ($("front").checked && !sim.recordersStopped) sim.frontLast = now;
+    if ($("rear").checked  && !sim.recordersStopped) sim.rearLast = now;
 
     if ($("gpsdel").checked) {
         if ($("gpsfix").checked) {
@@ -482,6 +573,10 @@ setInterval(() => {
         parseFloat($("cputemp").value).toFixed(1) + " °C";
     $("rflatval").textContent =
         (parseInt($("rflat").value, 10) / 1000).toFixed(1) + " s";
+    $("scriptmsval").textContent =
+        (parseInt($("scriptms").value, 10) / 1000).toFixed(1) + " s";
+    $("stopmsval").textContent =
+        (parseInt($("stopms").value, 10) / 1000).toFixed(1) + " s";
     $("apcount").textContent =
         $("aps").value.split("\n").filter(l => l.trim()).length + " in range";
 }, PANEL.TICK_MS);
@@ -499,14 +594,31 @@ function bootPanel() {
     sim.pending.length = 0;
     panel = PANEL.create(hw);
     panel.setBurnStepMs($("fastburn").checked ? 3000 : 60000);
-    panel.boot($("units").value, $("rfjoin").checked);
+    panel.boot($("units").value, $("rfjoin").checked,
+               $("riskyscripts").checked);
     prev = null;
     logLine(`dashberry-panel booted (UNITS=${$("units").value}, ` +
-            `RF_JOIN=${$("rfjoin").checked ? 1 : 0}); radios blocked; ` +
+            `RF_JOIN=${$("rfjoin").checked ? 1 : 0}, ` +
+            `RISKY_SCRIPTS=${$("riskyscripts").checked ? 1 : 0}); ` +
+            `radios blocked; ` +
             `health must prove itself — expect a moment of PAGE 0`, true);
 }
+
+/* A power cycle, as distinct from the daemon restart above. /run is tmpfs,
+ * so this is the only thing that clears the PAGE SCRIPTS marker — and it is
+ * also the only thing that starts the recorders again once that page has
+ * stopped them. That asymmetry IS the feature: on the card, a reboot is the
+ * page's only exit, and systemd restarting the daemon is not one. */
+function powerCycle() {
+    sim.scriptMark = false;
+    sim.recordersStopped = false;
+    logLine("power cycle: /run cleared, recorders back", true);
+    bootPanel();
+}
 $("restart").addEventListener("click", bootPanel);
+$("powercycle").addEventListener("click", powerCycle);
 $("rfjoin").addEventListener("change", bootPanel);
+$("riskyscripts").addEventListener("change", powerCycle);
 bootPanel();
 </script>
 </body>

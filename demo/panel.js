@@ -32,6 +32,26 @@
  *   present(view)               render sink: { blanked, fb (Uint8Array) }
  *   notify(msg)                 sd_notify stand-in ("READY=1"/"WATCHDOG=1")
  *   log(msg)                    stderr stand-in
+ *
+ * hw contract (OPTIONAL — PAGE SCRIPTS; omit them all and the feature is
+ * simply unarmed, which is what every card without --risky-scripts is):
+ *   scriptList()             -> [name, ...] already filtered and sorted;
+ *                               stands in for readdir + S_ISREG + X_OK +
+ *                               qsort over /usr/local/lib/dashberry/scripts
+ *   recordersStop()          -> job handle { done }, mutated by the harness;
+ *                               stands in for `systemctl stop front-rec
+ *                               rear-rec`, which is async in the C because
+ *                               TimeoutStopSec=10 x2 would blow the watchdog
+ *   scriptRun(name)          -> job handle { done, rc, signal }; stands in
+ *                               for fork + setsid + exec. `signal` non-null
+ *                               is the C's WIFSIGNALED branch
+ *   scriptLogOk()            -> bool: could /data/scripts/<name>.log be
+ *                               opened. false = output went to the journal
+ *                               instead, and DONE says so
+ *   scriptMarkGet()          -> bool: /run/dashberry/script-mode exists
+ *   scriptMarkSet()             create it. tmpfs in the C, so a harness
+ *                               should keep it across a simulated panel
+ *                               RESTART and drop it on a simulated REBOOT
  */
 
 "use strict";
@@ -56,6 +76,9 @@ const RFDOWN_TO_MS  = 15000;    /* rf-ctl down watchdog */
 const CONNECT_TO_MS = 30000;    /* rf-ctl connect watchdog: the hard cap on
                                    how long CONNECTING can hold the screen */
 const RF_KILL_TRIES = 3;        /* attempts to get the radios back down */
+const SCRIPT_HOLD_MS = 5000;    /* joystick CENTER hold: open PAGE SCRIPTS */
+const SCRIPT_STOP_MS = 30000;   /* `systemctl stop` watchdog (two recorders
+                                   at TimeoutStopSec=10 each, plus slack) */
 
 /* -------------------------------------------------------------- display - */
 
@@ -75,6 +98,13 @@ const SSID_COLS = COLS - 2;     /* SSID field on JW-1; LDOTS follows */
 const SSID_MAX  = 32;
 const PSK_MAX   = 63;
 const MAX_SSIDS = 48;
+
+/* PAGE SCRIPTS sizing — the same field/truncation shape as JW-1's list, so
+ * the two read as one family. MAX_SCRIPTS is a display bound, not a policy;
+ * dashberry-install refuses to deposit more than this. */
+const SCRIPT_COLS = COLS - 2;   /* name field; LDOTS then the glyph follow */
+const SCRIPT_ROWS = ROWS - 1;   /* list rows: everything below the title */
+const MAX_SCRIPTS = 32;
 
 /* ----------------------------------------------------------------- font - */
 
@@ -336,6 +366,10 @@ function create(hw) {
     }
     let rf_join      = false;      /* RF_JOIN=1: JOIN WIFI armed. 0 = the 5 s
                                       button-A hold does nothing, as before */
+    let risky_scripts = false;     /* RISKY_SCRIPTS=1: PAGE SCRIPTS armed.
+                                      Only a --debug card can carry it; on
+                                      every other card the CENTER hold does
+                                      nothing and the page does not exist. */
 
     /* Live RF state, read never assumed (rfkill soft/hard + operstate in
      * the C; hw.rfState() here): 'killed' | 'idle' | 'link'. */
@@ -377,8 +411,9 @@ function create(hw) {
     }
 
     /* Which screen owns the input. PAGE covers PAGE 0/1/2 (ui.error picks
-     * PAGE 0); the three JOIN WIFI screens are their own modes. */
-    const SCR = { PAGE: 0, JW1: 1, JW2: 2, CONN: 3 };
+     * PAGE 0); the three JOIN WIFI screens are their own modes; SCRIPT is
+     * the one screen with no way back. */
+    const SCR = { PAGE: 0, JW1: 1, JW2: 2, CONN: 3, SCRIPT: 4 };
 
     const ui = {
         error: false,              /* any health state ERR */
@@ -392,6 +427,8 @@ function create(hw) {
         b_fired: false,            /* this hold already marked an event */
         a_down_ms: 0,              /* button A pressed since (0 = up) */
         a_fired: false,            /* this hold already fired its action */
+        c_down_ms: 0,              /* joystick CENTER pressed since (0 = up) */
+        c_fired: false,            /* this hold already opened PAGE SCRIPTS */
         flash_until_ms: 0,         /* EVENT confirmation visible until */
         flash: "",
         rf_kill_pending: false,    /* the radios are owed an rf-ctl down */
@@ -404,6 +441,18 @@ function create(hw) {
         ssid: [], sel: 0, top: 0,
         scanning: false, scan_failed: false,
         psk: "", kr: 0, kc: 0, caps: false, staged: false,
+    };
+
+    /* PAGE SCRIPTS state. STOPPING -> LIST -> RUNNING -> DONE, and DONE is
+     * terminal: one script per session, then a reboot. */
+    const SCRST = { STOPPING: 0, LIST: 1, RUNNING: 2, DONE: 3 };
+    const scr = {
+        names: [], sel: 0, top: 0,
+        state: SCRST.LIST,
+        h: null,                   /* stop job, then script job */
+        to_journal: false,         /* the /data log could not be opened */
+        started_ms: 0,             /* RUNNING since — the elapsed counter */
+        deadline_ms: 0,            /* STOPPING watchdog only */
     };
 
     let burn_step_ms = BURN_STEP_MS;   /* demo aid: harness may shorten */
@@ -764,6 +813,109 @@ function create(hw) {
             jw.kc = (jw.kc + 1) % COLS;
     }
 
+    /* ----------------------------------------------------- PAGE SCRIPTS -- */
+
+    /* Ported from the C's PAGE SCRIPTS block. The parts that are OS surface
+     * go behind hw like everything else below the line: readdir + X_OK +
+     * qsort become hw.scriptList(), fork/setsid/exec becomes hw.scriptRun()
+     * returning a handle the harness completes (the same shape rfCtl uses),
+     * `systemctl stop front-rec rear-rec` becomes hw.recordersStop(), the
+     * /data log open becomes hw.scriptLogOk(), and /run/dashberry/script-mode
+     * becomes hw.scriptMark{Get,Set}(). All are OPTIONAL — a harness that
+     * omits them gets a panel where the feature is simply unarmed.
+     *
+     * What is NOT abstracted, because it is the behavior under test: that
+     * entry stops the recorders, that ERROR is suppressed while the page is
+     * up (health goes ERR by construction once the recorders stop, so
+     * without this the page would fault to PAGE 0 ten seconds in every
+     * time), that A and B are absorbed ahead of the EVENT hold, that DONE
+     * absorbs CENTER, that entry enumerates first, and that the marker
+     * re-enters the page after a restart. */
+
+    function script_scan() {
+        const l = hw.scriptList ? hw.scriptList() : [];
+        scr.names = l.slice(0, MAX_SCRIPTS);
+        scr.sel = 0;
+        scr.top = 0;
+        return scr.names.length;
+    }
+
+    function script_viewport() {
+        if (scr.sel < scr.top)
+            scr.top = scr.sel;
+        if (scr.sel >= scr.top + SCRIPT_ROWS)
+            scr.top = scr.sel - SCRIPT_ROWS + 1;
+        if (scr.top < 0)
+            scr.top = 0;
+    }
+
+    /* The door. Enumerates FIRST: with no scripts to run there is nothing to
+     * trade the recorders for, so the hold does nothing at all rather than
+     * stranding the user on an empty inescapable page. */
+    function script_enter(now) {
+        if (!risky_scripts || script_scan() === 0)
+            return;
+
+        if (hw.scriptMarkSet)
+            hw.scriptMarkSet();
+        ui.screen = SCR.SCRIPT;
+        ui.blanked = false;
+        ui.last_key_ms = now;
+        ui.flash_until_ms = 0;     /* an EVENT flash must not overlay this */
+
+        scr.to_journal = false;
+        scr.state = SCRST.STOPPING;
+        scr.deadline_ms = now + SCRIPT_STOP_MS;
+        scr.h = hw.recordersStop ? hw.recordersStop() : null;
+        if (!scr.h)
+            scr.state = SCRST.LIST;   /* could not even try; the list still
+                                         works and a script can stop them */
+    }
+
+    function script_run(now) {
+        scr.to_journal = hw.scriptLogOk ? !hw.scriptLogOk() : false;
+        scr.h = hw.scriptRun ? hw.scriptRun(scr.names[scr.sel]) : null;
+        scr.started_ms = now;
+        if (!scr.h) {
+            scr.state = SCRST.DONE;    /* fork failed: rc is unknowable */
+            return;
+        }
+        scr.state = SCRST.RUNNING;
+    }
+
+    /* LIST navigates; every other state absorbs every key. */
+    function script_key(key, press, now) {
+        if (!press || scr.state !== SCRST.LIST || scr.names.length === 0)
+            return;
+        if (key === KEY.UP || key === KEY.DOWN) {
+            const n = scr.names.length;
+            scr.sel = (scr.sel + (key === KEY.UP ? -1 : 1) + n) % n;
+            script_viewport();
+        } else if (key === KEY.CENTER) {
+            script_run(now);
+        }
+    }
+
+    function script_tick(now) {
+        if (ui.screen !== SCR.SCRIPT)
+            return;
+        if (scr.state !== SCRST.STOPPING && scr.state !== SCRST.RUNNING)
+            return;
+
+        if (scr.state === SCRST.STOPPING) {
+            /* Best-effort: a failed or slow stop must not strand the page,
+             * because the scripts are the point. */
+            if ((scr.h && scr.h.done) || now >= scr.deadline_ms)
+                scr.state = SCRST.LIST;
+            return;
+        }
+        /* RUNNING has no deadline on purpose: a script that never returns is
+         * the user's to reboot out of, and killing it at some arbitrary mark
+         * would throw away the run they came here for. */
+        if (scr.h && scr.h.done)
+            scr.state = SCRST.DONE;
+    }
+
     function handle_key(offset, press, now) {
         let key = -1;
         for (let i = 0; i < KEY_GPIO.length; i++)
@@ -782,6 +934,12 @@ function create(hw) {
                 return;
         } else if (ui.screen === SCR.JW1 || ui.screen === SCR.JW2) {
             jw_key(key, press, now);
+            return;
+        } else if (ui.screen === SCR.SCRIPT) {
+            /* Ahead of the button-B block below on purpose: PAGE SCRIPTS
+             * absorbs A and B outright. EVENT capture is an incident marker
+             * for a recording card, and this card has stopped recording. */
+            script_key(key, press, now);
             return;
         }
 
@@ -805,21 +963,31 @@ function create(hw) {
         }
 
         if (ui.error) {
-            /* PAGE 0 is static: input ignored — except the JOIN WIFI hold
-             * on an armed card (sshd waits behind a join, and a fault is
-             * exactly when getting in matters). Any other key, or the A
-             * release, still cancels a hold in flight. */
+            /* PAGE 0 is static: input ignored — except two holds. The JOIN
+             * WIFI hold on an armed card (sshd waits behind a join, and a
+             * fault is exactly when getting in matters), and the CENTER hold
+             * on a --risky-scripts card for the same reason: a faulted card
+             * is exactly when you want the debug script. Any other key, or
+             * either release, still cancels a hold in flight. */
             if (rf_join && key === KEY.A && press) {
                 ui.a_down_ms = now;
                 ui.a_fired = false;
             } else {
                 ui.a_down_ms = 0;
             }
+            if (risky_scripts && key === KEY.CENTER && press) {
+                ui.c_down_ms = now;
+                ui.c_fired = false;
+            } else {
+                ui.c_down_ms = 0;
+            }
             return;
         }
         if (!press) {
             if (key === KEY.A)
                 ui.a_down_ms = 0;
+            if (key === KEY.CENTER)
+                ui.c_down_ms = 0;
             ui.last_key_ms = now;
             return;
         }
@@ -838,11 +1006,14 @@ function create(hw) {
             ui.a_down_ms = now;    /* 5 s hold = JOIN WIFI, fired from the
                                       tick; short presses stay reserved */
             ui.a_fired = false;
+        } else if (key === KEY.CENTER) {
+            ui.c_down_ms = now;    /* 5 s hold = PAGE SCRIPTS, fired from the
+                                      tick; short presses stay reserved */
+            ui.c_fired = false;
         } else if (set >= 0 && (key === KEY.UP || key === KEY.DOWN)) {
             setting_move(set, key === KEY.UP ? -1 : 1);
         }
-        /* UP, DOWN (off a settings page), CENTER: reserved — wake/
-           reset-timer only */
+        /* UP, DOWN (off a settings page): reserved — wake/reset-timer only */
     }
 
     /* ------------------------------------------------------- rendering -- */
@@ -885,6 +1056,56 @@ function create(hw) {
         f.inv[1 + jw.kr] |= 1 << jw.kc;
     }
 
+    /* Names wider than the field are cut and marked with a single LDOTS,
+     * exactly as JW-1 does with a long SSID. */
+    function script_label(name) {
+        return name.length > SCRIPT_COLS
+             ? name.slice(0, SCRIPT_COLS) + G_LDOTS
+             : name;
+    }
+
+    /* PAGE SCRIPTS. STOPPING borrows the full-screen shape EVENT and
+     * CONNECTING use; LIST borrows JW-1's INVERTED bar; DONE spells out the
+     * only exit. */
+    function compose_script(f, now) {
+        if (scr.state === SCRST.STOPPING) {
+            f.rows[1] = " STOPPING REC";
+            return;
+        }
+        if (scr.state === SCRST.LIST) {
+            f.rows[0] = "SCRIPTS";
+            for (let r = 0; r < SCRIPT_ROWS; r++) {
+                const i = scr.top + r;
+                if (i >= scr.names.length)
+                    break;
+                f.rows[r + 1] = script_label(scr.names[i]);
+                if (i === scr.sel)
+                    f.inv[r + 1] = 0xFFFF;
+            }
+            return;
+        }
+        if (scr.state === SCRST.RUNNING) {
+            /* The elapsed counter is the liveness report: a script with
+             * nothing to say still visibly has not finished. Clamped so the
+             * row cannot grow past the display however long it runs. */
+            let secs = Math.floor((now - scr.started_ms) / 1000);
+            if (secs < 0) secs = 0;
+            if (secs > 9999) secs = 9999;
+            f.rows[0] = "RUNNING " + secs + "s";
+            f.rows[1] = script_label(scr.names[scr.sel]);
+            return;
+        }
+        const h = scr.h;
+        f.rows[0] = !h || !h.done || (h.rc === null && h.signal === null)
+                        ? "DONE rc=?"
+                  : h.signal !== null && h.signal !== undefined
+                        ? "DONE sig=" + h.signal
+                        : "DONE rc=" + h.rc;
+        f.rows[1] = script_label(scr.names[scr.sel]);
+        f.rows[2] = scr.to_journal ? "LOG: JOURNAL" : "LOG: /data";
+        f.rows[3] = "REBOOT TO EXIT";
+    }
+
     function compose() {
         const f = { blanked: false, yoff: 0, glyph: '',
                     inv: [0, 0, 0, 0], rows: ["", "", "", ""] };
@@ -895,6 +1116,14 @@ function create(hw) {
         }
         f.glyph = rf_state === "killed" ? 'S'
                 : rf_state === "link"   ? 'W' : 'R';
+
+        if (ui.screen === SCR.SCRIPT) {
+            /* Ahead of the EVENT flash and PAGE 0 both: the one-way door
+             * owns the screen absolutely, or "cannot be exited" is not
+             * true. */
+            compose_script(f, hw.now());
+            return f;
+        }
 
         if (hw.now() < ui.flash_until_ms) {
             /* EVENT confirmation — a deliberate 2 s full-screen
@@ -1074,7 +1303,7 @@ function create(hw) {
     /* ----------------------------------------------------------- main -- */
 
     /* main() before the loop: conf, first health pass, honest boot state. */
-    function boot(units, rfJoin) {
+    function boot(units, rfJoin, riskyScripts) {
         /* load_conf(): UNITS is only the INSTALLED DEFAULT for the PAGE 3
          * setting — whatever the user last chose outranks it, and lands on
          * top from the first eval_health once /data has answered. */
@@ -1082,6 +1311,7 @@ function create(hw) {
         settings_loaded = false;   /* a restart re-reads /data */
         settings_apply();
         rf_join = !!rfJoin;        /* RF_JOIN= in dashberry.conf */
+        risky_scripts = !!riskyScripts;   /* RISKY_SCRIPTS= in the same file */
         const now = hw.now();
         ui.screen = SCR.PAGE;
         ui.page_idx = 0;
@@ -1091,10 +1321,23 @@ function create(hw) {
         ui.rf_kill_pending = false;
         ui.rf_kill_tries = 0;
         jw_clear();
+        ui.c_down_ms = 0;
+        ui.c_fired = false;
+        scr.state = SCRST.LIST;
+        scr.h = null;
         eval_health(now);
         ui.error = system_err();   /* boot: honest immediate evaluation */
         hw.notify("READY=1");
         shown = null;              /* force first paint (glyph='?' in C) */
+
+        /* Restart-in-PAGE-SCRIPTS. Restart=always would otherwise reopen the
+         * door this page exists to close, on a card whose recorders are
+         * already down. The marker is on tmpfs in the C, so it survives a
+         * panel restart and not a reboot — which is exactly the distinction
+         * the page cares about, and what the harness models by keeping it
+         * across a simulated restart but not a simulated power cycle. */
+        if (risky_scripts && hw.scriptMarkGet && hw.scriptMarkGet())
+            script_enter(now);
     }
 
     /* One 200 ms tick: watchdog, health cadence, blank, burn-in, repaint.
@@ -1106,12 +1349,22 @@ function create(hw) {
 
         rf_job_tick(now);
         rf_kill_drain(now);
+        script_tick(now);
 
         if (++subtick >= HEALTH_TICKS) {
             subtick = 0;
-            eval_health(now);
+            eval_health(now);      /* the health LOG keeps its record either
+                                      way; only the screen is suppressed */
             const err = system_err();
-            if (err && !ui.error) {
+            /* PAGE SCRIPTS stopped the recorders itself, so health goes ERR
+             * within STALE_MS by construction. Without this guard the page
+             * would fault to PAGE 0 ten seconds after entry, every single
+             * time. "It will not ERROR" is a requirement of the design,
+             * not a preference. */
+            if (ui.screen === SCR.SCRIPT) {
+                /* neither transition: ui.error is frozen at whatever it was
+                   on entry, and compose() never reaches it anyway */
+            } else if (err && !ui.error) {
                 ui.error = true;   /* forces screen on + PAGE 0 */
                 ui.blanked = false;
                 /* A fault outranks a half-finished join: JW-1/JW-2 are
@@ -1148,6 +1401,18 @@ function create(hw) {
                 ui.a_fired = true;
                 rf_toggle(now);
             }
+        }
+
+        /* Joystick CENTER held to 5 s on any page, PAGE 0 included: open
+         * PAGE SCRIPTS. !ui.blanked is what makes the waking press a pure
+         * wake — handle_key never records a c_down_ms from blank, so the
+         * hold has to restart after the screen comes up, which is the whole
+         * accidental-entry guard, free from the existing absorption rule. */
+        if (ui.c_down_ms && !ui.c_fired && risky_scripts &&
+            ui.screen === SCR.PAGE && !ui.blanked &&
+            now - ui.c_down_ms >= SCRIPT_HOLD_MS) {
+            ui.c_fired = true;
+            script_enter(now);
         }
 
         /* JW-1/JW-2 time out to the pages rather than blanking. The idle
@@ -1206,7 +1471,8 @@ function create(hw) {
         setBurnStepMs(ms) { burn_step_ms = ms; },   /* demo aid only */
 
         state() {
-            const scrName = ["PAGE", "JW-1", "JW-2", "CONNECTING"][ui.screen];
+            const scrName = ["PAGE", "JW-1", "JW-2", "CONNECTING",
+                             "SCRIPTS"][ui.screen];
             return {
                 error: ui.error, blanked: ui.blanked,
                 screen: scrName,
@@ -1232,6 +1498,12 @@ function create(hw) {
                     kr: jw.kr, kc: jw.kc, caps: jw.caps, staged: jw.staged,
                 },
                 job: job.kind,
+                risky_scripts,
+                scripts: {
+                    state: ["STOPPING", "LIST", "RUNNING", "DONE"][scr.state],
+                    names: [...scr.names], sel: scr.sel, top: scr.top,
+                    to_journal: scr.to_journal,
+                },
                 rf_kill_pending: ui.rf_kill_pending,
                 rf_kill_tries: ui.rf_kill_tries,
                 flashing: hw.now() < ui.flash_until_ms,
@@ -1247,7 +1519,8 @@ return { create, KEY, KEY_GPIO, XRES, YRES, COLS, ROWS,
          SETTINGS, SET_PAGE_FIRST, OPT_COLS,
          TICK_MS, BLANK_MS, BURN_STEP_MS, STALE_MS, GPS_SILENT_MS,
          EVENT_HOLD_MS, RF_HOLD_MS, STAGE_HOLD_MS, JW_IDLE_MS,
-         SCAN_TO_MS, CONNECT_TO_MS,
+         SCAN_TO_MS, CONNECT_TO_MS, SCRIPT_HOLD_MS, SCRIPT_STOP_MS,
+         SCRIPT_COLS, SCRIPT_ROWS, MAX_SCRIPTS,
          G_LDOTS, G_SPACE, G_CAPS_OFF, G_CAPS_ON, G_DEL,
          FONT8X8,              /* exported so logic-test.js can decode fb */
          GLYPHS: { LDOTS: GLYPH_LDOTS, SPACE: GLYPH_SPACE,

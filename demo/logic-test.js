@@ -32,6 +32,16 @@ const sim = {
     scanOk: true, correctPsk: "swordfish", rfJobMs: 2000, pending: [],
     downFailsLeft: 0,              /* make N `rf-ctl down` runs exit nonzero */
     lastConnect: null,
+    /* PAGE SCRIPTS: the deposited list, the simulated child, and the
+     * /run marker. recordersRunning is what entry is supposed to change —
+     * advance() feeds the mtimes from it, so stopping them really does
+     * drive health stale, which is the condition the ERROR suppression
+     * exists to survive. */
+    scripts: ["01-first", "a-very-long-script-name", "sample-grid"],
+    scriptStopMs: 2000, scriptRunMs: 3000,
+    scriptRc: 0, scriptSignal: null,
+    scriptLogOk: true, scriptMark: false,
+    scriptRuns: [],
     logs: [],
     presented: null,
 };
@@ -59,6 +69,24 @@ const hw = {
     /* /data/settings.conf stand-in (atomic tmp+rename in the C). */
     settingsLoad: () => sim.settingsFile,
     settingsSave: (text) => { sim.settingsFile = text; return true; },
+    /* PAGE SCRIPTS. scriptList stands in for readdir+X_OK+qsort; the two
+     * job handles stand in for `systemctl stop` and fork+setsid+exec, and
+     * are completed by runScriptJobs() on the virtual clock. */
+    scriptList: () => sim.scripts.slice(),
+    recordersStop: () => {
+        const h = { done: false };
+        sim.pending.push({ h, cmd: "stoprec", at: vt.now + sim.scriptStopMs });
+        return h;
+    },
+    scriptRun: (name) => {
+        sim.scriptRuns.push(name);
+        const h = { done: false, rc: null, signal: null };
+        sim.pending.push({ h, cmd: "script", at: vt.now + sim.scriptRunMs });
+        return h;
+    },
+    scriptLogOk: () => sim.scriptLogOk,
+    scriptMarkGet: () => sim.scriptMark,
+    scriptMarkSet: () => { sim.scriptMark = true; },
     present: (view) => { sim.presented = { blanked: view.blanked,
                                            fb: Uint8Array.from(view.fb) }; },
     notify: () => {},
@@ -84,6 +112,14 @@ function runRfJobs() {
                 sim.rfLinked = false;
                 j.h.ok = true;
             }
+        } else if (j.cmd === "stoprec") {
+            /* What entering PAGE SCRIPTS does to the card: both recorders
+             * down, and they stay down until a reboot. */
+            sim.frontWriting = false;
+            sim.rearWriting = false;
+        } else if (j.cmd === "script") {
+            j.h.rc = sim.scriptRc;
+            j.h.signal = sim.scriptSignal;
         } else if (j.cmd === "connect") {
             const [ssid, psk] = String(j.stdinText).split("\n");
             sim.lastConnect = { ssid, psk };
@@ -996,6 +1032,211 @@ ok(js.rf_state === "killed",
     ok([ev, everr, nn, rferr, " CONNECTING...", " SCANNING..."]
         .every(t => t.startsWith(" ") && !t.startsWith("  ")),
        "all six status messages share the one-column indent");
+}
+
+/* ------------------------------------------------- PAGE SCRIPTS (rev 8) --
+ *
+ * The one-way door. Every check here is about a property that is load-
+ * bearing rather than cosmetic, so a regression in any of them turns the
+ * page back into something the C deliberately made impossible to leave.
+ */
+{
+    const sp = PANEL.create(hw);
+    const sstate = () => sp.state();
+    function sadvance(ms) {
+        const end = vt.now + ms;
+        while (vt.now < end) {
+            vt.now = Math.min(vt.now + PANEL.TICK_MS, end);
+            /* honours frontWriting/rearWriting, unlike jadvance: the whole
+               point is that entry stops them and health then goes stale */
+            if (sim.frontWriting) sim.frontLast = vt.now;
+            if (sim.rearWriting)  sim.rearLast = vt.now;
+            sp.gpsFix(sim.lat, sim.lon, sim.knots);
+            runRfJobs();
+            sp.tick();
+        }
+    }
+    const spress   = (k) => sp.keyEvent(PANEL.KEY_GPIO[k], true);
+    const srelease = (k) => sp.keyEvent(PANEL.KEY_GPIO[k], false);
+    const shold    = (k, ms) => { spress(k); sadvance(ms); srelease(k); };
+
+    sim.frontWriting = true; sim.rearWriting = true;
+    sim.scriptMark = false; sim.scriptRuns = [];
+    sim.rfBlocked = true; sim.rfLinked = false;
+
+    /* --- gate 1: an unarmed card does not have this page at all --------- */
+    sp.boot("MPH", false, false);
+    sadvance(1400);
+    shold(PANEL.KEY.CENTER, 6000);
+    sadvance(400);
+    ok(sstate().screen === "PAGE",
+       "RISKY_SCRIPTS=0: a 5 s CENTER hold does nothing");
+    ok(sim.scriptMark === false, "…and writes no /run marker");
+    ok(sim.frontWriting === true, "…and leaves the recorders alone");
+
+    /* --- gate 2: armed, but nothing deposited -------------------------- */
+    const realScripts = sim.scripts;
+    sim.scripts = [];
+    sp.boot("MPH", false, true);
+    sadvance(1400);
+    shold(PANEL.KEY.CENTER, 6000);
+    sadvance(400);
+    ok(sstate().screen === "PAGE",
+       "armed but empty: the hold does not open an inescapable empty page");
+    ok(sim.frontWriting === true,
+       "…and the recorders are not traded for nothing");
+    sim.scripts = realScripts;
+
+    /* --- entry ---------------------------------------------------------- */
+    sp.boot("MPH", false, true);
+    sadvance(1400);
+    ok(sstate().error === false, "armed card boots healthy");
+    spress(PANEL.KEY.CENTER);
+    sadvance(4000);
+    ok(sstate().screen === "PAGE", "…4 s is not yet enough to open it");
+    sadvance(1400);
+    srelease(PANEL.KEY.CENTER);
+    ok(sstate().screen === "SCRIPTS", "5 s CENTER hold opens PAGE SCRIPTS");
+    ok(sstate().scripts.state === "STOPPING", "…entering at STOPPING");
+    ok(decodeRow(1) === " STOPPING REC",
+       `…rendering " STOPPING REC" (got "${decodeRow(1)}")`);
+    ok(sim.scriptMark === true, "…and the /run marker is written");
+
+    sadvance(2400);
+    ok(sstate().scripts.state === "LIST", "the stop completes -> LIST");
+    ok(sim.frontWriting === false && sim.rearWriting === false,
+       "…and both recorders really are stopped");
+    ok(decodeRow(0) === "SCRIPTS", `list titled SCRIPTS (got "${decodeRow(0)}")`);
+    /* The selected row wears a full-width INVERTED bar, as JW-1's does, so
+     * it reads back through decodeRowGlyphs rather than decodeRow. */
+    ok(decodeRowGlyphs(1) === "01-first",
+       `first entry (got "${decodeRowGlyphs(1)}")`);
+    ok(invMask(1) === "1111111111111111",
+       "…and the selected entry is an INVERTED full-width bar");
+    ok(invMask(2) === "0000000000000000", "…while the others are not");
+    ok(decodeRowGlyphs(2) === "a-very-long-sc[LDOTS]",
+       `long name cut at 14 columns + one LDOTS (got "${decodeRowGlyphs(2)}")`);
+    ok(decodeCell(2, 15) === " ",
+       "column 15 stays clear on the list (LDOTS sits in column 14)");
+    ok([0, 1, 2, 3].every(r => decodeRow(r, 15).length <= 15),
+       "every list row fits inside the glyph cell");
+
+    /* --- the requirement: no PAGE 0, though health HAS gone bad --------- */
+    sadvance(30000);
+    ok(sstate().health.front === false && sstate().health.rear === false,
+       "health really does go ERR once the recorders stop (not a vacuous pass)");
+    ok(sstate().screen === "SCRIPTS",
+       "…and PAGE SCRIPTS still owns the screen 30 s later");
+    ok(decodeRow(0) === "SCRIPTS", "…rendering the list, not Errors:");
+    ok(sstate().blanked === false, "…and it never AUTO-BLANKs");
+
+    /* --- navigation and absorption -------------------------------------- */
+    ok(sstate().scripts.sel === 0, "cursor starts at the top");
+    shold(PANEL.KEY.DOWN, 200); sadvance(200);
+    ok(sstate().scripts.sel === 1, "DOWN moves the cursor");
+    shold(PANEL.KEY.UP, 200); shold(PANEL.KEY.UP, 200); sadvance(200);
+    ok(sstate().scripts.sel === 2, "UP from the top wraps to the last (cyclic)");
+    shold(PANEL.KEY.DOWN, 200); sadvance(200);
+    ok(sstate().scripts.sel === 0, "DOWN from the last wraps to the top");
+
+    const pageBefore = sstate().page;
+    shold(PANEL.KEY.LEFT, 200); shold(PANEL.KEY.RIGHT, 200); sadvance(200);
+    ok(sstate().screen === "SCRIPTS" && sstate().page === pageBefore,
+       "LEFT/RIGHT are absorbed — no paging off the one-way door");
+
+    const eventsBefore = sim.events;
+    shold(PANEL.KEY.B, 3000); sadvance(400);
+    ok(sim.events === eventsBefore,
+       "button B is absorbed: no EVENT marker from a page that is not recording");
+    ok(sstate().flashing === false, "…and no EVENT flash overlays the page");
+    shold(PANEL.KEY.A, 6000); sadvance(400);
+    ok(sstate().screen === "SCRIPTS", "button A is absorbed too");
+
+    /* --- run it ---------------------------------------------------------- */
+    sim.scriptRc = 7; sim.scriptSignal = null; sim.scriptLogOk = true;
+    shold(PANEL.KEY.CENTER, 200);
+    sadvance(400);
+    ok(sstate().scripts.state === "RUNNING", "CENTER runs the selected script");
+    ok(sim.scriptRuns.length === 1 && sim.scriptRuns[0] === "01-first",
+       `…the selected one (ran ${JSON.stringify(sim.scriptRuns)})`);
+    ok(decodeRow(0).startsWith("RUNNING "),
+       `…and RUNNING shows an elapsed counter (got "${decodeRow(0)}")`);
+
+    sadvance(3200);
+    ok(sstate().scripts.state === "DONE", "the child exits -> DONE");
+    ok(decodeRow(0) === "DONE rc=7", `…with its exit code (got "${decodeRow(0)}")`);
+    ok(decodeRow(1) === "01-first", "…the script it ran");
+    ok(decodeRow(2) === "LOG: /data", `…where the log went (got "${decodeRow(2)}")`);
+    /* maxc=15: the bottom-right cell is the reserved RF glyph, which
+     * decodes as '?' like it does on every other page. "REBOOT TO EXIT" is
+     * 14 columns, so it clears that cell with one to spare. */
+    ok(decodeRow(3, 15) === "REBOOT TO EXIT",
+       `…and the only way out (got "${decodeRow(3, 15)}")`);
+    ok(decodeCell(3, 14) === " ", "…without touching the glyph cell's neighbour");
+    ok([0, 1, 2, 3].every(r => decodeRow(r).length <= 16),
+       "every DONE row fits 16 columns");
+
+    /* DONE is terminal: one script per session, then a reboot. */
+    shold(PANEL.KEY.CENTER, 200); sadvance(400);
+    ok(sim.scriptRuns.length === 1, "DONE absorbs CENTER — no second run");
+    shold(PANEL.KEY.DOWN, 200); sadvance(400);
+    ok(sstate().scripts.state === "DONE", "…and absorbs the joystick");
+    sadvance(20000);
+    ok(sstate().screen === "SCRIPTS" && sstate().blanked === false,
+       "…and still will not blank or leave");
+
+    /* --- a signalled child, and a log that could not be opened ---------- */
+    sim.scriptMark = false; sim.frontWriting = true; sim.rearWriting = true;
+    sim.scriptRc = null; sim.scriptSignal = 9; sim.scriptLogOk = false;
+    sim.scriptRuns = [];
+    sp.boot("MPH", false, true);
+    sadvance(1400);
+    shold(PANEL.KEY.CENTER, 5400);
+    sadvance(2400);
+    shold(PANEL.KEY.CENTER, 200);
+    sadvance(3600);
+    ok(decodeRow(0) === "DONE sig=9",
+       `a killed child reports its signal (got "${decodeRow(0)}")`);
+    ok(decodeRow(2) === "LOG: JOURNAL",
+       `an unwritable /data falls back to the journal (got "${decodeRow(2)}")`);
+
+    /* --- entry from PAGE 0, and from a blanked screen -------------------- */
+    sim.scriptMark = false; sim.frontWriting = false; sim.rearWriting = false;
+    sim.scriptRc = 0; sim.scriptSignal = null; sim.scriptLogOk = true;
+    sp.boot("MPH", false, true);
+    sadvance(12000);               /* recorders down -> PAGE 0 */
+    ok(sstate().error === true && sstate().page === 0,
+       "a faulted armed card sits on PAGE 0");
+    shold(PANEL.KEY.CENTER, 5400);
+    sadvance(400);
+    ok(sstate().screen === "SCRIPTS",
+       "the CENTER hold opens PAGE SCRIPTS from PAGE 0 too");
+
+    sim.scriptMark = false; sim.frontWriting = true; sim.rearWriting = true;
+    sp.boot("MPH", false, true);
+    sadvance(11000);               /* idle past BLANK_MS */
+    ok(sstate().blanked === true, "an idle armed card blanks as usual");
+    shold(PANEL.KEY.CENTER, 6000); /* the waking press is absorbed */
+    sadvance(400);
+    ok(sstate().screen === "PAGE",
+       "from blank, a 6 s CENTER hold only WAKES — the hold must restart");
+    shold(PANEL.KEY.CENTER, 5400);
+    sadvance(400);
+    ok(sstate().screen === "SCRIPTS", "…and the second hold opens it");
+
+    /* --- the marker survives a panel restart ---------------------------- */
+    ok(sim.scriptMark === true, "the marker is set while the page is up");
+    const sp2 = PANEL.create(hw);
+    sp2.boot("MPH", false, true);   /* Restart=always brings it back */
+    ok(sp2.state().screen === "SCRIPTS",
+       "a restarted panel re-enters PAGE SCRIPTS instead of reopening the door");
+    const sp3 = PANEL.create(hw);
+    sim.scriptMark = false;         /* tmpfs: a REBOOT clears it */
+    sp3.boot("MPH", false, true);
+    ok(sp3.state().screen === "PAGE",
+       "…and a reboot, which clears the marker, returns to PAGE 1");
+
+    sim.frontWriting = true; sim.rearWriting = true;
 }
 
 console.log(`\n${checks - failures}/${checks} checks passed`);
