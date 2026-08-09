@@ -21,7 +21,7 @@ const sim = {
     lat: -30.123456, lon: 111.222222, knots: 78.3,
     rtcOk: true,
     cpuTempMc: 30566,              /* 30.566 C, a real quantized reading */
-    throttled: 0,
+    uvAlarm: 0,                    /* rpi_volt in0_lcrit_alarm, null = absent */
     mounted: true, rw: true, freePct: 90.1, fsErrors: false,
     eventLogWritable: true, events: 0,
     settingsFile: null,            /* /data/settings.conf, null = absent */
@@ -53,7 +53,7 @@ const hw = {
     rearNewestMtimeMs: () => sim.rearLast,
     rtcOk: () => sim.rtcOk,
     cpuTempMc: () => sim.cpuTempMc,
-    throttled: () => sim.throttled,
+    uvAlarm: () => sim.uvAlarm,
     statvfs: () => sim.mounted
         ? { rw: sim.rw, freePct: sim.freePct, fsErrors: sim.fsErrors }
         : null,
@@ -416,16 +416,30 @@ ok(decodeRow(2) === "" && decodeRow(3, 15) === "",
 ok(glyphCellPixels().join("") === expectedGlyphPixels('S').join(""),
    "RF glyph shows on PAGE 2 too");
 
-/* PWR precedence: under-voltage NOW beats the latched bit. */
-sim.throttled = 0x10001;
+/* PWR: the alarm is the live rail, and UV SEEN is the panel's own latch —
+ * the hwmon driver clears the firmware's since-boot bit before userspace can
+ * read it, so the only way to earn UV SEEN is to have seen UV NOW. */
+sim.uvAlarm = 1;
 advance(1200);
 ok(decodeRow(1) === "PWR UV NOW",
-   `bit 0 set renders "PWR UV NOW" (got "${decodeRow(1)}")`);
-sim.throttled = 0x10000;
+   `the alarm asserted renders "PWR UV NOW" (got "${decodeRow(1)}")`);
+sim.uvAlarm = 0;
 advance(1200);
 ok(decodeRow(1) === "PWR UV SEEN",
-   `bit 16 alone renders "PWR UV SEEN" (got "${decodeRow(1)}")`);
-sim.throttled = 0;
+   `a recovered rail stays "PWR UV SEEN" (got "${decodeRow(1)}")`);
+/* A vanished node reads ---, and does not fault the system. */
+sim.uvAlarm = null;
+advance(1200);
+ok(decodeRow(1) === "PWR ---",
+   `an absent alarm node renders "PWR ---" (got "${decodeRow(1)}")`);
+ok(panel.state().error === false,
+   "a missing under-voltage node is not a health ERR");
+/* The latch does not decay — not on a healthy rail, and not across a spell
+ * of unreadable ones. A dip that happened must not fall off the page. */
+sim.uvAlarm = 0;
+advance(1200);
+ok(decodeRow(1) === "PWR UV SEEN",
+   `the latch outlives a read failure (got "${decodeRow(1)}")`);
 
 /* Negative-safe rounding and read-failure placeholder (1 Hz cadence). */
 sim.cpuTempMc = -10499;            /* -10.499 C -> -10, not -11 or -9 */

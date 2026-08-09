@@ -19,7 +19,8 @@
  *   rtcOk()                  -> bool (rtc0/since_epoch readable)
  *   cpuTempMc()              -> SoC temp in millidegrees C (thermal_zone0),
  *                               null = read failure (PAGE 2 shows TMP ---)
- *   throttled()              -> get_throttled bitmask, null = read failure
+ *   uvAlarm()                -> rpi_volt in0_lcrit_alarm, 0/1, null = the
+ *                               node is absent (PAGE 2 shows PWR ---)
  *   statvfs()                -> null (/data not mounted) or
  *                               { rw, freePct, fsErrors }
  *   rfState()                -> 'killed' | 'idle' | 'link' — stands in for
@@ -397,17 +398,24 @@ function create(hw) {
             cpu_temp_mc = mc;
     }
 
-    /* Firmware throttle flags for the PAGE 2 PWR line — bit 0 =
-     * under-voltage NOW, bit 16 = under-voltage seen since boot.
+    /* Under-voltage for the PAGE 2 PWR line, from raspberrypi-hwmon's
+     * low-crit alarm: 1 = the rail dipped during the driver's last 2 s poll
+     * window, and it clears itself once the rail recovers. UV SEEN is
+     * latched here because the driver consumes the firmware's own
+     * since-boot bit, so it means "since the panel started" — see the C.
      * Informational like TMP, never a health state. */
-    let throttled = 0;
-    let throttled_valid = false;
+    let uv_now = false;
+    let uv_seen = false;
+    let uv_valid = false;
 
-    function read_throttled() {
-        const t = hw.throttled();
-        throttled_valid = t !== null;
-        if (throttled_valid)
-            throttled = t;
+    function read_undervoltage() {
+        const a = hw.uvAlarm();
+        uv_valid = a !== null;
+        if (!uv_valid)
+            return;
+        uv_now = a !== 0;
+        if (uv_now)
+            uv_seen = true;         /* the latch holds for the session */
     }
 
     /* Which screen owns the input. PAGE covers PAGE 0/1/2 (ui.error picks
@@ -481,7 +489,7 @@ function create(hw) {
             settings_apply();
         }
         read_cpu_temp();           /* 1 Hz, off the 5 Hz paint path */
-        read_throttled();
+        read_undervoltage();
         rf_refresh();              /* glyph truth, not a health state */
     }
 
@@ -1203,9 +1211,9 @@ function create(hw) {
             } else {
                 f.rows[0] = "TMP ---";
             }
-            if (!throttled_valid)            f.rows[1] = "PWR ---";
-            else if (throttled & 0x1)        f.rows[1] = "PWR UV NOW";
-            else if (throttled & 0x10000)    f.rows[1] = "PWR UV SEEN";
+            if (!uv_valid)                   f.rows[1] = "PWR ---";
+            else if (uv_now)                 f.rows[1] = "PWR UV NOW";
+            else if (uv_seen)                f.rows[1] = "PWR UV SEEN";
             else                             f.rows[1] = "PWR OK";
             return f;
         }
