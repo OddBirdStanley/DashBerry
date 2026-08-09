@@ -479,6 +479,21 @@ fi
 # flashed image (which need not match the card's previous one), so the size
 # is only computable here, after the flash.
 if [ "$KEEP_DATA" = 1 ]; then
+    # PUT /data BACK IN THE TABLE FIRST, before anything that can still fail.
+    # The flash has already erased the old partition table, so between here
+    # and the re-adopt the footage is physically intact but has no entry
+    # pointing at it — and `keep` itself cannot recover that, because it
+    # learns the start sector by READING the old table. A failure in this
+    # window (the OS-size check below used to be one) therefore left a card
+    # whose recordings were present, addressable only by hand, and invisible
+    # to a retry. Writing the entry now costs nothing and closes that window:
+    # every later failure leaves /data mounted-and-findable.
+    info "Restoring the /data partition entry..."
+    echo "${KEEP_DATA_START},${KEEP_DATA_SIZE},L" | sfdisk -q --wipe-partitions never -a "$DEV"
+    partprobe "$DEV"
+    udevadm settle
+    wait_part "$DATAP"
+
     NEW_TABLE=$(sfdisk -d "$DEV")
     new_root_start=$(sfdisk_field "$NEW_TABLE" "$ROOTP" start)
     case $new_root_start in *[!0-9]*|'') die "Could not read the start sector of $ROOTP after flashing" ;; esac
@@ -486,9 +501,36 @@ if [ "$KEEP_DATA" = 1 ]; then
         "the flashed OS partition starts at sector $new_root_start, at or past the preserved /data at $KEEP_DATA_START"
     root_sectors=$((KEEP_DATA_START - new_root_start))
     root_bytes=$((root_sectors * 512))
-    [ "$root_bytes" -ge $((8 * 1024 * 1024 * 1024)) ] || die \
-        "--root-size keep: this card leaves only $((root_bytes / 1024 / 1024 / 1024)) GiB for the OS, under the 8 GiB minimum. Rebuild it with --root-size N."
-    info "Sizing OS partition to $((root_bytes / 1024 / 1024 / 1024)) GiB (sectors $new_root_start..$((KEEP_DATA_START - 1)), ending where /data begins)..."
+
+    # The OS gets whatever sits between the image's p2 start and the
+    # preserved /data — and that is USUALLY a few MiB short of the 8 GiB the
+    # card was built with, because successive Pi OS images move the first
+    # partition. Trixie starts p1 at sector 16384 where the card's original
+    # image used 8192, so p2 begins 4 MiB later and the OS lands at 8188 MiB
+    # rather than 8192. Refusing that is wrong: 4 MiB is not the difference
+    # between a working card and a full one, and the operator cannot act on
+    # it anyway — nothing can move a partition that has footage in it.
+    #
+    # So the floor keeps its meaning (a 4 GiB root overflowed in the field,
+    # 2026-07-26; 8 GiB is the working size) but tolerates the layout shift.
+    # 64 MiB absorbs any plausible change to where an image puts p1, while
+    # still refusing a card genuinely built with a small OS — one made with
+    # --root-size 4 comes out ~4 GiB short and is rejected outright.
+    KEEP_ROOT_TARGET=$((8 * 1024 * 1024 * 1024))
+    KEEP_ROOT_SLACK=$((64 * 1024 * 1024))
+    [ "$root_bytes" -ge $((KEEP_ROOT_TARGET - KEEP_ROOT_SLACK)) ] || die \
+"--root-size keep: this card leaves $((root_bytes / 1024 / 1024)) MiB for the OS, under the $(((KEEP_ROOT_TARGET - KEEP_ROOT_SLACK) / 1024 / 1024)) MiB minimum.
+       Its /data starts at sector $KEEP_DATA_START and cannot be moved without
+       copying the footage off first. Archive /data, then rebuild the card
+       with --root-size N. (The footage is untouched and still mounted at
+       $DATAP — this failure did not write to it.)"
+    if [ "$root_bytes" -lt "$KEEP_ROOT_TARGET" ]; then
+        info "  OS is $(((KEEP_ROOT_TARGET - root_bytes) / 1024 / 1024)) MiB under 8 GiB — this image puts its partitions later than the one that built the card"
+    fi
+
+    info "Sizing OS partition to $((root_bytes / 1024 / 1024)) MiB (sectors $new_root_start..$((KEEP_DATA_START - 1)), ending where /data begins)..."
+    # /data is already in the table, so sfdisk refuses outright if this would
+    # overlap it — a second pair of eyes on the arithmetic above.
     echo ", ${root_sectors}" | sfdisk -q -N 2 "$DEV"
     partprobe "$DEV"
     udevadm settle
@@ -520,12 +562,19 @@ if [ "$KEEP_DATA" = 1 ]; then
     info "Re-adopting the existing /data partition (NOT formatting it)..."
     [ "$root_end" -lt "$KEEP_DATA_START" ] || die \
         "the OS partition now ends at sector $root_end, overlapping the preserved /data at $KEEP_DATA_START"
-    # Exact original geometry, and --wipe-partitions NEVER: destruction step
-    # 2 of 3 for the footage is sfdisk helpfully erasing the fs signature it
-    # finds where the partition lands. Here that signature IS the payload.
-    echo "${KEEP_DATA_START},${KEEP_DATA_SIZE},L" | sfdisk -q --wipe-partitions never -a "$DEV"
-    partprobe "$DEV"
-    udevadm settle
+    # The entry itself was written back immediately after the flash, so that
+    # a failure in between could not strand the footage; re-add it only if
+    # something removed it since. --wipe-partitions NEVER either way:
+    # destruction step 2 of 3 for the footage is sfdisk helpfully erasing the
+    # fs signature it finds where the partition lands, and here that
+    # signature IS the payload.
+    if [ "$(sfdisk_field "$(sfdisk -d "$DEV")" "$DATAP" start)" = "$KEEP_DATA_START" ]; then
+        info "  entry already in place at sector $KEEP_DATA_START"
+    else
+        echo "${KEEP_DATA_START},${KEEP_DATA_SIZE},L" | sfdisk -q --wipe-partitions never -a "$DEV"
+        partprobe "$DEV"
+        udevadm settle
+    fi
     wait_part "$DATAP"
     # Step 3 of 3 — the mkfs — is simply not run. Verify instead.
     rc=0; e2fsck -f -p "$DATAP" || rc=$?
