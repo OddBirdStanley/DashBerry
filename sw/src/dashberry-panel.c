@@ -14,6 +14,13 @@
  *     per page, chosen on the panel and stored on /data (the OS is
  *     read-only in production, so /data is the only writable home);
  *   - AUTO-BLANK (10 s, OK state only, unless "Always On" is set);
+ *   - PAGE SCRIPTS (armed only by RISKY_SCRIPTS=1, which only a --debug card
+ *     can carry): a 5 s joystick-CENTER hold on any page INCLUDING PAGE 0
+ *     stops the recorders and opens a list of the executables deposited in
+ *     /usr/local/lib/dashberry/scripts at install time; CENTER runs the
+ *     selected one as root, detached, with its output on /data. It is a
+ *     ONE-WAY DOOR — no exit, no AUTO-BLANK, no PAGE 0 — and the only way
+ *     out is a reboot;
  *   - JOIN WIFI (armed only by RF_JOIN=1 in /etc/dashberry.conf): a 5 s
  *     button-A hold turns the radios on and opens JW-1 (SSID list) → JW-2
  *     (on-screen keyboard) → CONNECTING; the radio work itself is done by
@@ -87,6 +94,16 @@
 #define RFKILL_BASE   "/sys/class/rfkill"
 #define NET_BASE      "/sys/class/net"
 #define RF_CTL        "/usr/local/bin/rf-ctl"
+#define SYSTEMCTL     "/usr/bin/systemctl"
+#define SCRIPT_DIR    "/usr/local/lib/dashberry/scripts"  /* --risky-scripts */
+#define SCRIPT_LOG    "/data/scripts"      /* one <name>.log per script */
+#define RUN_DIR       "/run/dashberry"
+/* PAGE SCRIPTS is a one-way door, but systemd restarts the panel on a crash
+ * or a watchdog trip — which would drop the user back on PAGE 1 with the
+ * recorders stopped and a script still running. This marker re-enters the
+ * page at startup. It lives on tmpfs on purpose: a reboot clears it, and a
+ * reboot is the only intended exit. */
+#define SCRIPT_MARK   RUN_DIR "/script-mode"
 
 /* --------------------------------------------------------------- timing - */
 
@@ -111,6 +128,13 @@
                                      under it so the child normally exits
                                      first and this never fires. */
 #define RF_KILL_TRIES    3        /* attempts to get the radios back down */
+#define SCRIPT_HOLD_MS   5000     /* joystick CENTER hold: open PAGE SCRIPTS */
+#define SCRIPT_STOP_MS   30000    /* `systemctl stop` watchdog. Two recorders
+                                     at up to 10 s each (SIGINT -> EOS ->
+                                     SIGKILL), plus slack. Best-effort: on
+                                     expiry the list opens anyway, because the
+                                     scripts are the point and a script that
+                                     needs the camera can stop it itself. */
 
 /* -------------------------------------------------------------- display - */
 
@@ -133,6 +157,14 @@
 #define SSID_MAX   32           /* IEEE 802.11 SSID octets */
 #define PSK_MAX    63           /* WPA passphrase ceiling (64 = raw hex PSK) */
 #define MAX_SSIDS  48
+
+/* PAGE SCRIPTS sizing. Same field/truncation shape as JW-1's SSID list, so
+ * the two lists read as one family. The cap is a display bound, not a
+ * policy: the installer warns when it deposits more than this. */
+#define SCRIPT_COLS  (COLS - 2) /* name field; LDOTS then the glyph follow */
+#define SCRIPT_ROWS  (ROWS - 1) /* list rows: everything below the title */
+#define SCRIPT_NAME  63
+#define MAX_SCRIPTS  32
 
 /* Bit order within each 1 bpp framebuffer byte. The fbdev mono
  * convention is MSB = leftmost pixel; if every 8-px column group shows
@@ -509,6 +541,10 @@ static const char *speed_unit   = "MPH";
 static bool        bypass_time;    /* BYPASS_TIME=1: installed without DS3231 */
 static long long   clock_floor;    /* CLOCK_FLOOR: epoch the card cannot predate */
 static bool        bypass_rear;    /* BYPASS_REAR=1: installed without rear cam */
+static bool        risky_scripts;  /* RISKY_SCRIPTS=1: PAGE SCRIPTS armed.
+                                      Only --debug cards can carry it; on
+                                      every other card the CENTER hold does
+                                      nothing and the page does not exist. */
 static bool        rf_join;        /* RF_JOIN=1: JOIN WIFI armed (an --auth
                                       card without --debug). 0 = the 5 s
                                       button-A hold does nothing, as before */
@@ -661,6 +697,8 @@ static void load_conf(void)
             bypass_rear = line[12] == '1';
         } else if (strncmp(line, "RF_JOIN=", 8) == 0) {
             rf_join = line[8] == '1';
+        } else if (strncmp(line, "RISKY_SCRIPTS=", 14) == 0) {
+            risky_scripts = line[14] == '1';
         } else if (strncmp(line, "CLOCK_FLOOR=", 12) == 0) {
             /* Shared with session-init so the panel and the session name
              * can never disagree about what "implausible" means. */
@@ -1286,8 +1324,9 @@ static void setting_move(struct setting *s, int delta)
 }
 
 /* Which screen owns the input. PAGE covers PAGE 0/1/2 (ui.error picks
- * PAGE 0); the three JOIN WIFI screens are their own modes. */
-enum screen { SCR_PAGE, SCR_JW1, SCR_JW2, SCR_CONN };
+ * PAGE 0); the three JOIN WIFI screens are their own modes; SCRIPT is the
+ * one screen with no way back — see PAGE SCRIPTS below. */
+enum screen { SCR_PAGE, SCR_JW1, SCR_JW2, SCR_CONN, SCR_SCRIPT };
 
 static struct {
     bool    error;                 /* any health state ERR */
@@ -1301,6 +1340,8 @@ static struct {
     bool    b_fired;               /* this hold already marked an event */
     int64_t a_down_ms;             /* button A pressed since (0 = up) */
     bool    a_fired;               /* this hold already fired its action */
+    int64_t c_down_ms;             /* joystick CENTER pressed since (0 = up) */
+    bool    c_fired;               /* this hold already opened PAGE SCRIPTS */
     int64_t flash_until_ms;        /* EVENT confirmation visible until */
     char    flash[COLS + 1];       /* EVENT confirmation text */
     bool    rf_kill_pending;       /* the radios are owed an rf-ctl down */
@@ -1824,6 +1865,260 @@ static void jw_key(int key, bool press, int64_t now)
         jw.kc = (jw.kc + 1) % COLS;
 }
 
+/* ---------------------------------------------------------- PAGE SCRIPTS - */
+
+/* A debug affordance, and deliberately a hostile one. --risky-scripts DIR
+ * deposits every executable in DIR onto the card at install time; a 5 s
+ * CENTER hold lists them and CENTER runs one AS ROOT. It exists so bench
+ * debugging stops meaning "scp the script again", and the whole design is
+ * shaped by that being worth a real cost:
+ *
+ *   - Entry STOPS BOTH RECORDERS. That is what makes it destructive rather
+ *     than merely modal, and it is what most debug scripts want anyway
+ *     (front-check and quality-probe both need the cameras). It also means
+ *     health goes ERR within STALE_SECS by construction, which is why the
+ *     PAGE 0 transition has to be suppressed while this screen is up — see
+ *     the health block in main().
+ *   - There is NO EXIT. Not a key, not a timeout, not a fault. The page
+ *     does not AUTO-BLANK and does not fault to PAGE 0. A reboot is the
+ *     only way out, and SCRIPT_MARK on tmpfs is what makes a panel restart
+ *     land back here instead of quietly reopening the door.
+ *   - The child is a SESSION leader (setsid), not merely its own process
+ *     group like the rf-ctl children. panel.service is PartOf=dashberry.target,
+ *     so a script that stops that target would otherwise take the panel down
+ *     and itself with it. Detached, the script outlives its own blast radius
+ *     and keeps writing to its log.
+ *
+ * Output goes to /data/scripts/<name>.log, appended with a timestamped
+ * header so repeated runs accumulate. If /data cannot take it — read-only,
+ * full, or simply the thing being debugged — the child inherits the panel's
+ * own stdout/stderr and lands in the journal instead. Running with the
+ * output somewhere is strictly better than refusing to run. */
+
+enum { SCRST_STOPPING, SCRST_LIST, SCRST_RUNNING, SCRST_DONE };
+
+static struct {
+    char    name[MAX_SCRIPTS][SCRIPT_NAME + 1];
+    int     n;
+    int     sel;                   /* cursor (index into name[]) */
+    int     top;                   /* first visible row */
+    int     state;
+    pid_t   pid;                   /* the stop job, then the script */
+    bool    reaped;
+    int     status;
+    bool    to_journal;            /* the /data log could not be opened */
+    int64_t started_ms;            /* RUNNING since — the elapsed counter */
+    int64_t deadline_ms;           /* STOPPING watchdog only */
+} scr;
+
+static int script_cmp(const void *a, const void *b)
+{
+    return strcmp((const char *)a, (const char *)b);
+}
+
+/* Regular, executable, not dotted. Anything else was already rejected on
+ * the PC side by dashberry-install, which is the last place a human was
+ * present to read why. */
+static int script_scan(void)
+{
+    scr.n = 0;
+    DIR *d = opendir(SCRIPT_DIR);
+    if (!d)
+        return 0;
+    const struct dirent *e;
+    while ((e = readdir(d)) != NULL && scr.n < MAX_SCRIPTS) {
+        if (e->d_name[0] == '.')
+            continue;
+        char p[PATH_MAX];
+        if (snprintf(p, sizeof p, "%s/%s", SCRIPT_DIR, e->d_name) >=
+            (int)sizeof p)
+            continue;
+        struct stat st;
+        if (stat(p, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+        if (access(p, X_OK) != 0)
+            continue;
+        size_t l = strlen(e->d_name);
+        if (l > SCRIPT_NAME)
+            continue;              /* unstorable, so unrunnable: the
+                                      installer rejects these already */
+        memcpy(scr.name[scr.n], e->d_name, l + 1);
+        scr.n++;
+    }
+    closedir(d);
+    qsort(scr.name, (size_t)scr.n, sizeof scr.name[0], script_cmp);
+    scr.sel = 0;
+    scr.top = 0;
+    return scr.n;
+}
+
+static void script_viewport(void)
+{
+    if (scr.sel < scr.top)
+        scr.top = scr.sel;
+    if (scr.sel >= scr.top + SCRIPT_ROWS)
+        scr.top = scr.sel - SCRIPT_ROWS + 1;
+    if (scr.top < 0)
+        scr.top = 0;
+}
+
+/* stdin on /dev/null; stdout+stderr on outfd, or INHERITED (the journal)
+ * when outfd < 0. Everything else the panel holds is O_CLOEXEC, so exec
+ * closes it; dup2 clears CLOEXEC on the copies, so outfd survives on
+ * purpose. */
+static pid_t script_fork(const char *path, char *const argv[], int outfd,
+                         bool detach)
+{
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        if (detach)
+            setsid();
+        int devnull = open("/dev/null", O_RDONLY);
+        if (devnull >= 0) {
+            dup2(devnull, 0);
+            close(devnull);
+        }
+        if (outfd >= 0) {
+            dup2(outfd, 1);
+            dup2(outfd, 2);
+            close(outfd);
+        }
+        execv(path, argv);
+        _exit(127);
+    }
+    return pid;
+}
+
+static int script_log_open(const char *name)
+{
+    mkdir(SCRIPT_LOG, 0755);       /* EEXIST is the normal case */
+    char p[PATH_MAX];
+    if (snprintf(p, sizeof p, "%s/%s.log", SCRIPT_LOG, name) >= (int)sizeof p)
+        return -1;
+    int fd = open(p, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return -1;
+    char hdr[128];
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    int k = snprintf(hdr, sizeof hdr,
+                     "\n=== %s %04d-%02d-%02d %02d:%02d:%02d ===\n", name,
+                     tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                     tm.tm_hour, tm.tm_min, tm.tm_sec);
+    if (k > 0) {
+        ssize_t w = write(fd, hdr, (size_t)k);
+        (void)w;                   /* best effort: a header we could not
+                                      write must not cost us the run */
+    }
+    return fd;
+}
+
+static void script_mark(void)
+{
+    mkdir(RUN_DIR, 0755);          /* session-init normally made it already */
+    int fd = open(SCRIPT_MARK, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0)
+        close(fd);
+}
+
+/* The door. Enumerates FIRST: with no scripts to run there is nothing to
+ * trade the recorders for, so the hold does nothing at all rather than
+ * stranding the user on an empty inescapable page. */
+static void script_enter(int64_t now)
+{
+    if (!risky_scripts || script_scan() == 0)
+        return;
+
+    script_mark();
+    ui.screen = SCR_SCRIPT;
+    ui.blanked = false;
+    ui.last_key_ms = now;
+    ui.flash_until_ms = 0;         /* an EVENT flash must not overlay this */
+
+    scr.to_journal = false;
+    scr.reaped = false;
+    scr.status = -1;
+    scr.state = SCRST_STOPPING;
+    scr.deadline_ms = now + SCRIPT_STOP_MS;
+
+    char *const argv[] = { "systemctl", "stop", "front-rec", "rear-rec",
+                           NULL };
+    scr.pid = script_fork(SYSTEMCTL, argv, -1, false);
+    if (scr.pid < 0)
+        scr.state = SCRST_LIST;    /* could not even try; the list still works
+                                      and a script can stop them itself */
+}
+
+static void script_run(int64_t now)
+{
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof path, "%s/%s", SCRIPT_DIR, scr.name[scr.sel]) >=
+        (int)sizeof path)
+        return;
+
+    int logfd = script_log_open(scr.name[scr.sel]);
+    scr.to_journal = logfd < 0;
+
+    char *const argv[] = { scr.name[scr.sel], NULL };
+    scr.pid = script_fork(path, argv, logfd, true);
+    if (logfd >= 0)
+        close(logfd);
+
+    scr.reaped = scr.pid < 0;
+    scr.status = -1;
+    scr.started_ms = now;
+    scr.state = scr.pid < 0 ? SCRST_DONE : SCRST_RUNNING;
+}
+
+/* LIST navigates; every other state absorbs every key. DONE absorbs CENTER
+ * too — one script per session, then a reboot, which is the whole contract
+ * of the page. */
+static void script_key(int key, bool press, int64_t now)
+{
+    if (!press || scr.state != SCRST_LIST || scr.n <= 0)
+        return;
+    if (key == KEY_UP || key == KEY_DOWN) {
+        scr.sel = (scr.sel + (key == KEY_UP ? -1 : 1) + scr.n) % scr.n;
+        script_viewport();
+    } else if (key == KEY_CENTER) {
+        script_run(now);
+    }
+}
+
+static void script_tick(int64_t now)
+{
+    if (ui.screen != SCR_SCRIPT)
+        return;
+    if (scr.state != SCRST_STOPPING && scr.state != SCRST_RUNNING)
+        return;
+
+    if (scr.pid > 0 && !scr.reaped) {
+        int st;
+        pid_t r = waitpid(scr.pid, &st, WNOHANG);
+        if (r == scr.pid) {
+            scr.reaped = true;
+            scr.status = st;
+        } else if (r < 0) {
+            scr.reaped = true;     /* already gone; rc unknown */
+            scr.status = -1;
+        }
+    }
+
+    if (scr.state == SCRST_STOPPING) {
+        if (scr.reaped || now >= scr.deadline_ms)
+            scr.state = SCRST_LIST;
+        return;
+    }
+    /* RUNNING has no deadline on purpose: a script that never returns is
+     * the user's to reboot out of, and killing it at some arbitrary mark
+     * would throw away the run they came here for. */
+    if (scr.reaped)
+        scr.state = SCRST_DONE;
+}
+
 static void handle_key(uint32_t offset, bool press, int64_t now)
 {
     int key = -1;
@@ -1844,6 +2139,12 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
             return;
     } else if (ui.screen == SCR_JW1 || ui.screen == SCR_JW2) {
         jw_key(key, press, now);
+        return;
+    } else if (ui.screen == SCR_SCRIPT) {
+        /* Ahead of the button-B block below on purpose: PAGE SCRIPTS
+         * absorbs A and B outright. EVENT capture is an incident marker
+         * for a recording card, and this card has stopped recording. */
+        script_key(key, press, now);
         return;
     }
 
@@ -1871,22 +2172,32 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
     }
 
     if (ui.error) {
-        /* PAGE 0 is static: input ignored — except the JOIN WIFI hold on
-         * an armed card. A production card built with --auth has sshd
-         * waiting behind a join, and a fault is exactly when getting in
-         * matters, so button A stays live. Any other key (or the A
-         * release) still cancels a hold in flight. */
+        /* PAGE 0 is static: input ignored — except two holds. A production
+         * card built with --auth has sshd waiting behind a join, and a
+         * fault is exactly when getting in matters, so button A stays live;
+         * the CENTER hold is live for the same reason on a --risky-scripts
+         * card, since a faulted card is exactly when you want the debug
+         * script. Any other key (or either release) still cancels a hold
+         * in flight. */
         if (rf_join && key == KEY_A && press) {
             ui.a_down_ms = now;
             ui.a_fired = false;
         } else {
             ui.a_down_ms = 0;
         }
+        if (risky_scripts && key == KEY_CENTER && press) {
+            ui.c_down_ms = now;
+            ui.c_fired = false;
+        } else {
+            ui.c_down_ms = 0;
+        }
         return;
     }
     if (!press) {
         if (key == KEY_A)
             ui.a_down_ms = 0;
+        if (key == KEY_CENTER)
+            ui.c_down_ms = 0;
         ui.last_key_ms = now;
         return;
     }
@@ -1905,11 +2216,14 @@ static void handle_key(uint32_t offset, bool press, int64_t now)
         ui.a_down_ms = now;        /* 5 s hold = JOIN WIFI, fired from the
                                       tick; short presses stay reserved */
         ui.a_fired = false;
+    } else if (key == KEY_CENTER) {
+        ui.c_down_ms = now;        /* 5 s hold = PAGE SCRIPTS, fired from the
+                                      tick; short presses stay reserved */
+        ui.c_fired = false;
     } else if (set && (key == KEY_UP || key == KEY_DOWN)) {
         setting_move(set, key == KEY_UP ? -1 : 1);
     }
-    /* UP, DOWN (off a settings page), CENTER: reserved — wake/reset-timer
-       only */
+    /* UP, DOWN (off a settings page): reserved — wake/reset-timer only */
 }
 
 /* ------------------------------------------------------------ rendering - */
@@ -1980,6 +2294,72 @@ static void compose_jw2(struct frame *f)
     f->inv[1 + jw.kr] |= (uint16_t)(1u << jw.kc);
 }
 
+/* Names wider than the field are cut and marked with a single LDOTS,
+ * exactly as JW-1 does with a long SSID. */
+static void script_label(char *dst, size_t len, const char *name)
+{
+    size_t l = strlen(name);
+    if (l > SCRIPT_COLS && len > SCRIPT_COLS + 1) {
+        memcpy(dst, name, SCRIPT_COLS);
+        dst[SCRIPT_COLS] = G_LDOTS;
+        dst[SCRIPT_COLS + 1] = '\0';
+    } else {
+        snprintf(dst, len, "%s", name);
+    }
+}
+
+/* PAGE SCRIPTS. STOPPING borrows the full-screen shape EVENT and CONNECTING
+ * use; LIST borrows JW-1's INVERTED bar; DONE spells out the only exit. */
+static void compose_script(struct frame *f, int64_t now)
+{
+    if (scr.state == SCRST_STOPPING) {
+        snprintf(f->rows[1], sizeof f->rows[1], " STOPPING REC");
+        return;
+    }
+    if (scr.state == SCRST_LIST) {
+        snprintf(f->rows[0], sizeof f->rows[0], "SCRIPTS");
+        for (int r = 0; r < SCRIPT_ROWS; r++) {
+            int i = scr.top + r;
+            if (i >= scr.n)
+                break;
+            script_label(f->rows[r + 1], sizeof f->rows[r + 1], scr.name[i]);
+            if (i == scr.sel)
+                f->inv[r + 1] = 0xFFFF;
+        }
+        return;
+    }
+    if (scr.state == SCRST_RUNNING) {
+        /* The elapsed counter is the liveness report: a script with nothing
+         * to say still visibly has not finished. Clamped so the row cannot
+         * grow past the display no matter how long it runs. */
+        int secs = (int)((now - scr.started_ms) / 1000);
+        if (secs < 0)
+            secs = 0;
+        if (secs > 9999)
+            secs = 9999;
+        snprintf(f->rows[0], sizeof f->rows[0], "RUNNING %ds", secs);
+        script_label(f->rows[1], sizeof f->rows[1], scr.name[scr.sel]);
+        return;
+    }
+
+    if (!scr.reaped || scr.status < 0)
+        snprintf(f->rows[0], sizeof f->rows[0], "DONE rc=?");
+    else if (WIFEXITED(scr.status))
+        snprintf(f->rows[0], sizeof f->rows[0], "DONE rc=%d",
+                 WEXITSTATUS(scr.status));
+    else if (WIFSIGNALED(scr.status))
+        snprintf(f->rows[0], sizeof f->rows[0], "DONE sig=%d",
+                 WTERMSIG(scr.status));
+    else
+        snprintf(f->rows[0], sizeof f->rows[0], "DONE rc=?");
+    script_label(f->rows[1], sizeof f->rows[1], scr.name[scr.sel]);
+    /* Where to look, not the full path — 16 columns cannot hold
+     * "/data/scripts/<name>.log" and the docs carry the rest. */
+    snprintf(f->rows[2], sizeof f->rows[2], "%s",
+             scr.to_journal ? "LOG: JOURNAL" : "LOG: /data");
+    snprintf(f->rows[3], sizeof f->rows[3], "REBOOT TO EXIT");
+}
+
 static void compose(struct frame *f, int64_t now)
 {
     memset(f, 0, sizeof *f);       /* deterministic padding for memcmp */
@@ -1989,6 +2369,13 @@ static void compose(struct frame *f, int64_t now)
         return;
     }
     f->glyph = rf_state == RF_KILLED ? 'S' : rf_state == RF_LINK ? 'W' : 'R';
+
+    if (ui.screen == SCR_SCRIPT) {
+        /* Ahead of the EVENT flash and PAGE 0 both: the one-way door owns
+         * the screen absolutely, or "cannot be exited" is not true. */
+        compose_script(f, now);
+        return;
+    }
 
     if (now < ui.flash_until_ms) {
         /* EVENT confirmation — a deliberate 2 s full-screen interruption
@@ -2205,6 +2592,17 @@ int main(void)
     ui.error = system_err();       /* boot: honest immediate evaluation */
     gps_try_connect(now);
 
+    /* Restart-in-PAGE-SCRIPTS. Restart=always means a crash or a watchdog
+     * trip would otherwise reopen the door this page exists to close, on a
+     * card whose recorders are already down. The marker is on tmpfs, so it
+     * survives a panel restart and not a reboot — which is exactly the
+     * distinction the page cares about. The stop is re-issued (idempotent);
+     * a script that was already running is detached and keeps writing to
+     * its log, but we are no longer its parent, so its exit code is gone —
+     * the log is the record. */
+    if (risky_scripts && access(SCRIPT_MARK, F_OK) == 0)
+        script_enter(now);
+
     sd_notify_msg("READY=1");
 
     struct frame shown;
@@ -2286,12 +2684,22 @@ int main(void)
 
             rf_job_tick(now);
             rf_kill_drain(now);
+            script_tick(now);
 
             if (++subtick >= HEALTH_TICKS) {
                 subtick = 0;
-                eval_health(now);
+                eval_health(now);   /* the health LOG keeps its record either
+                                       way; only the screen is suppressed */
+                /* PAGE SCRIPTS stopped the recorders itself, so health goes
+                 * ERR within STALE_SECS by construction. Without this guard
+                 * the page would fault to PAGE 0 ten seconds after entry,
+                 * every single time. "It will not ERROR" is a requirement
+                 * of the design, not a preference. */
                 bool err = system_err();
-                if (err && !ui.error) {
+                if (ui.screen == SCR_SCRIPT) {
+                    /* neither transition: ui.error is frozen at whatever it
+                       was on entry, and compose() never reaches it anyway */
+                } else if (err && !ui.error) {
                     ui.error = true;   /* forces screen on + PAGE 0 */
                     ui.blanked = false;
                     /* A fault outranks a half-finished join: JW-1/JW-2 are
@@ -2322,6 +2730,18 @@ int main(void)
                     ui.a_fired = true;
                     rf_toggle(now);
                 }
+            }
+
+            /* Joystick CENTER held to 5 s on any page, PAGE 0 included:
+             * open PAGE SCRIPTS. !ui.blanked is what makes the waking press
+             * a pure wake — handle_key never records a c_down_ms from blank,
+             * so the hold has to restart after the screen comes up, which is
+             * the whole accidental-entry guard this gets for free. */
+            if (ui.c_down_ms && !ui.c_fired && risky_scripts &&
+                ui.screen == SCR_PAGE && !ui.blanked &&
+                now - ui.c_down_ms >= SCRIPT_HOLD_MS) {
+                ui.c_fired = true;
+                script_enter(now);
             }
 
             /* JW-1/JW-2 time out to the pages rather than blanking. The
