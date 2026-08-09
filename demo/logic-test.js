@@ -37,7 +37,8 @@ const sim = {
      * advance() feeds the mtimes from it, so stopping them really does
      * drive health stale, which is the condition the ERROR suppression
      * exists to survive. */
-    scripts: ["01-first", "a-very-long-script-name", "sample-grid"],
+    scripts: ["01-first", "02-second", "a-very-long-script-name",
+              "sample-grid", "zz-last"],
     scriptStopMs: 2000, scriptRunMs: 3000,
     scriptRc: 0, scriptSignal: null,
     scriptLogOk: true, scriptMark: false,
@@ -1106,18 +1107,27 @@ ok(js.rf_state === "killed",
     ok(sstate().scripts.state === "LIST", "the stop completes -> LIST");
     ok(sim.frontWriting === false && sim.rearWriting === false,
        "…and both recorders really are stopped");
-    ok(decodeRow(0) === "SCRIPTS", `list titled SCRIPTS (got "${decodeRow(0)}")`);
-    /* The selected row wears a full-width INVERTED bar, as JW-1's does, so
-     * it reads back through decodeRowGlyphs rather than decodeRow. */
-    ok(decodeRowGlyphs(1) === "01-first",
-       `first entry (got "${decodeRowGlyphs(1)}")`);
-    ok(invMask(1) === "1111111111111111",
+    /* No title row: the list is JW-1's shape, so entry 0 sits on row 0
+     * and all FOUR rows are entries. The selected row wears a
+     * full-width INVERTED bar, so it reads back through
+     * decodeRowGlyphs rather than decodeRow. */
+    ok(decodeRowGlyphs(0) === "01-first",
+       `first entry is on row 0, not under a title (got "${decodeRowGlyphs(0)}")`);
+    ok(invMask(0) === "1111111111111111",
        "…and the selected entry is an INVERTED full-width bar");
-    ok(invMask(2) === "0000000000000000", "…while the others are not");
+    ok(invMask(1) === "0000000000000000", "…while the others are not");
+    ok(decodeRowGlyphs(1) === "02-second", "second entry on row 1");
     ok(decodeRowGlyphs(2) === "a-very-long-sc[LDOTS]",
        `long name cut at 14 columns + one LDOTS (got "${decodeRowGlyphs(2)}")`);
     ok(decodeCell(2, 15) === " ",
        "column 15 stays clear on the list (LDOTS sits in column 14)");
+    /* maxc=15 on the bottom row: unlike JW-1, PAGE SCRIPTS keeps the RF
+     * glyph, so row 3 column 15 is still the reserved cell. Names cap at
+     * 14 + LDOTS = 15 columns, so they never reach it. */
+    ok(decodeRowGlyphs(3, 15) === "sample-grid",
+       `the fourth entry is visible — the row the title used to eat (got "${decodeRowGlyphs(3, 15)}")`);
+    ok(decodeCell(3, 15) === "[SHIELD]",
+       "…and the RF glyph still reports RF-KILLED beside it");
     ok([0, 1, 2, 3].every(r => decodeRow(r, 15).length <= 15),
        "every list row fits inside the glyph cell");
 
@@ -1127,17 +1137,36 @@ ok(js.rf_state === "killed",
        "health really does go ERR once the recorders stop (not a vacuous pass)");
     ok(sstate().screen === "SCRIPTS",
        "…and PAGE SCRIPTS still owns the screen 30 s later");
-    ok(decodeRow(0) === "SCRIPTS", "…rendering the list, not Errors:");
+    ok(decodeRowGlyphs(0) === "01-first" && decodeRow(0) !== "Errors:",
+       "…rendering the list, not Errors:");
     ok(sstate().blanked === false, "…and it never AUTO-BLANKs");
 
     /* --- navigation and absorption -------------------------------------- */
-    ok(sstate().scripts.sel === 0, "cursor starts at the top");
+    ok(sstate().scripts.sel === 0 && sstate().scripts.top === 0,
+       "cursor starts at the top");
     shold(PANEL.KEY.DOWN, 200); sadvance(200);
     ok(sstate().scripts.sel === 1, "DOWN moves the cursor");
-    shold(PANEL.KEY.UP, 200); shold(PANEL.KEY.UP, 200); sadvance(200);
-    ok(sstate().scripts.sel === 2, "UP from the top wraps to the last (cyclic)");
+    /* Five entries in four rows: the fifth is only reachable by
+     * scrolling, which is the case the title row used to force one
+     * entry earlier. */
+    shold(PANEL.KEY.DOWN, 200); shold(PANEL.KEY.DOWN, 200);
+    sadvance(200);
+    ok(sstate().scripts.sel === 3 && sstate().scripts.top === 0,
+       "the fourth entry needs no scroll");
     shold(PANEL.KEY.DOWN, 200); sadvance(200);
-    ok(sstate().scripts.sel === 0, "DOWN from the last wraps to the top");
+    ok(sstate().scripts.sel === 4 && sstate().scripts.top === 1,
+       "the fifth scrolls the viewport by one");
+    ok(decodeRowGlyphs(3, 15) === "zz-last" &&
+       invMask(3, 15) === "111111111111111",
+       "…and it lands on the bottom row, inverted");
+    ok(decodeCell(3, 15) === "[SHIELD]",
+       "…with the bar stopping short of the glyph cell, not over it");
+    shold(PANEL.KEY.DOWN, 200); sadvance(200);
+    ok(sstate().scripts.sel === 0 && sstate().scripts.top === 0,
+       "DOWN from the last wraps to the top and resets the viewport");
+    shold(PANEL.KEY.UP, 200); sadvance(200);
+    ok(sstate().scripts.sel === 4, "UP from the top wraps to the last (cyclic)");
+    shold(PANEL.KEY.DOWN, 200); sadvance(200);
 
     const pageBefore = sstate().page;
     shold(PANEL.KEY.LEFT, 200); shold(PANEL.KEY.RIGHT, 200); sadvance(200);
