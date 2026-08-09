@@ -213,13 +213,17 @@
         <code>/usr/local/lib/dashberry/scripts</code>. One name per line,
         already filtered to executables and sorted, as the panel's own scan
         leaves them. A 5 s CENTER hold stops both recorders and opens the
-        list; CENTER runs one; the only way out is a reboot.</div>
+        list; CENTER runs one; the only way out is a reboot. The list has no
+        title row — it is JW-1's shape, four names with the selected one
+        under an INVERTED bar — so a fifth entry is what makes it scroll.</div>
       <textarea id="scriptlist" rows="4" style="width:100%;background:#232a33;
         color:var(--ink);border:1px solid var(--edge);border-radius:6px;
         font:12px ui-monospace,monospace;padding:6px"
       >01-first
+02-second
 a-very-long-script-name
-sample-grid</textarea>
+sample-grid
+zz-last</textarea>
     </div>
     <div class="grp">
       <div class="slider">how long the script runs

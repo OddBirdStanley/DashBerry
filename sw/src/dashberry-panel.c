@@ -162,7 +162,7 @@
  * the two lists read as one family. The cap is a display bound, not a
  * policy: the installer warns when it deposits more than this. */
 #define SCRIPT_COLS  (COLS - 2) /* name field; LDOTS then the glyph follow */
-#define SCRIPT_ROWS  (ROWS - 1) /* list rows: everything below the title */
+#define SCRIPT_ROWS  ROWS       /* the whole screen: the list has no title */
 #define SCRIPT_NAME  63
 #define MAX_SCRIPTS  32
 
@@ -2317,14 +2317,18 @@ static void compose_script(struct frame *f, int64_t now)
         return;
     }
     if (scr.state == SCRST_LIST) {
-        snprintf(f->rows[0], sizeof f->rows[0], "SCRIPTS");
+        /* No title row. This is JW-1's shape exactly — four names, the
+         * selected one under a full-width INVERTED bar — and it is the right
+         * one for the same reason: a constant word spends a quarter of a
+         * four-line display restating what the bar and the filenames already
+         * say, and the row it costs is a whole entry. */
         for (int r = 0; r < SCRIPT_ROWS; r++) {
             int i = scr.top + r;
             if (i >= scr.n)
                 break;
-            script_label(f->rows[r + 1], sizeof f->rows[r + 1], scr.name[i]);
+            script_label(f->rows[r], sizeof f->rows[r], scr.name[i]);
             if (i == scr.sel)
-                f->inv[r + 1] = 0xFFFF;
+                f->inv[r] = 0xFFFF;
         }
         return;
     }

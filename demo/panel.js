@@ -103,7 +103,7 @@ const MAX_SSIDS = 48;
  * the two read as one family. MAX_SCRIPTS is a display bound, not a policy;
  * dashberry-install refuses to deposit more than this. */
 const SCRIPT_COLS = COLS - 2;   /* name field; LDOTS then the glyph follow */
-const SCRIPT_ROWS = ROWS - 1;   /* list rows: everything below the title */
+const SCRIPT_ROWS = ROWS;       /* the whole screen: the list has no title */
 const MAX_SCRIPTS = 32;
 
 /* ----------------------------------------------------------------- font - */
@@ -1073,14 +1073,19 @@ function create(hw) {
             return;
         }
         if (scr.state === SCRST.LIST) {
-            f.rows[0] = "SCRIPTS";
+            /* No title row. This is JW-1's shape exactly — four names, the
+             * selected one under a full-width INVERTED bar — and it is the
+             * right one for the same reason: a constant word spends a
+             * quarter of a four-line display restating what the bar and the
+             * filenames already say, and the row it costs is a whole
+             * entry. */
             for (let r = 0; r < SCRIPT_ROWS; r++) {
                 const i = scr.top + r;
                 if (i >= scr.names.length)
                     break;
-                f.rows[r + 1] = script_label(scr.names[i]);
+                f.rows[r] = script_label(scr.names[i]);
                 if (i === scr.sel)
-                    f.inv[r + 1] = 0xFFFF;
+                    f.inv[r] = 0xFFFF;
             }
             return;
         }
