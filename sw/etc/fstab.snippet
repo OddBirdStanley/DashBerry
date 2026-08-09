@@ -2,14 +2,13 @@
 # card; OS partition goes read-only via `raspi-config` > Performance > Overlay FS).
 # cli/dashberry-install appends this automatically (by PARTUUID) when it builds
 # the card — this snippet stays as the manual-install reference.
-# nodelalloc + data=ordered + commit=1: an append allocates its blocks at
+# nodelalloc + data=journal + commit=1: an append allocates its blocks at
 # write() time, which puts it in the journal transaction the 1 s commit is
-# about to close, and ordered mode writes the data blocks ahead of that
-# commit — so a hard power cut (every ignition-off, and an impact that kills
-# 12 V) loses ~1-2 s of the open segment. nodelalloc is LOAD-BEARING in that
-# chain: with ext4's default delayed allocation, appended pages sit outside
-# every transaction until writeback (30 s dirty_expire, 5 s flusher pass),
-# commit=1 has nothing to order against, and a power cut leaves the open
+# about to close — so a hard power cut (every ignition-off, and an impact that
+# kills 12 V) loses ~1-2 s of the open segment. nodelalloc is LOAD-BEARING in
+# that chain: with ext4's default delayed allocation, appended pages sit
+# outside every transaction until writeback (30 s dirty_expire, 5 s flusher
+# pass), commit=1 has nothing to order against, and a power cut leaves the open
 # segment as it was at the last writeback — 0 BYTES on the card for a tail
 # younger than ~30 s, for all that filesink wrote it unbuffered. Closed
 # segments do not depend on this line: each recorder fsyncs a segment (and
@@ -17,11 +16,37 @@
 # the segment being written when the 12 V dies, which is the one with the
 # impact on it.
 #
-# What it CANNOT do is make a partially-filled 4 KB page whole. The commit
-# flushes that page with its tail zeroed, and the bytes that complete it are
-# written afterwards; if power goes before they land, the zeros stay. That is
-# survivable only because segments are MPEG-TS — the loss costs the frames it
-# covers, and the reader resyncs on the next 188-byte packet. The same holes
-# in fragmented MP4 destroyed a whole GOP each AND, once one landed on the
+# data=journal, NOT data=ordered (changed 2026-08-09), because ordered mode
+# left INTERIOR holes in every unclosed segment. Ordered mode's guarantee is
+# "a block's data reaches the card before the metadata that makes it
+# reachable" — and that covers a block's FIRST write only. Appending never
+# lands on a 4 KB boundary, so every 1 s commit pushes out a partially-filled
+# tail page with its remainder zeroed; completing that page is a SECOND write
+# to an already-reachable block, which ordered mode does not order and the
+# commit does not force. The result is a skew: the committed i_size says the
+# data is there while the page on the card is still the zero-tailed version.
+# Journaling the data removes the skew — page content and i_size land in the
+# same transaction — so the file on the card is always a PREFIX of what was
+# written: losses only ever at the tail, never in the middle.
+#
+# Measured before the change (cam/front_bad_last.ts, 2026-08-08): 7 holes in
+# the last 17.0 s of a 48.9 s final segment, 14,721 zeroed bytes = 0.11% of
+# the file, costing 210 frames — 7.0 s of video. Every hole ended exactly on
+# a 4096-byte boundary and every one landed inside that second's IDR (see
+# usr/local/bin/front-rec on why the two 1 Hz clocks phase-lock), and losing
+# an IDR costs its whole GOP. rear_bad_final.ts: 3 holes, 3.0 s of a 3.9 s
+# segment. The MPEG-TS container is what kept these files playable at all —
+# the reader resyncs on the next 188-byte packet. The same holes in
+# fragmented MP4 destroyed a whole GOP each AND, once one landed on the
 # header, hid the entire file (crash tail, 2026-08-07).
-/dev/mmcblk0p3  /data  ext4  defaults,noatime,nodelalloc,data=ordered,commit=1,nofail  0 2
+#
+# The costs, accepted: data=journal writes every byte twice (once to the
+# journal, once to its final block), so the card sees ~2x the write volume —
+# ~1 MB/s for both cameras against a class-10 card's tens of MB/s, and the
+# extra wear is the price of the segment being readable. It also DEPENDS on
+# the card honouring cache-flush/FUA, which cheap cards are known to lie
+# about; that is not verified on this hardware, and it is why front-rec's
+# periodic fsync (which narrows the same window from the other side) stays
+# rather than being replaced by this line. NOT VERIFIED against a real power
+# pull yet — the bench test is in README.md's table.
+/dev/mmcblk0p3  /data  ext4  defaults,noatime,nodelalloc,data=journal,commit=1,nofail  0 2
