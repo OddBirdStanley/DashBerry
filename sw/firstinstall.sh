@@ -322,6 +322,20 @@ install_files 644 /etc/systemd/system/ etc/systemd/system/*
 # video4linux, so the wlan switch this install may be running over is
 # never re-added underneath it. The rule takes effect on the next boot.
 install_files 644 /etc/udev/rules.d/ etc/udev/rules.d/*
+# --risky-scripts (DEBUG cards only, RISKY_SCRIPTS=1). Conditional, unlike
+# every glob above: on a normal card this directory does not exist, and its
+# ABSENCE is the correct and overwhelmingly common case rather than the
+# broken payload install_files fails loudly on.
+if [ -d scripts ]; then
+    install -d -m 755 /usr/local/lib/dashberry/scripts
+    install_files 755 /usr/local/lib/dashberry/scripts/ scripts/*
+    # Beside the directory, not inside it: a non-executable file in there
+    # would be skipped by the panel anyway, but keeping the run directory
+    # to exactly "things you can run" leaves no room for that argument.
+    if [ -f scripts.manifest ]; then
+        install -m 644 scripts.manifest /usr/local/lib/dashberry/scripts.manifest
+    fi
+fi
 install -D -m 644 etc/chrony/conf.d/gps-refclock.conf /etc/chrony/conf.d/gps-refclock.conf
 
 echo "configuring gpsd ($GPS_DEV, static, guarded hotplug)..."

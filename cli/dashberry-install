@@ -45,6 +45,22 @@
 #                        journal kept and made persistent. JOIN WIFI is NOT
 #                        armed here; the card boots RF-KILLED unless a
 #                        --wifi profile was explicitly staged for it.
+#                        The only mode --risky-scripts will build onto: see
+#                        below.
+#
+# --risky-scripts DIR (DEBUG ONLY) is the one option that puts code this
+# repo has never seen onto a card and hands it root. Every executable in DIR
+# is deposited at /usr/local/lib/dashberry/scripts and RISKY_SCRIPTS=1 arms
+# the panel's PAGE SCRIPTS: a 5 s joystick-CENTER hold stops both recorders
+# and runs any one of them as root, with no way off that page but a reboot.
+# It exists so bench debugging stops meaning "scp the script again". It is
+# refused on sealed and JOIN WIFI cards outright — a sealed card is sealed
+# against exactly this, and a JOIN WIFI card is one a passenger can reach.
+# DIR is yours and is deliberately not versioned with this repo, so nothing
+# here reviews its CONTENTS; what is validated is only what the panel cannot
+# validate later (names it can display and tell apart), and a manifest of
+# sha256 + name rides onto the card so it can be asked afterwards what it
+# was built carrying.
 #
 # The stock image's own auto-expand is left in place and self-disarms: it
 # refuses to grow a root partition that is not the last one, and /data is.
@@ -81,6 +97,14 @@ Options:
   --wifi SSID[:PSK] run the first boot over Wi-Fi instead of Ethernet. Omit
                     :PSK (or leave it empty) to join an OPEN network
   --wifi-country CC regulatory domain; required by --wifi and by JOIN WIFI
+  --risky-scripts DIR
+                    DANGEROUS, and --debug only. Deposits every executable in
+                    DIR onto the card and arms PAGE SCRIPTS: a 5 s joystick-
+                    CENTER hold on the panel stops both recorders and runs any
+                    one of them AS ROOT, with no exit but a reboot. For bench
+                    debugging, so a change stops meaning "scp it again". DIR
+                    is yours and is not versioned with this repo, so nothing
+                    here reviews what you put in it
   -h, --help        display this help
 EOF
 }
@@ -100,6 +124,9 @@ KEEP_DATA=0
 DEBUG=0
 AUTH=0
 RF_JOIN=0
+RISKY_DIR=
+RISKY_SCRIPTS=0
+RISKY_N=0
 USERSPEC=
 WIFISPEC=
 WIFI_CC=
@@ -123,6 +150,8 @@ while [ $# -gt 0 ]; do
         --auth)        shift; AUTH=1; USERSPEC=${1:-} ;;
         --wifi)        shift; WIFISPEC=${1:-} ;;
         --wifi-country) shift; WIFI_CC=${1:-} ;;
+        --risky-scripts) shift; RISKY_DIR=${1:-}
+                        [ -n "$RISKY_DIR" ] || die "--risky-scripts requires a directory" ;;
         -h|--help)     usage; exit 0 ;;
         -*)            die "Unknown option: $1 (see --help)" ;;
         *)             if   [ -z "$IMG" ]; then IMG=$1
@@ -160,6 +189,47 @@ if [ "$AUTH" = 1 ]; then
     case $USERSPEC in *:*) ;; *) die "--auth requires NAME:PASS" ;; esac
     need openssl
     [ "$DEBUG" = 1 ] || RF_JOIN=1
+fi
+# --risky-scripts is the only option that puts unreviewed code on a card and
+# hands it root. Everything about it is validated HERE, on the PC, because
+# this is the last place a human is present to read why a script was
+# refused: by the time the panel sees the list it has 16 columns and no
+# keyboard, and a name it cannot show is a row the user cannot identify.
+if [ -n "$RISKY_DIR" ]; then
+    # DEBUG only, and not negotiable. A sealed card is sealed against
+    # exactly this, and a JOIN WIFI card is one a passenger can reach.
+    [ "$DEBUG" = 1 ] || \
+        die "--risky-scripts requires --debug: it runs arbitrary code as root from a front-panel hold, which no production card may carry"
+    [ -d "$RISKY_DIR" ] || die "--risky-scripts: $RISKY_DIR is not a directory"
+    need sha256sum
+    RISKY_LABELS=
+    for f in "$RISKY_DIR"/*; do
+        [ -f "$f" ] || continue        # subdirectories and specials: skipped
+        [ -x "$f" ] || continue        # not executable: not a script we run
+        b=${f##*/}
+        # No dotfile arm here: the glob above does not match leading dots in
+        # the first place, which is exactly what the panel's own scan does
+        # with them. A dot-named script is invisible to both, and the count
+        # check below is what reports it.
+        case $b in
+        *[!A-Za-z0-9._-]*) die "--risky-scripts: '$b' has characters outside A-Za-z0-9._- — rename it" ;;
+        esac
+        [ "${#b}" -le 63 ] || die "--risky-scripts: '$b' is longer than 63 characters"
+        # Two names that truncate to the same panel label are two rows the
+        # user cannot tell apart, on a page where picking the wrong one runs
+        # the wrong thing as root. Refuse rather than ship that list.
+        if [ "${#b}" -gt 14 ]; then l=$(printf '%.14s' "$b"); else l=$b; fi
+        case " $RISKY_LABELS " in
+        *" $l "*) die "--risky-scripts: '$b' and another script both display as '$l' in the panel's 14-column field — rename one" ;;
+        esac
+        RISKY_LABELS="$RISKY_LABELS $l"
+        RISKY_N=$((RISKY_N + 1))
+    done
+    [ "$RISKY_N" -gt 0 ] || \
+        die "--risky-scripts: $RISKY_DIR holds no executable files. Names starting with a dot do not count — neither this glob nor the panel's scan sees them (chmod +x, and no leading dot)"
+    [ "$RISKY_N" -le 32 ] || \
+        die "--risky-scripts: $RISKY_N executables, but PAGE SCRIPTS lists at most 32"
+    RISKY_SCRIPTS=1
 fi
 # A JOIN WIFI card must carry a regulatory domain or the kernel keeps wlan
 # hard-blocked for its whole life and the feature can never do anything.
@@ -379,6 +449,26 @@ if [ "$FIRSTBOOT_WIFI" = 1 ]; then
     else
         echo "    wifi  : $WIFI_SSID ($WIFI_CC)"
     fi
+fi
+if [ "$RISKY_SCRIPTS" = 1 ]; then
+    # Its own banner inside the only gate a human passes before the wipe.
+    # Everything else on this screen describes what the card will RECORD;
+    # this describes what the card will let someone RUN.
+    echo
+    echo "    ##########################################################"
+    echo "    #  PAGE SCRIPTS ARMED — $RISKY_N executable(s)"
+    echo "    #  from: $RISKY_DIR"
+    echo "    #"
+    echo "    #  A 5 s joystick-CENTER hold on the panel — on ANY page,"
+    echo "    #  PAGE 0 included — STOPS BOTH RECORDERS and runs any of"
+    echo "    #  them AS ROOT. There is no exit from that page but a"
+    echo "    #  reboot. Nothing has reviewed what is in that directory."
+    echo "    ##########################################################"
+    for f in "$RISKY_DIR"/*; do
+        [ -f "$f" ] && [ -x "$f" ] || continue
+        echo "    #  $(sha256sum "$f" | cut -c1-12)  ${f##*/}"
+    done
+    echo "    ##########################################################"
 fi
 echo
 printf 'Type the device path (%s) to continue: ' "$DEV"
@@ -723,6 +813,23 @@ if [ "$DEBUG" = 1 ]; then
 fi
 if [ "$RF_JOIN" = 1 ]; then
     sed -i 's/^RF_JOIN=0/RF_JOIN=1/' "$MNT/opt/dashberry/sw/etc/dashberry.conf"
+fi
+# --risky-scripts: stage the executables into the payload so firstinstall
+# installs them like any other payload file. They come from OUTSIDE this
+# repo and nothing versions them, so the manifest beside them is the only
+# way to ask a card later what it was actually built carrying — the same
+# reason the ABSENT-package case elsewhere is treated as a finding.
+if [ "$RISKY_SCRIPTS" = 1 ]; then
+    mkdir -p "$MNT/opt/dashberry/sw/scripts"
+    : > "$MNT/opt/dashberry/sw/scripts.manifest"
+    for f in "$RISKY_DIR"/*; do
+        [ -f "$f" ] && [ -x "$f" ] || continue
+        install -m 755 "$f" "$MNT/opt/dashberry/sw/scripts/"
+        printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "${f##*/}" \
+            >> "$MNT/opt/dashberry/sw/scripts.manifest"
+    done
+    sed -i 's/^RISKY_SCRIPTS=0/RISKY_SCRIPTS=1/' \
+        "$MNT/opt/dashberry/sw/etc/dashberry.conf"
 fi
 printf 'FIRSTBOOT_WIFI=%s\n' "$FIRSTBOOT_WIFI" \
     > "$MNT/opt/dashberry/install-opts"
