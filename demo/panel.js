@@ -46,9 +46,6 @@
  *   scriptRun(name)          -> job handle { done, rc, signal }; stands in
  *                               for fork + setsid + exec. `signal` non-null
  *                               is the C's WIFSIGNALED branch
- *   scriptLogOk()            -> bool: could /data/scripts/<name>.log be
- *                               opened. false = output went to the journal
- *                               instead, and DONE says so
  *   scriptMarkGet()          -> bool: /run/dashberry/script-mode exists
  *   scriptMarkSet()             create it. tmpfs in the C, so a harness
  *                               should keep it across a simulated panel
@@ -458,7 +455,6 @@ function create(hw) {
         names: [], sel: 0, top: 0,
         state: SCRST.LIST,
         h: null,                   /* stop job, then script job */
-        to_journal: false,         /* the /data log could not be opened */
         started_ms: 0,             /* RUNNING since — the elapsed counter */
         deadline_ms: 0,            /* STOPPING watchdog only */
     };
@@ -827,9 +823,11 @@ function create(hw) {
      * go behind hw like everything else below the line: readdir + X_OK +
      * qsort become hw.scriptList(), fork/setsid/exec becomes hw.scriptRun()
      * returning a handle the harness completes (the same shape rfCtl uses),
-     * `systemctl stop front-rec rear-rec` becomes hw.recordersStop(), the
-     * /data log open becomes hw.scriptLogOk(), and /run/dashberry/script-mode
-     * becomes hw.scriptMark{Get,Set}(). All are OPTIONAL — a harness that
+     * `systemctl stop front-rec rear-rec` becomes hw.recordersStop(), and
+     * /run/dashberry/script-mode becomes hw.scriptMark{Get,Set}(). The C
+     * still opens /data/scripts/<name>.log and still falls back to the
+     * journal when it cannot — that has no hook here because the panel no
+     * longer says which one it got. All are OPTIONAL — a harness that
      * omits them gets a panel where the feature is simply unarmed.
      *
      * What is NOT abstracted, because it is the behavior under test: that
@@ -871,7 +869,6 @@ function create(hw) {
         ui.last_key_ms = now;
         ui.flash_until_ms = 0;     /* an EVENT flash must not overlay this */
 
-        scr.to_journal = false;
         scr.state = SCRST.STOPPING;
         scr.deadline_ms = now + SCRIPT_STOP_MS;
         scr.h = hw.recordersStop ? hw.recordersStop() : null;
@@ -881,7 +878,6 @@ function create(hw) {
     }
 
     function script_run(now) {
-        scr.to_journal = hw.scriptLogOk ? !hw.scriptLogOk() : false;
         scr.h = hw.scriptRun ? hw.scriptRun(scr.names[scr.sel]) : null;
         scr.started_ms = now;
         if (!scr.h) {
@@ -1097,6 +1093,10 @@ function create(hw) {
             }
             return;
         }
+        /* RUNNING and DONE are the same two-row shape — a word on row 1, its
+         * one number on row 2 — so the screen does not reflow when the child
+         * exits; only the two lines' contents change. Rows 0 and 3 stay
+         * empty, which is what centres the pair on a four-line display. */
         if (scr.state === SCRST.RUNNING) {
             /* The elapsed counter is the liveness report: a script with
              * nothing to say still visibly has not finished. Clamped so the
@@ -1104,19 +1104,21 @@ function create(hw) {
             let secs = Math.floor((now - scr.started_ms) / 1000);
             if (secs < 0) secs = 0;
             if (secs > 9999) secs = 9999;
-            f.rows[0] = "RUNNING " + secs + "s";
-            f.rows[1] = script_label(scr.names[scr.sel]);
+            f.rows[1] = "RUNNING";
+            f.rows[2] = secs + "s";
             return;
         }
         const h = scr.h;
-        f.rows[0] = !h || !h.done || (h.rc === null && h.signal === null)
-                        ? "DONE rc=?"
+        f.rows[1] = "DONE";
+        /* A signal is not an exit status, so it keeps its own spelling
+         * rather than being folded into 128+n — on a card you reboot to
+         * leave, the difference between "the script returned 9" and
+         * "something killed it" is the whole reason you are reading this. */
+        f.rows[2] = !h || !h.done || (h.rc === null && h.signal === null)
+                        ? "EXIT ?"
                   : h.signal !== null && h.signal !== undefined
-                        ? "DONE sig=" + h.signal
-                        : "DONE rc=" + h.rc;
-        f.rows[1] = script_label(scr.names[scr.sel]);
-        f.rows[2] = scr.to_journal ? "LOG: JOURNAL" : "LOG: /data";
-        f.rows[3] = "REBOOT TO EXIT";
+                        ? "EXIT SIG" + h.signal
+                        : "EXIT " + h.rc;
     }
 
     function compose() {
@@ -1515,7 +1517,6 @@ function create(hw) {
                 scripts: {
                     state: ["STOPPING", "LIST", "RUNNING", "DONE"][scr.state],
                     names: [...scr.names], sel: scr.sel, top: scr.top,
-                    to_journal: scr.to_journal,
                 },
                 rf_kill_pending: ui.rf_kill_pending,
                 rf_kill_tries: ui.rf_kill_tries,

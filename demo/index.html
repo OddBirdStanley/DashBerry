@@ -237,8 +237,6 @@ zz-last</textarea>
           <option value="7">rc=7</option>
           <option value="sig9">killed by SIGKILL (sig=9)</option>
         </select></label>
-      <label class="row"><input type="checkbox" id="scriptlogfail">
-        <code>/data</code> cannot take the log (DONE says LOG: JOURNAL)</label>
       <div class="slider">how long <code>systemctl stop</code> takes
         <input type="range" id="stopms" min="200" max="12000" step="200"
                value="2000">
@@ -377,7 +375,6 @@ const hw = {
         logLine(`running ${name} as root, detached (setsid)`, true);
         return h;
     },
-    scriptLogOk: () => !$("scriptlogfail").checked,
     scriptMarkGet: () => sim.scriptMark,
     scriptMarkSet: () => { sim.scriptMark = true;
                            logLine("touched /run/dashberry/script-mode"); },
