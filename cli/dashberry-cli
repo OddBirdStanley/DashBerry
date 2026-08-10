@@ -20,6 +20,9 @@ Subcommands:
            target length "HH:MM:SS"). Always a re-encode — near-
            transparent x264 settings
   gpx      GPX 1.0 track (native <speed>, m/s) from the session NMEA log
+  csv      the same track as a spreadsheet — one row per GPS fix, with SoC
+           temperature joined on from the health log and the button-B
+           markers flagged
 
 The health log (/data/health/<session>/<session>.log, written by
 dashberry-panel — format in IMPL.md) is what makes render honest: its
@@ -34,6 +37,7 @@ Getting this wrong shifts every annotation by one segment length.
 """
 
 import argparse
+import csv
 import datetime as dt
 import math
 import os
@@ -153,6 +157,8 @@ def parse_health(path):
       events       [epoch, ...] button-B markers
       temps        [degC, ...] SoC temperature samples (empty on sessions
                    recorded before the panel logged them)
+      temp_series  [(epoch, degC), ...] the same samples with their times
+                   kept, for joining temperature onto a GPS timeline (csv)
     Tolerates the duplicate initial-state dumps a mid-session log reopen
     produces (same-state records are ignored)."""
     if not path:
@@ -179,7 +185,7 @@ def parse_health(path):
                 events.append(t)
             elif kind == "tmp" and len(parts) >= 3:
                 try:
-                    temps.append(int(parts[2]))
+                    temps.append((t, int(parts[2])))
                 except ValueError:
                     pass
             elif kind == "gpsfix" and len(parts) >= 3:
@@ -200,7 +206,8 @@ def parse_health(path):
     if nofix_open is not None:
         nofix.append((nofix_open, end))
     return {"start": start, "end": end, "err": err, "nofix": nofix,
-            "events": events, "temps": temps}
+            "events": events, "temps": [c for _, c in temps],
+            "temp_series": temps}
 
 
 def spans_subtract(spans, minus):
@@ -486,7 +493,7 @@ def display_shift_secs(args, start0):
 # the window (sub-second exact) alternating with generated black
 # "No Signal" filler — and GPS trouble labeled "GPS Error"/"GPS No
 # Signal". Always a re-encode; near-transparent x264 settings (CRF 18)
-# keep the loss on 2 Mbps dashcam source visually negligible.
+# keep the loss on 8/4 Mbps dashcam source visually negligible.
 
 def cam_segments_abs(data, session, cam):
     """Sorted [(path, start_epoch, duration)]; start = mtime - duration
@@ -786,6 +793,116 @@ def cmd_gpx(args):
         print("wrote %s (%d points)" % (args.output, len(sel)))
 
 
+# ------------------------------------------------------------------- csv --
+
+# The panel samples SoC temperature on its 10 s health heartbeat while RMC
+# fixes arrive at the puck's 5 Hz, so there is no sample of our own on almost
+# every row: each row carries the most recent EARLIER sample forward. Carrying
+# it forward without limit would print a reading from before a logging gap as
+# though it were current, so a sample older than this leaves the cell empty
+# instead. Three heartbeats — long enough that an ordinary missed record does
+# not punch holes in the column, short enough that a real gap shows as one.
+TEMP_STALE_S = 30
+
+# A button-B marker is logged with 1 s resolution, so it never lands exactly
+# on a fix; it is attributed to the nearest one. Beyond this the nearest fix
+# is not plausibly "the same moment" (GPS was out, or the event sits outside
+# the --from/--to window) and the marker is dropped rather than pinned to an
+# arbitrary row.
+EVENT_MATCH_S = 2.0
+
+
+def temp_at(series, t):
+    """Most recent temperature sample at or before t, or None if there is
+    none or that sample is staler than TEMP_STALE_S. The health log is
+    append-only and therefore already sorted, so this is a bisect."""
+    lo, hi = 0, len(series) - 1
+    best = None
+    while lo <= hi:                      # rightmost sample with time <= t
+        mid = (lo + hi) // 2
+        if series[mid][0] <= t:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best is None:
+        return None
+    ts, degc = series[best]
+    return degc if t - ts <= TEMP_STALE_S else None
+
+
+def cmd_csv(args):
+    """One row per RMC fix: time, position, speed, SoC temperature, and the
+    button-B marker. Same drive selection and same --from/--to/--anchor/
+    --tz-offset handling as gpx — this is that track as a spreadsheet."""
+    fixes = parse_rmc(nmea_path(args.data, args.drive))
+    if not fixes:
+        die("no RMC fixes for drive %s" % args.drive)
+    start0 = drive_start(args.data, args.drive)
+    lo = start0 + parse_hms(getattr(args, "from")) if getattr(args, "from") else None
+    hi = start0 + parse_hms(args.to) if args.to else None
+    shift = display_shift_secs(args, start0)
+    tzoff = parse_tz(args.tz_offset) if args.tz_offset else 0
+    sel = [f for f in fixes
+           if (lo is None or f[0] >= lo) and (hi is None or f[0] <= hi)]
+    if not sel:
+        die("no fixes in the requested range")
+
+    def stamp(t):
+        d = dt.datetime.fromtimestamp(t + shift, dt.timezone.utc)
+        if tzoff:
+            sign = "+" if tzoff >= 0 else "-"
+            a = abs(tzoff)
+            return d.strftime("%Y-%m-%dT%H:%M:%S") + "%s%02d:%02d" % (
+                sign, a // 3600, (a % 3600) // 60)
+        return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    health = parse_health(health_path(args.data, args.drive))
+    series = health["temp_series"] if health else []
+    if health is None:
+        warn("no health log for %s: temp_c will be empty" % args.drive)
+    elif not series:
+        warn("%s predates temperature logging: temp_c will be empty"
+             % args.drive)
+
+    # Walk the markers, not the rows: there are a handful of markers per
+    # drive against thousands of fixes. Markers are filtered by the SAME
+    # window as the fixes before being matched — otherwise a press just
+    # outside --to lands on the last row in range, reporting an event the
+    # caller explicitly asked not to see.
+    marked = set()
+    for e in (health["events"] if health else []):
+        if (lo is not None and e < lo) or (hi is not None and e > hi):
+            continue
+        best, bestd = None, None
+        for i, f in enumerate(sel):
+            d = abs(f[0] - e)
+            if bestd is None or d < bestd:
+                best, bestd = i, d
+        if best is not None and bestd <= EVENT_MATCH_S:
+            marked.add(best)
+
+    factor, unit = ((KNOTS_TO_KMH, "kmh") if args.units == "KMH"
+                    else (KNOTS_TO_MPH, "mph"))
+    out = sys.stdout if args.output in (None, "-") else open(
+        args.output, "w", newline="")
+    # lineterminator is pinned: csv defaults to CRLF, and this file is read
+    # by whatever the user has on a PC, not by a spreadsheet on Windows only.
+    w = csv.writer(out, lineterminator="\n")
+    w.writerow(["timestamp", "epoch", "lat", "lon",
+                "speed_" + unit, "speed_ms", "temp_c", "event"])
+    for i, (t, lat, lon, knots) in enumerate(sel):
+        degc = temp_at(series, t)
+        w.writerow([stamp(t), "%d" % round(t),
+                    "%.6f" % lat, "%.6f" % lon,
+                    "%.1f" % (knots * factor), "%.2f" % (knots * KNOTS_TO_MS),
+                    "" if degc is None else "%d" % degc,
+                    "1" if i in marked else "0"])
+    if out is not sys.stdout:
+        out.close()
+        print("wrote %s (%d rows)" % (args.output, len(sel)))
+
+
 # ------------------------------------------------------------------ main --
 
 def add_range_opts(p):
@@ -848,6 +965,23 @@ def main():
     pg.add_argument("-o", "--output", metavar="OUT.gpx",
                     help="output file (default stdout)")
 
+    pv = sub.add_parser(
+        "csv", help="generate a CSV track log from one drive",
+        description="One row per GPS fix: timestamp, position, speed, SoC "
+                    "temperature and the button-B event marker. Same drive "
+                    "selection and same --from/--to/--anchor/--tz-offset "
+                    "handling as gpx. temp_c comes from the session health "
+                    "log and is empty where that log has nothing recent to "
+                    "say; it is empty for every row on drives recorded "
+                    "before the panel logged temperature.")
+    pv.add_argument("--drive", required=True, metavar="SESSION")
+    add_range_opts(pv)
+    pv.add_argument("--units", choices=["MPH", "KMH"], default="MPH",
+                    help="units for the speed_mph/speed_kmh column "
+                         "(default MPH); speed_ms is always present")
+    pv.add_argument("-o", "--output", metavar="OUT.csv",
+                    help="output file (default stdout)")
+
     args = ap.parse_args()
     if args.cmd == "catalog":
         cmd_catalog(args)
@@ -855,6 +989,8 @@ def main():
         cmd_render(args)
     elif args.cmd == "gpx":
         cmd_gpx(args)
+    elif args.cmd == "csv":
+        cmd_csv(args)
 
 
 if __name__ == "__main__":

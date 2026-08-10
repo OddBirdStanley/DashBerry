@@ -62,7 +62,7 @@ PC-side CLI.
 | Path | Contents |
 |---|---|
 | `sw/` | everything that ships on the card: recorder scripts, systemd units, config snippets, and `dashberry-panel` (the one compiled C program) |
-| `cli/` | PC-side tools — `dashberry-install` (card builder) and `dashberry-cli` (catalog/render/gpx); neither is ever installed on the card |
+| `cli/` | PC-side tools — `dashberry-install` (card builder) and `dashberry-cli` (catalog/render/gpx/csv); neither is ever installed on the card |
 | `demo/` | browser visualizer of the panel's UI state machine, for exercising the interaction spec without hardware |
 
 ## Hardware
@@ -236,12 +236,26 @@ cli/dashberry-cli --data ~/dashcam-copy render \
 # export the GPS track (GPX 1.0, native speed element)
 cli/dashberry-cli --data ~/dashcam-copy gpx \
     --drive 20260721-1830-0042 -o track.gpx
+
+# the same track as a spreadsheet: one row per GPS fix, with SoC temperature
+# joined on from the health log and your button-B presses flagged
+cli/dashberry-cli --data ~/dashcam-copy csv \
+    --drive 20260721-1830-0042 -o track.csv
 ```
 
-Times are relative to the drive's start throughout; `render` and `gpx` take
-`--anchor` (assert the true wall-clock start, repairing a wrong-RTC drive)
-and `--tz-offset` to display local time instead. `--units MPH|KMH` selects
-the speed units shown by `catalog --verbose` and `render --annotate`.
+Times are relative to the drive's start throughout; `render`, `gpx` and `csv`
+take `--anchor` (assert the true wall-clock start, repairing a wrong-RTC
+drive) and `--tz-offset` to display local time instead. `--units MPH|KMH`
+selects the speed units shown by `catalog --verbose`, `render --annotate` and
+the `csv` `speed_mph`/`speed_kmh` column.
+
+`csv` columns are `timestamp, epoch, lat, lon, speed_mph|speed_kmh, speed_ms,
+temp_c, event`. `speed_ms` is always present, so a consumer never has to know
+which `--units` produced the file. `temp_c` is the most recent reading from
+the health log's 10 s heartbeat and is left EMPTY rather than guessed where
+that log has nothing within 30 s — every row on a drive recorded before the
+panel logged temperature, and any row inside a logging gap. `event` is `1` on
+the fix nearest each button-B press.
 
 Requires Python 3 and `ffmpeg`/`ffprobe`.
 
