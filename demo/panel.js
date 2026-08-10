@@ -1096,7 +1096,14 @@ function create(hw) {
         /* RUNNING and DONE are the same two-row shape — a word on row 1, its
          * one number on row 2 — so the screen does not reflow when the child
          * exits; only the two lines' contents change. Rows 0 and 3 stay
-         * empty, which is what centres the pair on a four-line display. */
+         * empty, which is what centres the pair on a four-line display.
+         *
+         * Both rows carry the same ONE leading space STOPPING REC and JW-1's
+         * SCANNING.../RF ERROR/NO NETWORKS carry: it is this panel's inset
+         * for a full-screen message, as opposed to the flush-left data pages.
+         * The space goes on the number row too, not just the word — the two
+         * rows are one block, and insetting only the top of it reads as a
+         * misalignment. */
         if (scr.state === SCRST.RUNNING) {
             /* The elapsed counter is the liveness report: a script with
              * nothing to say still visibly has not finished. Clamped so the
@@ -1104,21 +1111,21 @@ function create(hw) {
             let secs = Math.floor((now - scr.started_ms) / 1000);
             if (secs < 0) secs = 0;
             if (secs > 9999) secs = 9999;
-            f.rows[1] = "RUNNING";
-            f.rows[2] = secs + "s";
+            f.rows[1] = " RUNNING";
+            f.rows[2] = " " + secs + "s";
             return;
         }
         const h = scr.h;
-        f.rows[1] = "DONE";
+        f.rows[1] = " DONE";
         /* A signal is not an exit status, so it keeps its own spelling
          * rather than being folded into 128+n — on a card you reboot to
          * leave, the difference between "the script returned 9" and
          * "something killed it" is the whole reason you are reading this. */
         f.rows[2] = !h || !h.done || (h.rc === null && h.signal === null)
-                        ? "EXIT ?"
+                        ? " EXIT ?"
                   : h.signal !== null && h.signal !== undefined
-                        ? "EXIT SIG" + h.signal
-                        : "EXIT " + h.rc;
+                        ? " EXIT SIG" + h.signal
+                        : " EXIT " + h.rc;
     }
 
     function compose() {

@@ -1202,10 +1202,12 @@ ok(js.rf_state === "killed",
     ok(sim.scriptRuns.length === 1 && sim.scriptRuns[0] === "01-first",
        `…the selected one (ran ${JSON.stringify(sim.scriptRuns)})`);
     /* RUNNING is two rows and nothing else: the word on line 2, its elapsed
-     * seconds on line 3, and rows 0/3 left empty to centre the pair. */
-    ok(decodeRow(1) === "RUNNING",
+     * seconds on line 3, and rows 0/3 left empty to centre the pair. Both
+     * rows carry STOPPING REC's one-space inset, the number as well as the
+     * word — a half-inset block reads as a misalignment. */
+    ok(decodeRow(1) === " RUNNING",
        `…and RUNNING names itself on line 2 (got "${decodeRow(1)}")`);
-    ok(/^\d+s$/.test(decodeRow(2)),
+    ok(/^ \d+s$/.test(decodeRow(2)),
        `…with the elapsed counter alone on line 3 (got "${decodeRow(2)}")`);
     ok(decodeRow(0) === "" && decodeRow(3, 15) === "",
        "…and prints nothing else");
@@ -1213,8 +1215,8 @@ ok(js.rf_state === "killed",
     sadvance(3200);
     ok(sstate().scripts.state === "DONE", "the child exits -> DONE");
     /* DONE keeps RUNNING's shape exactly, so the screen does not reflow. */
-    ok(decodeRow(1) === "DONE", `…saying so on line 2 (got "${decodeRow(1)}")`);
-    ok(decodeRow(2) === "EXIT 7",
+    ok(decodeRow(1) === " DONE", `…saying so on line 2 (got "${decodeRow(1)}")`);
+    ok(decodeRow(2) === " EXIT 7",
        `…with the exit code on line 3 (got "${decodeRow(2)}")`);
     ok(decodeRow(0) === "" && decodeRow(3, 15) === "",
        "…and nothing else: no name, no log hint, no exit hint");
@@ -1246,8 +1248,8 @@ ok(js.rf_state === "killed",
     /* A signal keeps its own spelling rather than folding into 128+n — on a
      * card you reboot to leave, "returned 9" and "was killed" must not read
      * the same. It still lives on line 3, in DONE's one slot. */
-    ok(decodeRow(1) === "DONE", `…still DONE on line 2 (got "${decodeRow(1)}")`);
-    ok(decodeRow(2) === "EXIT SIG9",
+    ok(decodeRow(1) === " DONE", `…still DONE on line 2 (got "${decodeRow(1)}")`);
+    ok(decodeRow(2) === " EXIT SIG9",
        `a killed child reports its signal (got "${decodeRow(2)}")`);
     ok(decodeRow(0) === "" && decodeRow(3, 15) === "",
        "…and a signalled DONE prints nothing else either");
