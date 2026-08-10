@@ -54,6 +54,8 @@ PIP_FRAC = 0.28         # PiP window width as a fraction of the main width
 PIP_MARGIN = 16         # PiP inset from the top/right edges, px
 GAP_MIN = 1.0           # timeline holes shorter than this are scheduling
                         # jitter (mtime granularity), absorbed not rendered
+FILLER_TILE = 30.0      # seconds of pre-rendered "No Signal" filler; a hole
+                        # of any length is covered by repeating this one tile
 CAM_FALLBACK_WH = {"front": (1920, 1080), "rear": (1280, 720)}
 
 
@@ -255,17 +257,65 @@ def ffprobe_duration(path, fatal=True):
         return None
 
 
+def ffprobe_dur_start(path, fatal=True):
+    """(duration, first container timestamp) in a single probe.
+
+    The start timestamp is what makes a concat-demuxer cut land in the right
+    place: inpoint/outpoint are absolute timestamps in the FILE'S OWN domain,
+    and an MPEG-TS segment does not begin at zero (the muxer offsets by 1.4 s,
+    and splitmuxsink carries a running PTS across the whole session, so a late
+    segment can start hours in). Feeding a raw in-segment offset would cut at
+    a completely unrelated instant. Probed here rather than at cut time
+    because the duration probe already visits every segment — this costs
+    nothing extra. A file that reports no start time is treated as starting
+    at zero, which is the right reading for a container without the field."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration,start_time", "-of", "default=noprint_wrappers=1",
+             path], capture_output=True, text=True, check=True).stdout
+        vals = {}
+        for line in out.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                vals[k.strip()] = v.strip()
+        dur = float(vals["duration"])
+        try:
+            t0 = float(vals.get("start_time", "0"))
+        except ValueError:
+            t0 = 0.0
+        return dur, t0
+    except FileNotFoundError:
+        die("ffprobe not found (is ffmpeg installed?)")
+    except (subprocess.CalledProcessError, KeyError, ValueError):
+        if fatal:
+            die("ffprobe failed on %s" % path)
+        return None
+
+
 def ffprobe_wh(path, fatal=True):
+    """(width, height) of the first video stream.
+
+    Reads the FIRST row only. An MPEG-TS file carries programs, and ffprobe
+    prints a matching stream once per program as well as once for the file,
+    so a .ts segment answers "1280,720\\n\\n1280,720" — unpacking that whole
+    string raised, this returned None, and every render silently fell back to
+    CAM_FALLBACK_WH. That was invisible while the fallbacks happened to match
+    the recorder's real geometry, and stops being invisible the moment
+    anything else has to be generated at the same size (the No Signal filler
+    now is): a mismatch makes the concat demuxer switch resolution mid-stream
+    and ffmpeg drops frames across the join."""
     try:
         out = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0",
              "-show_entries", "stream=width,height", "-of", "csv=p=0", path],
-            capture_output=True, text=True, check=True).stdout.strip()
-        w, h = out.split(",")
+            capture_output=True, text=True, check=True).stdout
+        row = next(l for l in out.splitlines() if l.strip())
+        w, h = row.strip().split(",")
         return int(w), int(h)
     except FileNotFoundError:
         die("ffprobe not found (is ffmpeg installed?)")
-    except (subprocess.CalledProcessError, ValueError):
+    except (subprocess.CalledProcessError, ValueError, StopIteration):
         if fatal:
             die("ffprobe failed on %s" % path)
         return None
@@ -494,18 +544,41 @@ def display_shift_secs(args, start0):
 # "No Signal" filler — and GPS trouble labeled "GPS Error"/"GPS No
 # Signal". Always a re-encode; near-transparent x264 settings (CRF 18)
 # keep the loss on 8/4 Mbps dashcam source visually negligible.
+#
+# Each camera reaches ffmpeg as ONE input: an ffconcat list walked by the
+# concat DEMUXER, which opens one segment at a time. It used to be one -i
+# per segment joined by the concat FILTER, and that is what made a long
+# drive unrenderable — ffmpeg opened every segment at once, so both the
+# per-input decoder overhead and libavfilter's unbounded per-input frame
+# queues grew with the length of the drive. Measured on 640x480 stand-in
+# footage, peak RSS went 1.06 / 1.93 / 3.65 / 7.16 GB across 20 / 40 / 80 /
+# 160 segments and failed outright at 120 under a 16 GB cap ("Error while
+# opening decoder: Resource temporarily unavailable"); the same renders on
+# the demuxer hold flat at 0.23 GB. Real 60 s 1080p segments are far
+# heavier per segment than that stand-in, which is why hours of footage
+# filled RAM.
+#
+# What keeps the joins seamless is the division of labour between the two:
+# the demuxer places each piece on the timeline (durations pinned by our own
+# arithmetic, cuts taken off segment TAILS so nothing seeks into a GOP) and
+# the filter graph does the frame-exact work (fps= onto a rigid grid, then
+# the single head trim --from needs). See tail_trim_overlaps,
+# write_concat_list and normalize_filter for why each half does its half.
 
 def cam_segments_abs(data, session, cam):
-    """Sorted [(path, start_epoch, duration)]; start = mtime - duration
-    (mtime is the segment END — see module docstring)."""
+    """Sorted [(path, start_epoch, duration, ts0)]; start = mtime - duration
+    (mtime is the segment END — see module docstring). ts0 is the segment's
+    own first timestamp, carried because a concat-demuxer cut is expressed in
+    that domain (see ffprobe_dur_start)."""
     out = []
     for path, mtime in segments(data, session, cam):
-        dur = ffprobe_duration(path, fatal=False)
-        if dur is None:
+        probe = ffprobe_dur_start(path, fatal=False)
+        if probe is None:
             warn("skipping unreadable segment %s (rendered as No Signal)"
                  % path)
             continue
-        out.append((path, mtime - dur, dur))
+        dur, ts0 = probe
+        out.append((path, mtime - dur, dur, ts0))
     out.sort(key=lambda s: s[1])
     return out
 
@@ -517,7 +590,7 @@ def timeline_pieces(segs, lo, hi):
     filler; overlaps trim the head of the later segment."""
     pieces = []
     cursor = lo
-    for path, start, dur in segs:
+    for path, start, dur, ts0 in segs:
         end = start + dur
         if end <= cursor or start >= hi:
             continue
@@ -528,41 +601,205 @@ def timeline_pieces(segs, lo, hi):
         take = min(end, hi) - (start + in_off)
         if take <= 0:
             continue
-        pieces.append(("seg", path, in_off, take))
+        pieces.append(("seg", path, in_off, take, ts0))
         cursor = start + in_off + take
     if hi - cursor >= GAP_MIN:
         pieces.append(("gap", hi - cursor))
     return pieces
 
 
-def build_timeline_filter(pieces, idx0, w, h, label):
-    """One camera's pieces -> (ffmpeg input args, filter lines, next input
-    index). Real segments become file inputs starting at index idx0; gaps
-    are "No Signal" lavfi color sources generated inside the graph
-    (drawtext uses the fontconfig default font). Everything is normalized
-    to w×h @ TIMELINE_FPS yuv420p so the final concat cannot mismatch."""
-    inputs, lines, parts = [], [], []
-    i = idx0
-    for k, piece in enumerate(pieces):
-        out = "%s%d" % (label, k)
-        if piece[0] == "seg":
-            _, path, in_off, take = piece
-            inputs += ["-i", path]
-            lines.append(
-                "[%d:v]trim=start=%.3f:duration=%.3f,setpts=PTS-STARTPTS,"
-                "fps=%d,scale=%d:%d,setsar=1,format=yuv420p[%s]"
-                % (i, in_off, take, TIMELINE_FPS, w, h, out))
-            i += 1
+def tail_trim_overlaps(pieces):
+    """Move every interior head trim onto the tail of the piece before it.
+
+    timeline_pieces resolves an overlap by trimming the HEAD of the later
+    segment. Under the old per-piece `trim` filter that was free, but for the
+    concat demuxer a head trim is an inpoint in the middle of a GOP: the
+    decoder has to start at the preceding keyframe, the frames before the cut
+    come out referencing pictures it never saw, and the cut both loses real
+    footage and shows a brief freeze where fps= papers over the hole.
+    Trimming the TAIL of the EARLIER segment removes exactly the same amount
+    of timeline at exactly the same instant, but the demuxer merely stops
+    reading early — no seek, no broken references, frame-exact.
+
+    The trim cascades backwards: normally the immediately preceding piece has
+    room for all of it, but a segment shorter than the overlap that swallowed
+    it has to pass the remainder further back. Filler holes can absorb it too
+    — shrinking generated black by the same amount as it shifts is exactly
+    the mtime-jitter approximation timeline_pieces already makes. Every move
+    keeps the total length identical, so the timeline and every overlay time
+    survive untouched.
+
+    What this guarantees downstream: after this pass, only the FIRST piece
+    can still carry a head trim (anything earlier that could have absorbed it
+    was reduced to nothing and dropped). That one is the --from cut, and
+    write_concat_list hands it to the filter graph rather than the demuxer.
+    """
+    out = [list(p) for p in pieces]
+    room = lambda p: p[3] if p[0] == "seg" else p[1]
+
+    def take_from(p, amount):
+        if p[0] == "seg":
+            p[3] -= amount
         else:
-            src = ("color=black:size=%dx%d:rate=%d:duration=%.3f"
-                   ",drawtext=text='No Signal':fontcolor=white:"
-                   "fontsize=%d:x=(w-text_w)/2:y=(h-text_h)/2"
-                   % (w, h, TIMELINE_FPS, piece[1], h // 9))
-            lines.append(src + ",format=yuv420p[%s]" % out)
-        parts.append("[%s]" % out)
-    lines.append("%sconcat=n=%d:v=1:a=0[%s]"
-                 % ("".join(parts), len(pieces), label))
-    return inputs, lines, i
+            p[1] -= amount
+
+    for i in range(len(out) - 1, 0, -1):
+        cur = out[i]
+        if cur[0] != "seg" or cur[2] <= 0:
+            continue
+        j = i - 1
+        while cur[2] > 0 and j >= 0:
+            move = min(cur[2], room(out[j]))
+            if move > 0:
+                take_from(out[j], move)
+                cur[2] -= move
+                cur[3] += move
+            j -= 1
+    # A piece consumed whole by the cascade contributes nothing; drop it
+    # rather than emit a zero-length concat entry.
+    return [tuple(p) for p in out if room(p) > 0]
+
+
+def concat_quote(path):
+    """Quote a path for an ffconcat list. The parser quotes like a shell:
+    inside single quotes everything is literal, so only the quote itself has
+    to break out. --data is caller-supplied and may contain anything."""
+    return "'" + path.replace("'", "'\\''") + "'"
+
+
+def make_filler(w, h, dur, tmpdir, cam):
+    """Pre-render one "No Signal" tile for a camera -> (path, duration, ts0).
+
+    Holes used to be lavfi color sources generated inside the filter graph,
+    which cost one graph input per hole. As a file, one tile covers a hole of
+    any length by being listed repeatedly, so the input count stays at one
+    per camera no matter how broken the footage is. Rendered at the camera's
+    own w×h so the demuxer never sees a resolution change mid-stream.
+
+    drawtext needs a fontconfig default font; where there is none, fall back
+    to unlabeled black rather than failing the whole render — a black hole
+    still reads as "no footage", which is the point of the filler."""
+    path = os.path.join(tmpdir, "filler-%s.ts" % cam)
+    src = ("color=black:size=%dx%d:rate=%d:duration=%.3f"
+           % (w, h, TIMELINE_FPS, dur))
+    labeled = ("drawtext=text='No Signal':fontcolor=white:fontsize=%d:"
+               "x=(w-text_w)/2:y=(h-text_h)/2,format=yuv420p" % (h // 9))
+    for attempt, vf in enumerate((labeled, "format=yuv420p")):
+        try:
+            subprocess.run(
+                ["ffmpeg", "-hide_banner", "-v", "error", "-y",
+                 "-f", "lavfi", "-i", src, "-vf", vf, "-c:v", "libx264",
+                 "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p",
+                 "-an", "-f", "mpegts", path], check=True)
+        except FileNotFoundError:
+            die("ffmpeg not found")
+        except subprocess.CalledProcessError:
+            continue
+        probe = ffprobe_dur_start(path, fatal=False)
+        if probe:
+            if attempt:
+                warn("no usable font for the 'No Signal' label: "
+                     "rendering footage holes as plain black")
+            return path, probe[0], probe[1]
+    die("could not render 'No Signal' filler for %s" % cam)
+
+
+def write_concat_list(pieces, filler, tmpdir, cam):
+    """One camera's pieces -> (ffconcat list path, segment count).
+
+    This is what keeps memory flat. The old graph gave every segment its own
+    -i and joined them with the concat FILTER, so ffmpeg opened all of them
+    at once and libavfilter's unbounded per-input frame queues accumulated
+    decoded frames for every segment not yet reached — O(segments) RAM, which
+    on a multi-hour drive is tens of gigabytes. The concat DEMUXER walks the
+    same list one file at a time, closing each before opening the next, so
+    peak memory is a single decoder regardless of how long the drive is.
+
+    Two directives per entry, and each earns its place:
+      outpoint  where the piece ends. Absolute in the FILE'S OWN timestamp
+                domain, hence ts0 + ... — see ffprobe_dur_start.
+      duration  the timeline advance, pinned to OUR arithmetic. Without it
+                the demuxer derives the next file's start from where the
+                packets actually stopped, which is a packet boundary rather
+                than the exact cut, and those sub-frame errors would random-
+                walk across hundreds of segments until the two cameras and
+                the overlay no longer agreed on what time it was.
+
+    Deliberately NO inpoint, even for the one head trim tail_trim_overlaps
+    cannot move (the --from cut). inpoint does not compose with duration:
+    the demuxer still lays the file's frames down at (pts - file start), so
+    the skipped head becomes a silent lead-in that collides with the next
+    entry's offset and ffmpeg drops the overlap — a --from render came out
+    ~28 frames short and shifted. Instead the first file goes in WHOLE and
+    the caller trims that lead off in the filter graph, which is frame-exact
+    and costs one segment of decoded-and-discarded video, once per render.
+    Returned as `lead` for exactly that purpose.
+    """
+    lines = ["ffconcat version 1.0"]
+    n_seg = 0
+    lead = 0.0
+    for i, piece in enumerate(pieces):
+        if piece[0] == "seg":
+            _, path, in_off, take, ts0 = piece
+            # Read the lead off the FIRST piece and only the first, rather
+            # than off whichever piece still has one. tail_trim_overlaps
+            # leaves the others at zero mathematically, but it subtracts
+            # floats, so a later piece can hold a stray 1e-16 — and picking
+            # that up would silently overwrite a real --from cut with it.
+            if i == 0:
+                lead = in_off
+            lines.append("file " + concat_quote(os.path.abspath(path)))
+            lines.append("outpoint %.6f" % (ts0 + in_off + take))
+            lines.append("duration %.6f" % (in_off + take))
+            n_seg += 1
+        else:
+            fpath, fdur, fts0 = filler
+            left = piece[1]
+            while left > 0.5 / TIMELINE_FPS:    # ignore a sub-frame remainder
+                take = min(left, fdur)
+                lines.append("file " + concat_quote(fpath))
+                if take < fdur:
+                    lines.append("outpoint %.6f" % (fts0 + take))
+                lines.append("duration %.6f" % take)
+                left -= take
+    out = os.path.join(tmpdir, "concat-%s.txt" % cam)
+    with open(out, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    return out, n_seg, lead
+
+
+def normalize_filter(idx, w, h, lead, span, label):
+    """The whole of one camera, as a single chain on a single input.
+
+    Order matters, and every step is load-bearing for seamlessness:
+      setpts=PTS-STARTPTS  rebase to zero FIRST. The concatenated stream
+                           inherits the first segment's timestamp, which for
+                           MPEG-TS is ~1.4 s in and can be far larger; leave
+                           it and every .ass cue (which counts from zero)
+                           would sit that far off the footage it describes.
+      fps                  resample onto a rigid grid. This is what makes the
+                           joins seamless: a cut that lands mid-GOP, a
+                           segment whose real length differs a hair from its
+                           declared one, a filler tile boundary — all of them
+                           become an exact frame count instead of a drift,
+                           so the two cameras stay locked to each other and
+                           to the overlay for the length of the drive.
+      scale/setsar/format  after fps, so surplus frames are dropped before
+                           the expensive part rather than after.
+      trim                 drop `lead` — the --from cut the demuxer could not
+                           take (see write_concat_list) — and cap the result
+                           at the timeline span. Placed AFTER fps so both
+                           edges land on the rigid grid and the cut is exact
+                           to the frame; also insurance that nothing runs
+                           past the window even if a segment over-reports
+                           itself.
+      setpts               rebase again, so the kept range starts at zero and
+                           the .ass cues (which count from zero) line up with
+                           the footage they describe.
+    """
+    return ("[%d:v]setpts=PTS-STARTPTS,fps=%d,scale=%d:%d,setsar=1,"
+            "format=yuv420p,trim=start=%.6f:end=%.6f,setpts=PTS-STARTPTS[%s]"
+            % (idx, TIMELINE_FPS, w, h, lead, lead + span, label))
 
 
 def ticking_spans(spans, epoch0, text):
@@ -688,33 +925,48 @@ def cmd_render(args):
         wh = ffprobe_wh(segs[cam][0][0], fatal=False) if segs[cam] else None
         return wh or CAM_FALLBACK_WH[cam]
 
-    input_args, filter_lines = [], []
-    idx = 0
-    n_fill = 0
-    for cam in cams:
-        w, h = cam_wh(cam)
-        pieces = timeline_pieces(segs[cam], lo, hi)
-        if not pieces:              # window inside an absorbed sliver
-            pieces = [("gap", hi - lo)]
-        n_fill += sum(1 for p in pieces if p[0] == "gap")
-        ins, lines, idx = build_timeline_filter(pieces, idx, w, h, cam)
-        input_args += ins
-        filter_lines += lines
-
-    if both:
-        mw, _ = cam_wh(cams[0])
-        pw, ph = cam_wh(cams[1])
-        pip_w = int(mw * PIP_FRAC) // 2 * 2
-        pip_h = int(pip_w * ph / pw) // 2 * 2
-        filter_lines.append("[%s]scale=%d:%d[pip]"
-                            % (cams[1], pip_w, pip_h))
-        filter_lines.append("[%s][pip]overlay=W-w-%d:%d[vid]"
-                            % (cams[0], PIP_MARGIN, PIP_MARGIN))
-        vid = "vid"
-    else:
-        vid = cams[0]
-
     with tempfile.TemporaryDirectory() as tmpdir:
+        # One input per CAMERA, not per segment: each camera's whole timeline
+        # is an ffconcat list the demuxer walks file by file. Peak memory is
+        # therefore flat in the length of the drive (see write_concat_list),
+        # and a both-prio-* render of a multi-hour drive is 2 inputs where it
+        # used to be several hundred — which also puts the open-file count
+        # and the argument list back well under their limits.
+        input_args, filter_lines = [], []
+        n_seg = 0
+        n_fill = 0
+        for idx, cam in enumerate(cams):
+            w, h = cam_wh(cam)
+            pieces = timeline_pieces(segs[cam], lo, hi)
+            if not pieces:          # window inside an absorbed sliver
+                pieces = [("gap", hi - lo)]
+            pieces = tail_trim_overlaps(pieces)
+            gaps = [p[1] for p in pieces if p[0] == "gap"]
+            n_fill += len(gaps)
+            filler = (make_filler(w, h, min(FILLER_TILE, max(gaps)),
+                                  tmpdir, cam) if gaps else None)
+            lst, ns, lead = write_concat_list(pieces, filler, tmpdir, cam)
+            n_seg += ns
+            input_args += ["-f", "concat", "-safe", "0", "-i", lst]
+            filter_lines.append(
+                normalize_filter(idx, w, h, lead, hi - lo, cam))
+
+        # Both cameras are now exactly the same number of frames on exactly
+        # the same grid, so the PiP stays registered to the main picture for
+        # the whole drive instead of sliding as holes accumulate.
+        if both:
+            mw, _ = cam_wh(cams[0])
+            pw, ph = cam_wh(cams[1])
+            pip_w = int(mw * PIP_FRAC) // 2 * 2
+            pip_h = int(pip_w * ph / pw) // 2 * 2
+            filter_lines.append("[%s]scale=%d:%d[pip]"
+                                % (cams[1], pip_w, pip_h))
+            filter_lines.append("[%s][pip]overlay=W-w-%d:%d[vid]"
+                                % (cams[0], PIP_MARGIN, PIP_MARGIN))
+            vid = "vid"
+        else:
+            vid = cams[0]
+
         shift = display_shift_secs(args, t0)
         ass = write_timeline_ass(fixes, health, lo, hi, shift,
                                  args.units, args.annotate, tmpdir)
@@ -747,7 +999,7 @@ def cmd_render(args):
             die("ffmpeg failed (%d)" % e.returncode)
     print("wrote %s (%s span %s%s, %d segments, %d filler pieces%s)"
           % (args.output, args.camera, fmt_span(hi - lo),
-             " at %gx" % speed if speed > 1.0 else "", idx, n_fill,
+             " at %gx" % speed if speed > 1.0 else "", n_seg, n_fill,
              ", %d unreadable segments skipped" % n_bad if n_bad else ""))
 
 
