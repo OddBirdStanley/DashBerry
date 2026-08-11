@@ -225,6 +225,9 @@ cli/dashberry-cli --data ~/dashcam-copy catalog
 # add distance, average/top speed and the event markers you pressed B for
 cli/dashberry-cli --data ~/dashcam-copy catalog --verbose
 
+# just one drive (same columns, skips the work for all the others)
+cli/dashberry-cli --data ~/dashcam-copy catalog --drive 20260721-1830-0042
+
 # render a clip — the continuous boot-to-shutdown timeline: footage holes
 # show "No Signal", GPS trouble is labeled from the health log; --annotate
 # burns time/position/speed; --camera both-prio-front adds the rear camera
