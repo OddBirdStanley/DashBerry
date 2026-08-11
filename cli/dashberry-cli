@@ -369,9 +369,11 @@ def fmt_span(seconds):
                              seconds % 60)
 
 
-def drive_start(data, session):
+def drive_start(data, session, fixes=None):
     """Earliest evidence of the drive: min over segment STARTS (mtime minus
-    duration) of both cameras and the first RMC fix. None if no evidence."""
+    duration) of both cameras and the first RMC fix. None if no evidence.
+    A caller that has already parsed the NMEA log passes its fixes in rather
+    than paying to read it twice."""
     starts = []
     for cam in ("front", "rear"):
         # First segment that actually probes: segments() is sorted, so that
@@ -383,7 +385,8 @@ def drive_start(data, session):
             if dur is not None:
                 starts.append(mt - dur)
                 break
-    fixes = parse_rmc(nmea_path(data, session))
+    if fixes is None:
+        fixes = parse_rmc(nmea_path(data, session))
     if fixes:
         starts.append(fixes[0][0])
     return min(starts) if starts else None
@@ -466,18 +469,28 @@ def cmd_catalog(args):
         front = segments(data, s, "front")
         rear = segments(data, s, "rear")
         fixes = parse_rmc(nmea_path(data, s))
-        # cheap catalog: span of segment mtimes; fall back to gps log span
+        # A segment's mtime is its LAST WRITE, i.e. its END — so min(mtimes),
+        # which this used to call the start, is really the moment the FIRST
+        # segment closed: one SEGMENT_NS (60 s) after the drive began. That
+        # put START a whole segment late, made it postdate the GPS column it
+        # sits next to, and docked DURATION the same 60 s. Anchor on
+        # drive_start() instead: the same evidence render/gpx/csv already use,
+        # so catalog agrees with `render --from 0:00`, and START cannot
+        # postdate the first fix because that fix is one of the candidates it
+        # takes the min over. The end needs no such care — the newest mtime
+        # really is the last write of the drive. Costs one ffprobe per camera
+        # per session, which is why the cheap version existed.
         mtimes = [m for _, m in front + rear]
-        if mtimes:
-            start, end = min(mtimes), max(mtimes)
-        elif fixes:
-            start, end = fixes[0][0], fixes[-1][0]
-        else:
-            start = end = None
-        if start is not None:
+        end = max(mtimes) if mtimes else (fixes[-1][0] if fixes else None)
+        start = drive_start(data, s, fixes)
+        if start is None and mtimes:
+            # Every segment unprobeable (truncated tail, no ffprobe): fall
+            # back to the old estimate rather than losing the row entirely.
+            start = min(mtimes)
+        if start is not None and end is not None:
             start_s = dt.datetime.fromtimestamp(start).strftime(
                 "%Y-%m-%d %H:%M:%S")
-            dur = fmt_span(end - start)
+            dur = fmt_span(max(0.0, end - start))
         else:
             start_s, dur = "?", "?"
         if fixes:
