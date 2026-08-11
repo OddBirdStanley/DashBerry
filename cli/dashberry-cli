@@ -49,6 +49,11 @@ KNOTS_TO_MPH = 1.15078
 KNOTS_TO_KMH = 1.852
 KNOTS_TO_MS = 0.514444
 
+MOVING_KNOTS = 2.0                  # 3.7 km/h: below this the vehicle is
+                                    # stopped and the receiver is reporting
+                                    # noise, not a crawl
+MAX_KNOTS = 250.0 / KNOTS_TO_KMH    # 250 km/h — a faster fix is junk
+
 TIMELINE_FPS = 30       # timeline renders normalize both cameras to this
 PIP_FRAC = 0.28         # PiP window width as a fraction of the main width
 PIP_MARGIN = 16         # PiP inset from the top/right edges, px
@@ -394,31 +399,51 @@ def drive_start(data, session, fixes=None):
 
 # --------------------------------------------------------------- catalog --
 
-def haversine_m(lat1, lon1, lat2, lon2):
-    r1, r2 = math.radians(lat1), math.radians(lat2)
-    a = (math.sin(math.radians(lat2 - lat1) / 2) ** 2 +
-         math.cos(r1) * math.cos(r2) *
-         math.sin(math.radians(lon2 - lon1) / 2) ** 2)
-    return 2 * 6371000.0 * math.asin(math.sqrt(a))
-
-
 def drive_stats(fixes):
-    """(distance_m, moving_secs, top_knots) over the RMC timeline. Gated
-    against GPS junk: fix pairs more than 10 s apart (tunnel / log gap) or
-    implying > 250 km/h are skipped; 'moving' means > 2 knots."""
+    """(distance_m, moving_secs, top_knots) over the RMC timeline.
+
+    Distance INTEGRATES THE RECEIVER'S DOPPLER SPEED over time — the RMC
+    speed field, trapezoid rule between consecutive fixes — instead of
+    summing haversine hops between consecutive positions, which is what
+    this did until 2026-08-11.
+
+    Doppler is the better observable by a wide margin, and the gap widens
+    as the fix rate rises. It is derived from carrier phase rate, good to
+    a few cm/s, and its error is zero-mean, so integrating it averages the
+    noise away. A position, by contrast, carries metres of independent
+    noise per fix, and differencing two of them ADDS those errors instead
+    of cancelling them: at the puck's 5 Hz a stationary car random-walks
+    its way to kilometres of distance it never travelled (measured: ~4 km
+    over a 5-minute stop with 1.5 m RMS noise). Sampling faster makes
+    position-differencing worse and Doppler integration better.
+
+    Gates, all junk rejection rather than smoothing:
+
+    - A pair more than 10 s apart (tunnel, log gap, power cut) contributes
+      nothing. The speed across that gap is *unknown*, not zero — this
+      undercounts a tunnel rather than inventing a straight line through
+      it, which is the conservative direction for a dashcam log.
+    - A fix reading above MAX_KNOTS is discarded outright.
+    - A pair with BOTH ends below MOVING_KNOTS is stopped, and contributes
+      neither distance nor time. This is what keeps standstill noise out
+      of the total now that every pair is integrated; it costs a genuine
+      sub-3.7 km/h crawl, which is the right trade for a car. Because it
+      is the same threshold `moving` uses, `distance / moving_secs` is
+      exactly the mean speed while moving.
+    """
     dist = moving = top = 0.0
-    for (t0, la0, lo0, _), (t1, la1, lo1, k1) in zip(fixes, fixes[1:]):
+    for (t0, _, _, k0), (t1, _, _, k1) in zip(fixes, fixes[1:]):
         span = t1 - t0
         if span <= 0 or span > 10:
             continue
-        d = haversine_m(la0, lo0, la1, lo1)
-        if d / span > 250 / 3.6:
+        if k0 > MAX_KNOTS or k1 > MAX_KNOTS:
             continue
-        dist += d
-        if k1 > 2.0:
-            moving += span
-            if k1 > top:
-                top = k1
+        if k0 < MOVING_KNOTS and k1 < MOVING_KNOTS:
+            continue
+        dist += (k0 + k1) / 2.0 * KNOTS_TO_MS * span
+        moving += span
+        if k1 > top:
+            top = k1
     return dist, moving, top
 
 
