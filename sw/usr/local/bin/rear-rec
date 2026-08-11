@@ -104,8 +104,10 @@ trap 'kill "$SYNCER_PID" 2>/dev/null || true' EXIT INT TERM
 # empty for neither. Unlike the front (where the ISP flips for free), this
 # one costs a videoflip element between the decoder and the encoder — a
 # reversal on already-decoded I420, cheap next to the software jpegdec that
-# is already in the chain, and nothing in the UVC gadget is asked to change
-# (the Zero's image stays untouched, per the project rule).
+# is already in the chain, and nothing in the UVC gadget is asked to change —
+# correcting geometry on this side is simply the cheaper place for it. (It was
+# also once a project RULE that the Zero stays untouched; that rule was retired
+# 2026-08-11 — see IMPL.md "Explicitly not built".)
 #
 # Both axes at once is rotate-180 (vertical ∘ horizontal), NOT two elements,
 # so the two-axis mount costs exactly what a one-axis mount does. Horizontal
@@ -129,11 +131,16 @@ case "$V$H" in
 esac
 
 # REAR_GAMMA: the rear picture is too dark at night; the front (IMX708, HDR)
-# is not. The fix lands here rather than at the source for two reasons: the
-# Zero's showmewebcam image and its camera tuning are untouched by this tree
-# (project rule), and at 30 fps the sensor's exposure is already capped at
-# 33 ms — whatever its AE has left is gain, which buys the same noise this
-# does without being switchable.
+# is not. The fix lands here rather than at the source because at 30 fps the
+# sensor's exposure is already capped at 33 ms — whatever its AE has left is
+# gain, which buys the same noise this does without being switchable.
+#
+# It landed here for a SECOND reason that no longer holds: the Zero's
+# showmewebcam image and camera tuning used to be untouchable by project rule.
+# That rule was retired 2026-08-11 (IMPL.md, "Explicitly not built"), so a
+# source-side tuning change is now a legitimate competitor to this element —
+# and a better-placed one, since this lifts shadow noise into a 4 Mbps
+# baseline encode. Measure first: cam/rootscripts/rear-source.
 #
 # Gamma, not a brightness offset or contrast stretch, and that choice IS the
 # day/night balance: a gamma curve is pinned at both black and white, so it
