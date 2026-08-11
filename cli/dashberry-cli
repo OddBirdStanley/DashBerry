@@ -9,8 +9,9 @@ may be Python). firstinstall.sh deliberately does not install it.
 Stdlib only; ffmpeg/ffprobe are invoked as subprocesses for all heavy lifting.
 
 Subcommands:
-  catalog  one line per DRIVE (= per-boot session directory); --verbose adds
-           distance / average / top speed and button-B event markers
+  catalog  one line per DRIVE (= per-boot session directory), or just one
+           drive with --drive; --verbose adds distance / average / top speed
+           and button-B event markers
   render   continuous boot-to-shutdown video of one drive (footage holes —
            including segments ffprobe cannot read — become black "No
            Signal" filler, GPS trouble is labeled from the health log;
@@ -488,6 +489,13 @@ def cmd_catalog(args):
     sess = sessions(data)
     if not sess:
         die("no sessions under %s" % data)
+    if args.drive:
+        # One row, same columns and same header — the point is to skip the
+        # per-session ffprobe/NMEA work for every OTHER drive on a card
+        # holding weeks of them, not to print a different thing.
+        if args.drive not in sess:
+            die("no such drive: %s (see `catalog` for the list)" % args.drive)
+        sess = [args.drive]
     print("%-20s %-19s %9s %6s %6s  %s" %
           ("DRIVE", "START", "DURATION", "FRONT", "REAR", "GPS"))
     for s in sess:
@@ -1216,6 +1224,8 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     pc = sub.add_parser("catalog", help="print drive session info")
+    pc.add_argument("--drive", metavar="SESSION",
+                    help="list only this drive (default: every drive)")
     pc.add_argument("-v", "--verbose", action="store_true",
                     help="add per-drive distance / avg / top speed (from the "
                          "NMEA log) and button-B event markers (health log)")
