@@ -12,9 +12,10 @@ no account, no companion app, and no telemetry.
 
 ## Features
 
-- **Dual-camera H.264 recording** — 1080p30 front (CSI camera), 720p30 rear
-  (Pi Zero UVC gadget), hardware-encoded, 60-second segments, ~110–120 h of
-  retention on a 256 GB card
+- **Dual-camera H.264 recording** — 1080p30 front (CSI camera, hardware-encoded)
+  and 1080p30 rear (Pi Zero UVC gadget, software-encoded), 60-second MPEG-TS
+  segments, ~110–120 h of retention on a 256 GB card. Setting up the rear
+  camera's card: [ZERO_SETUP.md](ZERO_SETUP.md).
 - **5 Hz GPS logging** — raw NMEA per drive; Doppler-derived speed accurate
   to well under 1 km/h
 - **Crash-only design** — ignition off is a hard power cut, and the system
