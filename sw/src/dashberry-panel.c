@@ -87,6 +87,7 @@
 #define DATA_MNT      "/data"
 #define RTC_EPOCH     "/sys/class/rtc/rtc0/since_epoch"
 #define CPU_TEMP      "/sys/class/thermal/thermal_zone0/temp"  /* milli-degC */
+#define PROC_STAT     "/proc/stat"                    /* cumulative jiffies */
 /* Under-voltage comes from raspberrypi-hwmon, not from the firmware node
  * this used to read: rpi-6.12.y — the kernel Trixie ships — does not expose
  * get_throttled under soc:firmware at all, so that open failed on every
@@ -982,6 +983,64 @@ static int cpu_temp_c(void)
     return (cpu_temp_mc + (cpu_temp_mc >= 0 ? 500 : -500)) / 1000;
 }
 
+/* CPU load for the PAGE 2 CPU line, off /proc/stat's aggregate "cpu" row.
+ * That row sums all four cores, so the figure is a share of the WHOLE Pi 4,
+ * 0-100% — not top's per-core 0-400%. On 16 columns the normalized form is
+ * the only one readable at a glance, and it is the one that answers "is
+ * there headroom left".
+ *
+ * This line exists because the rear moved to 1920x1080@30 (2026-08-12):
+ * 2.25x the pixel rate of the old 720p30, through a SOFTWARE jpegdec and a
+ * SOFTWARE openh264enc that between them were measured at ~1.3 cores at the
+ * OLD mode. Whether the Pi 4 sustains the new one alongside front-rec is the
+ * open question on that change, and nothing on the car could see it: TMP
+ * shows heat AFTER the work, and the health check (segments growing) cannot
+ * distinguish an encoder keeping up from one quietly dropping frames.
+ *
+ * The counters are cumulative since boot, so the FIRST tick has no delta to
+ * divide and shows ---. A failed read keeps the last figure rather than
+ * blanking, because a single unreadable /proc/stat is not news. Like TMP and
+ * PWR, informational only: it never faults the system. */
+static unsigned long long cpu_busy_prev, cpu_total_prev;
+static int  cpu_load_pct;
+static bool cpu_load_valid;
+
+static void read_cpu_load(void)
+{
+    char buf[192];
+    unsigned long long v[8] = { 0 };
+
+    if (read_small(PROC_STAT, buf, sizeof buf) <= 0)
+        return;
+    /* The aggregate row is the first line, so parsing from the head of the
+     * buffer is enough — no need to read all of /proc/stat. */
+    int n = sscanf(buf, "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7]);
+    if (n < 4)                     /* user/nice/system/idle are the minimum */
+        return;
+
+    unsigned long long total = 0;
+    for (int i = 0; i < 8; i++)
+        total += v[i];
+    /* idle + iowait are the not-working columns. iowait is idle time that
+     * merely has I/O outstanding, and counting it as busy would make every
+     * card flush and every retention sweep read as load. */
+    unsigned long long busy = total - v[3] - v[4];
+
+    if (cpu_total_prev != 0 && total > cpu_total_prev) {
+        unsigned long long dt = total - cpu_total_prev;
+        unsigned long long db = busy - cpu_busy_prev;
+        /* The counters are monotonic, so db <= dt always holds — clamp
+         * anyway rather than print an unsigned underflow as 4294967295%. */
+        if (db > dt)
+            db = dt;
+        cpu_load_pct = (int)((db * 100 + dt / 2) / dt);
+        cpu_load_valid = true;
+    }
+    cpu_busy_prev  = busy;
+    cpu_total_prev = total;
+}
+
 /* Under-voltage for the PAGE 2 PWR line, from raspberrypi-hwmon's low-crit
  * alarm. The driver polls the firmware every 2 s and hands it the
  * sticky-clear mask, so the alarm reads "under-voltage during the last poll
@@ -1317,6 +1376,7 @@ static void eval_health(int64_t now)
         settings_apply();
     }
     read_cpu_temp();               /* 1 Hz, off the 5 Hz paint path */
+    read_cpu_load();               /* same tick: the delta window IS 1 s */
     read_undervoltage();
     rf_refresh();                  /* glyph truth, not a health state */
     hlog_sync(session, now);
@@ -2515,7 +2575,10 @@ static void compose(struct frame *f, int64_t now)
     if (pages[ui.page_idx] == 2) {
         /* PAGE 2 — line 1: Pi 4 SoC temperature, whole degrees C
          * (negative-safe round-to-nearest); line 2: rail under-voltage
-         * (now beats latched); remaining lines reserved */
+         * (now beats latched); line 3: CPU load across all four cores;
+         * line 4 reserved. Load sits under TMP deliberately — heat is the
+         * consequence, load is the cause, and reading them together is what
+         * tells a thermal soak from a merely busy encoder. */
         if (cpu_temp_valid) {
             snprintf(f->rows[0], sizeof f->rows[0], "TMP %d C", cpu_temp_c());
         } else {
@@ -2529,6 +2592,10 @@ static void compose(struct frame *f, int64_t now)
             snprintf(f->rows[1], sizeof f->rows[1], "PWR UV SEEN");
         else
             snprintf(f->rows[1], sizeof f->rows[1], "PWR OK");
+        if (cpu_load_valid)
+            snprintf(f->rows[2], sizeof f->rows[2], "CPU %d%%", cpu_load_pct);
+        else
+            snprintf(f->rows[2], sizeof f->rows[2], "CPU ---");
         return;
     }
 

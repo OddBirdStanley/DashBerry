@@ -1,4 +1,8 @@
 __pycache__/
 *.md
 !/README.md
+# ZERO_SETUP.md is the record of the rear Zero's card, which this tree does
+# not build and cannot reconstruct. Losing it means a reflash silently
+# reverts the rear camera with no symptom but a worse picture.
+!/ZERO_SETUP.md
 /*.txt
