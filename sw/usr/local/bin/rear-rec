@@ -85,10 +85,17 @@ trap 'kill "$SYNCER_PID" 2>/dev/null || true' EXIT INT TERM
 # setting governs a codec path nothing here touches, so it was never a
 # floor under anything. The knob that DOES govern the source's quality is
 # compression_quality (JPEG Compression Controls); see ZERO_SETUP.md.
-# Nothing has yet measured what the source actually delivers, so there is
-# now NO evidence either way on whether this encoder or the source
-# dominates the rear's loss — rootscripts/rear-source produces the
-# measurement.
+#
+# What survives the retraction: a 2026-08-05 rear bench DID measure the
+# source at roughly 100 KB/frame, flat across every advertised resolution
+# — about 25 Mbps at 30 fps. Flat bytes across resolutions is the
+# signature of a bitrate-targeted encoder, so the figure is probably real
+# and the coincidence with video_bitrate=25000000 is unexplained rather
+# than debunked. Treat it as unconfirmed: that result is NOT recorded
+# anywhere in this tree, and the achieved-fps figure from the same bench
+# section was later retracted as a parse artifact. Re-measure with
+# rootscripts/rear-source before leaning on it again — and note it would
+# now be measured at 1080p, not the 720p it was taken at.
 #
 # THE ~1 CORE FIGURE WAS MEASURED AT 720p30, and the rear now runs
 # 1920x1080@30 (2026-08-12) — 2.25x the pixel rate through both the
