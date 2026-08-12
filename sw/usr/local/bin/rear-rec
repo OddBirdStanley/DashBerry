@@ -95,15 +95,21 @@ trap 'kill "$SYNCER_PID" 2>/dev/null || true' EXIT INT TERM
 # anywhere in this tree, and the achieved-fps figure from the same bench
 # section was later retracted as a parse artifact. Re-measure with
 # rootscripts/rear-source before leaning on it again — and note it would
-# now be measured at 1080p, not the 720p it was taken at.
+# now be measured at 1640x922, not the 720p it was taken at.
 #
-# THE ~1 CORE FIGURE WAS MEASURED AT 720p30, and the rear now runs
-# 1920x1080@30 (2026-08-12) — 2.25x the pixel rate through both the
-# software jpegdec and this software encoder. Whether the Pi 4 sustains
-# that alongside front-rec is UNVERIFIED and is the open question on the
-# mode change; it is settled by a dual-stream thermal soak, not by
-# scaling this number. If a soak shows strain, complexity=low and
-# multi-thread=N are the headroom knobs. The queue ahead of the encoder decouples
+# THE ~1 CORE FIGURE WAS MEASURED AT 720p30, and the rear runs
+# 1640x922@30 as of 2026-08-12 — 1.64x that pixel rate through both the
+# software jpegdec and this software encoder.
+#
+# That mode is the SECOND one adopted that day. 1920x1080@30 (2.25x) went
+# in first and was REVERTED: recorded segments came out at a frame rate
+# well under 30, so this chain could not consume the source at the rate it
+# arrived, and the crop's extra detail per degree was never actually
+# banked. 1.64x is a 27% cut from a rate that demonstrably did not fit —
+# it is NOT a measured fit. Confirm the achieved frame rate on real
+# footage before treating it as settled; if it strains, complexity=low and
+# multi-thread=N are the headroom knobs to reach for before the mode moves
+# again. The queue ahead of the encoder decouples
 # capture+decode from encode so the software encoder pipelines across
 # cores — part of the benched configuration, not an optimization.
 # The old level=(string)4 caps filter was v4l2h264enc-specific (without
@@ -164,8 +170,9 @@ esac
 # showmewebcam image and camera tuning used to be untouchable by project rule.
 # That rule was retired 2026-08-11 (IMPL.md, "Explicitly not built"), so a
 # source-side tuning change is now a legitimate competitor to this element —
-# and a better-placed one, since this lifts shadow noise into a 4 Mbps
-# baseline encode. Measure first: cam/rootscripts/rear-source.
+# and a better-placed one, since this lifts shadow noise into a baseline
+# encode that then spends bitrate on it (8 Mbps as of 2026-08-12, raised
+# partly for this). Measure first: cam/rootscripts/rear-source.
 #
 # Gamma, not a brightness offset or contrast stretch, and that choice IS the
 # day/night balance: a gamma curve is pinned at both black and white, so it
