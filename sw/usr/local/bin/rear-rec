@@ -74,11 +74,29 @@ trap 'kill "$SYNCER_PID" 2>/dev/null || true' EXIT INT TERM
 # cam/dashberry-quality-probe.sh.
 #
 # The costs, accepted: baseline profile only (~10-20% less
-# bitrate-efficient than a high-profile hw encode — tolerable while the
-# Zero's ~25 Mbps MJPEG is the quality floor; raise REAR_BITRATE before
-# blaming the encoder) and ~1 CPU core, which the Pi 4 has idle. If a
-# thermal soak ever shows strain, complexity=low and multi-thread=N are
-# the headroom knobs. The queue ahead of the encoder decouples
+# bitrate-efficient than a high-profile hw encode) and ~1 CPU core.
+#
+# THE "~25 Mbps MJPEG FLOOR" IS RETRACTED (2026-08-12). This comment used
+# to argue the encoder could not be the rear's problem because the Zero's
+# MJPEG was a ~25 Mbps quality floor beneath it. That number was read out
+# of showmewebcam's shipped /boot/camera.txt, which sets
+# video_bitrate=25000000 — V4L2_CID_MPEG_VIDEO_BITRATE, an H.264 control
+# in bcm2835-v4l2's Codec Controls class. The gadget streams MJPEG. The
+# setting governs a codec path nothing here touches, so it was never a
+# floor under anything. The knob that DOES govern the source's quality is
+# compression_quality (JPEG Compression Controls); see ZERO_SETUP.md.
+# Nothing has yet measured what the source actually delivers, so there is
+# now NO evidence either way on whether this encoder or the source
+# dominates the rear's loss — rootscripts/rear-source produces the
+# measurement.
+#
+# THE ~1 CORE FIGURE WAS MEASURED AT 720p30, and the rear now runs
+# 1920x1080@30 (2026-08-12) — 2.25x the pixel rate through both the
+# software jpegdec and this software encoder. Whether the Pi 4 sustains
+# that alongside front-rec is UNVERIFIED and is the open question on the
+# mode change; it is settled by a dual-stream thermal soak, not by
+# scaling this number. If a soak shows strain, complexity=low and
+# multi-thread=N are the headroom knobs. The queue ahead of the encoder decouples
 # capture+decode from encode so the software encoder pipelines across
 # cores — part of the benched configuration, not an optimization.
 # The old level=(string)4 caps filter was v4l2h264enc-specific (without
