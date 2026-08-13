@@ -604,11 +604,67 @@ patch_kernel_config() {
 EOK
 }
 
+# ---------------------------------------------------------------------------
+# 11. DEVICE TREE PATH — ARM DTS files moved in Linux 6.5.
+#
+# arch/arm/boot/dts/ was flat until 6.5, when every board's DTS was filed under
+# a vendor subdirectory: bcm2708-rpi-zero-w.dts now lives in
+# arch/arm/boot/dts/broadcom/. buildroot builds the DTB by asking make for
+# "$(BR2_LINUX_KERNEL_INTREE_DTS_NAME).dtb", so with the unqualified name the
+# kernel has no such target:
+#
+#   make[3]: *** No rule to make target 'arch/arm/boot/dts/bcm2708-rpi-zero-w.dtb'
+#
+# The name gains a broadcom/ prefix. buildroot installs the result with
+# $(notdir), so the file still lands in BINARIES_DIR as
+# bcm2708-rpi-zero-w.dtb, which is the name genimage-raspberrypi0w.cfg asks
+# for — nothing downstream has to change.
+#
+# Applied to every board config, since all the bcm27xx boards moved together.
+# ---------------------------------------------------------------------------
+dts_needs_vendor_prefix() {         # 0 = yes, on this kernel branch
+    local v maj min
+    case $KERNEL_BRANCH in
+    rpi-[0-9]*.[0-9]*.y)
+        v=${KERNEL_BRANCH#rpi-}; v=${v%.y}
+        maj=${v%%.*}; min=${v#*.}
+        [ "$maj" -gt 6 ] && return 0
+        [ "$maj" -eq 6 ] && [ "$min" -ge 5 ] && return 0
+        return 1 ;;
+    *)
+        say "  (cannot read a version out of '$KERNEL_BRANCH' — assuming >= 6.5)"
+        return 0 ;;
+    esac
+}
+
+patch_dts_name() {
+    dts_needs_vendor_prefix || {
+        say "device tree paths left flat (${KERNEL_BRANCH} predates the 6.5 move)"
+        return
+    }
+    local f found=0
+    for f in "$SMW"/configs/*; do
+        case $f in *_defconfig) continue ;; esac      # generated at build time
+        grep -q '^BR2_LINUX_KERNEL_INTREE_DTS_NAME=' "$f" 2>/dev/null || continue
+        found=1
+        if grep -q 'INTREE_DTS_NAME="broadcom/' "$f"; then
+            say "device tree already vendor-qualified in $(basename "$f")"
+            continue
+        fi
+        say "device tree → broadcom/ prefix in $(basename "$f")"
+        sed -i 's|^BR2_LINUX_KERNEL_INTREE_DTS_NAME="\([^/"]*\)"|BR2_LINUX_KERNEL_INTREE_DTS_NAME="broadcom/\1"|' "$f"
+    done
+    [ "$found" = 1 ] || die "no board config sets BR2_LINUX_KERNEL_INTREE_DTS_NAME.
+  Upstream's configs/ layout has changed; the device tree name has to be
+  vendor-qualified for kernels >= 6.5 and edits.sh could not find where."
+}
+
 echo "edits.sh: patching ${SMW}"
 patch_download_sites
 patch_busybox
 patch_kernel_config
 repin_kernel
+patch_dts_name
 patch_uvc_gadget
 patch_multi_gadget
 patch_camera_txt
