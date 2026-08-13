@@ -1,0 +1,33 @@
+[Unit]
+Description=DashBerry boot-time Bluetooth kill (every card, no exception)
+# The Bluetooth twin of dashberry-rfkill.service, kept as its own unit for
+# one reason: that unit is deliberately NOT enabled on a debug card given a
+# --wifi profile, the one build meant to come up with radios live. That
+# exception is about wlan. Bluetooth has no equivalent — nothing in
+# DashBerry has ever spoken it — so this unit is enabled on every card,
+# including that one, and firstinstall does not branch on it.
+#
+# Ordering: bluetoothd is the replayer here. BlueZ ships AutoEnable=true by
+# default (5.51+), so bluetooth.service un-blocks the rfkill switch and
+# powers the adapter shortly after it starts — the same shape of problem as
+# NetworkManager asserting WirelessEnabled over the wlan switch. Running
+# after it means this speaks last. Both units are masked by firstinstall, so
+# on a correctly built card these orderings are inert and this is belt and
+# braces over dtoverlay=disable-bt having already removed the adapter.
+After=bluetooth.service hciuart.service
+PartOf=dashberry.target
+
+[Service]
+Type=oneshot
+# Latched, matching dashberry-rfkill.service. Nothing on the card should be
+# re-running this, and a restart loop against an adapter something else
+# keeps re-adding would be a power drain on a vehicle battery.
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/rf-ctl bt-kill
+# A failure here shows as a failed unit and nothing more: nothing Requires
+# this, so the drive is unaffected. Note this is the ONLY place a live BT
+# radio is reported — the panel's glyph reads rfkill type wlan and says
+# nothing about Bluetooth — so the journal is the whole alarm.
+
+[Install]
+WantedBy=dashberry.target

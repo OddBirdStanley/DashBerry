@@ -35,6 +35,15 @@
 # the udev rule alike, is a debug card given a --wifi profile — an explicit
 # request for a card that rejoins the LAN by itself.
 #
+# All of that is about WLAN. Bluetooth is simpler and stricter: it is killed
+# on every card with no exception, because nothing in DashBerry has ever
+# used it, so there is no session and no build that may bring it up. bt_off()
+# below masks bluetoothd and hciuart and blocks the switch, the card carries
+# dtoverlay=disable-bt so the firmware never attaches the modem at all, and
+# dashberry-btkill.service re-asserts it after bluetooth.service on every
+# later boot. Note the panel's glyph does NOT report BT — it reads rfkill
+# type wlan and nothing else — so a failed btkill unit is the only alarm.
+#
 # Every run appends to an install log on the BOOT partition (see the block
 # below) — the card's black box, and the only record of this script that
 # outlives it.
@@ -442,9 +451,12 @@ udevadm control --reload
 # the next reboot, and gpsd's DEVICES= would point at nothing until then.
 udevadm trigger --action=add --subsystem-match=tty --subsystem-match=video4linux
 udevadm settle
+# dashberry-btkill.service is in the unconditional list, unlike its wlan
+# twin below: the --wifi exception that follows is about wlan, and no build
+# of this card — debug, --wifi, or otherwise — is ever allowed Bluetooth.
 enable_units="dashberry.target session.service \
     gps-rate.service front-rec.service gps-log.service panel.service \
-    retention.timer"
+    retention.timer dashberry-btkill.service"
 if [ "$BYPASS_REAR" = "1" ]; then
     echo "bypass-rear: rear-rec.service stays disabled"
 else
@@ -473,6 +485,22 @@ rf_live() {
         [ "$(cat "$_s/type" 2>/dev/null)" = wlan ] || continue
         [ "$(cat "$_s/soft" 2>/dev/null)" = 0 ]    || continue
         [ "$(cat "$_s/hard" 2>/dev/null)" = 0 ]    || continue
+        return 0
+    done
+    return 1
+}
+
+# The same test for the Bluetooth switch, kept separate from rf_live() for
+# the same reason rf-ctl keeps its copies separate: rf_live() is byte for
+# byte the panel's rf_unblocked(), and folding BT into it would change what
+# the OLED glyph means. No bluetooth switch at all is the SUCCESS case —
+# that is what dtoverlay=disable-bt produces.
+bt_live() {
+    for _s in /sys/class/rfkill/rfkill*; do
+        [ -d "$_s" ] || continue
+        [ "$(cat "$_s/type" 2>/dev/null)" = bluetooth ] || continue
+        [ "$(cat "$_s/soft" 2>/dev/null)" = 0 ]         || continue
+        [ "$(cat "$_s/hard" 2>/dev/null)" = 0 ]         || continue
         return 0
     done
     return 1
@@ -539,6 +567,55 @@ radios_off() {
         fi
     fi
 }
+
+# Bluetooth down for good, on every card. This is the whole Linux-side BT
+# story and it deliberately does NOT branch on DEBUG or FIRSTBOOT_WIFI: the
+# one build allowed live radios is allowed WLAN, because someone asked for a
+# card that rejoins the LAN. Nobody has ever asked this card for Bluetooth.
+#
+# Ordering inside the function matters. bluetoothd is the replayer — BlueZ
+# ships AutoEnable=true (5.51+), so it un-blocks the switch and powers the
+# adapter on its own — so it is stopped and masked BEFORE the block, rather
+# than blocking first and racing it. Masked, not merely disabled, for the
+# same reason as fake-hwclock, gpsdctl@ and systemd-rfkill above: nothing
+# may quietly bring it back, including a later apt that pulls in a package
+# wanting bluetooth.target. hciuart goes with it — on a card carrying
+# dtoverlay=disable-bt it would otherwise fail every boot with no modem to
+# attach, and on an older card it is what attaches the modem in the first
+# place.
+#
+# Depth beneath dtoverlay=disable-bt (config-snippet.txt), which is what
+# actually removes the adapter on any card built since. Everything here is
+# for the cards built before it, for a hand-edited config.txt, and for the
+# boot this install is running in — where the overlay has not flipped yet
+# and the modem is still attached.
+bt_off() {
+    systemctl disable --now bluetooth.service hciuart.service 2>/dev/null || true
+    systemctl mask bluetooth.service hciuart.service 2>/dev/null || true
+    rfkill block bluetooth 2>/dev/null || true
+    _i=0
+    while bt_live && [ "$_i" -lt 15 ]; do
+        sleep 0.2
+        _i=$((_i + 1))
+    done
+    # Pin systemd-rfkill's saved state the same way radios_off pins the wlan
+    # one: on a production card this file is about to be frozen into the
+    # read-only lower layer and replayed at every boot for the life of the
+    # card, so it must not carry "unblocked". (A production card also masks
+    # systemd-rfkill outright below; a debug card keeps it, and this is what
+    # that card replays.)
+    for _f in /var/lib/systemd/rfkill/*:bluetooth; do
+        [ -e "$_f" ] && printf '1\n' > "$_f"
+    done
+    if bt_live; then
+        echo "WARNING: Bluetooth is STILL live after the take-down — this card" >&2
+        echo "         can boot radiating BT, and the panel's glyph will NOT" >&2
+        echo "         report it (the glyph reads wlan only). Check that" >&2
+        echo "         'dtoverlay=disable-bt' is in config.txt and reboot." >&2
+    fi
+}
+echo "killing Bluetooth (every card: masking bluetoothd/hciuart, blocking the switch)..."
+bt_off
 
 # Everything a later reader needs to decide whether the overlay ACTUALLY
 # armed — dumped into the install log, which outlives the reboot and the

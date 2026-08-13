@@ -1,0 +1,31 @@
+# The Bluetooth switch comes up BLOCKED on every boot of every card.
+#
+# This is a THIRD rules file, separate from both 99-dashberry.rules (device
+# symlinks) and 99-dashberry-rfkill.rules (the wlan block), and the split is
+# the point: firstinstall REMOVES the wlan rules file on the one build meant
+# to boot live (a debug card given a --wifi profile). Bluetooth has no such
+# build. Nothing in DashBerry speaks BT, no card is ever meant to, and there
+# is no session — nothing like JOIN WIFI — that could ever want it up. Put
+# this rule in that file and the one card allowed wlan would silently be
+# allowed BT too; here, no code path on any card removes it.
+#
+# Depth, not the whole defense — the same lesson the wlan rule learned the
+# hard way (2026-08-05, 2026-08-08). Current Pi OS images ship
+# rfkill_default.conf (`options rfkill default_state=0`), so the kernel
+# already registers every switch soft-blocked and this write is usually
+# 1-over-1; on an older image, or if that conf goes away, this is what
+# blocks the switch as it appears. Either way an add-time state is only the
+# FIRST word of a boot: bluetoothd's AutoEnable (default true since BlueZ
+# 5.51) un-blocks the adapter and powers it seconds later, and on a writable
+# OS systemd-rfkill restores its own saved state over the top. What actually
+# holds a boot BT-KILLED is dashberry-btkill.service, ordered after
+# bluetooth.service so it speaks last, over an adapter that dtoverlay=disable-bt
+# means should not exist at all; firstinstall masking bluetooth.service and
+# hciuart.service sits between them.
+#
+# ACTION=="add" is load-bearing here for the same reason as in the wlan
+# rule: an rfkill state change also reaches udev, and an unqualified rule
+# would re-write the attribute inside the kernel's own change event. Only
+# the switch APPEARING — boot, or a driver rebind — forces it down; holding
+# it down afterwards is the service's job, not udev's.
+ACTION=="add", SUBSYSTEM=="rfkill", ATTR{type}=="bluetooth", ATTR{soft}="1"

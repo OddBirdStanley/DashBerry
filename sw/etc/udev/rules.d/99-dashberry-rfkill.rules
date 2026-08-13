@@ -28,6 +28,10 @@
 # APPEARING (boot, or a driver rebind) may force it down; rf-ctl's
 # explicit `rfkill unblock wifi` during a session is untouched.
 #
-# wlan only. The Bluetooth switch is a separate rfkill device and is not
-# in rev 8's scope — the panel's glyph reads type wlan and nothing else.
+# wlan only, still — the Bluetooth switch is a separate rfkill device and
+# is blocked by 99-dashberry-btkill.rules, which is a separate file because
+# this one is removed on a debug --wifi card and BT is never allowed up on
+# any card. The panel's glyph is unchanged: it reads type wlan and nothing
+# else, so RF-ENABLED on the OLED still means exactly "wlan is live" and
+# says nothing about BT.
 ACTION=="add", SUBSYSTEM=="rfkill", ATTR{type}=="wlan", ATTR{soft}="1"

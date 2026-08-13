@@ -17,6 +17,15 @@
 #   rf-ctl down        drop the profile and block the radios again
 #   rf-ctl boot-kill   assert the block at boot, after every replayer, and
 #                      prove it (dashberry-rfkill.service — not the panel)
+#   rf-ctl bt-kill     the same, for Bluetooth, on EVERY card and every boot
+#                      (dashberry-btkill.service)
+#
+# Everything except bt-kill is wlan and nothing else. Bluetooth is a
+# separate rfkill device with a separate switch, and it is kept down
+# unconditionally: no card speaks BT, so unlike wlan it has no session that
+# may bring it up and no build that is allowed it. That is why bt-kill is
+# its own subcommand and its own unit rather than a line inside boot-kill —
+# boot-kill is not enabled on a debug --wifi card, and BT must die there too.
 #
 # The passphrase arrives on stdin and is written under umask 077 — it is
 # never an argument (argv is world-readable through /proc), never echoed,
@@ -29,11 +38,18 @@ PROFILE_ID=dashberry-join
 PROFILE=/etc/NetworkManager/system-connections/$PROFILE_ID.nmconnection
 
 command -v nmcli >/dev/null 2>&1 || {
-    echo "rf-ctl: nmcli not found — this card has no NetworkManager" >&2
+    # bt-kill is the one subcommand NetworkManager has nothing to do with —
+    # BlueZ and the kernel switch are its whole stack — so it is not even
+    # worth a warning there.
+    [ "${1:-}" = bt-kill ] ||
+        echo "rf-ctl: nmcli not found — this card has no NetworkManager" >&2
     # boot-kill must fail CLOSED. Blocking the kernel switch does not need
     # NetworkManager, and a card with no nmcli is the last one that should
     # be left with its radios up because a helper was missing.
-    [ "${1:-}" = boot-kill ] || exit 1
+    case "${1:-}" in
+        boot-kill|bt-kill) ;;
+        *) exit 1 ;;
+    esac
 }
 
 # Remove the profile whether or not it is up. Never fatal: `down` must
@@ -56,6 +72,26 @@ rf_live() {
         [ "$(cat "$_s/type" 2>/dev/null)" = wlan ] || continue
         [ "$(cat "$_s/soft" 2>/dev/null)" = 0 ]    || continue
         [ "$(cat "$_s/hard" 2>/dev/null)" = 0 ]    || continue
+        return 0
+    done
+    return 1
+}
+
+# The same test for the Bluetooth switch. A SEPARATE function on purpose:
+# rf_live() above is byte for byte the panel's rf_unblocked() and
+# firstinstall's rf_live(), and folding BT into it would silently change
+# what the OLED's glyph means on every card. The glyph stays a wlan
+# instrument; this is only ever read by bt-kill below.
+#
+# No bluetooth switch at all is the SUCCESS case here, not a doubtful one:
+# it is what dtoverlay=disable-bt produces — the firmware never attached the
+# modem, so there is no adapter and nothing to block.
+bt_live() {
+    for _s in /sys/class/rfkill/rfkill*; do
+        [ -d "$_s" ] || continue
+        [ "$(cat "$_s/type" 2>/dev/null)" = bluetooth ] || continue
+        [ "$(cat "$_s/soft" 2>/dev/null)" = 0 ]         || continue
+        [ "$(cat "$_s/hard" 2>/dev/null)" = 0 ]         || continue
         return 0
     done
     return 1
@@ -233,8 +269,49 @@ boot-kill)
     fi
     ;;
 
+bt-kill)
+    # Once per boot, from dashberry-btkill.service, on EVERY card — there is
+    # no --wifi exception here because no build of this dashcam has ever had
+    # a reason to speak Bluetooth. Ordered after bluetooth.service so this
+    # speaks last: BlueZ's AutoEnable (default true since 5.51) un-blocks
+    # and powers the adapter shortly after bluetoothd starts, which is
+    # exactly the replayer the wlan side learned about the hard way. On a
+    # card built from the current config-snippet.txt the adapter does not
+    # exist at all (dtoverlay=disable-bt) and this is a no-op that proves it;
+    # the work is for cards built before that line, or hand-edited ones.
+    rfkill block bluetooth 2>/dev/null || true
+
+    # Same bounded re-assert as boot-kill, and for the same reason: winning
+    # the ordering race is not winning the write. Believe it only once the
+    # switch has stayed down for 5 straight polls (1 s), capped at 5 s.
+    # Nothing is ordered after this unit, so no part of the drive waits.
+    i=0
+    quiet=0
+    while [ "$i" -lt 25 ] && [ "$quiet" -lt 5 ]; do
+        if bt_live; then
+            rfkill block bluetooth 2>/dev/null || true
+            quiet=0
+        else
+            quiet=$((quiet + 1))
+        fi
+        sleep 0.2
+        i=$((i + 1))
+    done
+
+    if bt_live; then
+        # Reported, not fatal — the card must still record. Unlike the wlan
+        # case the panel canNOT report this: the glyph reads type wlan only,
+        # so a failed unit in the journal and this message are the only
+        # place it shows.
+        echo "rf-ctl: Bluetooth is STILL live after bt-kill — something is" >&2
+        echo "        re-asserting it (bluetoothd unmasked? adapter added" >&2
+        echo "        after this ran?) and this card is radiating" >&2
+        exit 1
+    fi
+    ;;
+
 *)
-    echo "usage: rf-ctl scan|connect|down|boot-kill" >&2
+    echo "usage: rf-ctl scan|connect|down|boot-kill|bt-kill" >&2
     exit 2
     ;;
 esac

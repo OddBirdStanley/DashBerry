@@ -40,6 +40,13 @@ no account, no companion app, and no telemetry.
   back blocked and the passphrase is gone — so the privacy default is
   still "dark", just no longer permanent. The bottom-right glyph reports
   the live radio state at a glance
+- **Bluetooth off, permanently** — nothing on the card uses BT, so it is
+  killed outright on every build, `--auth` and debug cards included: the
+  firmware never attaches the modem (`dtoverlay=disable-bt`), `bluetoothd`
+  and `hciuart` are masked, and a boot-time unit blocks the switch and says
+  so in the journal if anything brings it back. JOIN WIFI is the *only* way
+  any radio on this card comes up. Note the OLED glyph is a Wi-Fi
+  instrument — it reads the wlan switch and reports nothing about BT
 - **Minimal software** — the card carries only what recording requires;
   all heavier tooling runs on your PC and never ships in the vehicle
 

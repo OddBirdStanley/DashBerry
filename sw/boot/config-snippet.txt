@@ -29,6 +29,27 @@ dtoverlay=ssd1306,inverted
 dtoverlay=vc4-kms-v3d
 disable_splash=1
 
+# --- Bluetooth: OFF, on every card, with no exception. Nothing in
+# DashBerry has ever used BT, and a dashcam whose README says it transmits
+# nothing must not carry a radio no layer of the card asserts. Until this
+# line, none did: every RF layer here is scoped to rfkill type wlan, so
+# whether BT came up live was decided entirely by the base image.
+#
+# This is the layer that cannot be argued with — the firmware never
+# attaches the BT modem, so there is no adapter for bluetoothd to power on
+# or for a writable OS to un-block. Everything on the Linux side
+# (dashberry-btkill.service, the udev rule, the masked bluetooth.service)
+# is depth beneath it, and is what covers a card built before this line
+# existed or one whose config.txt was hand-edited.
+#
+# Safe on this build, checked rather than assumed: disable-bt frees the
+# PL011 UART and hands ttyAMA0 back to GPIO 14/15, and nothing on the card
+# wants it — the GPS puck is USB (gpsd is pinned to the /dev/gps0 symlink
+# over ttyACM), the panel is I2C, and the serial console is not enabled.
+# It also leaves hciuart failing at boot with nothing to attach, which is
+# why firstinstall masks that unit. ---
+dtoverlay=disable-bt
+
 # --- VideoCore firmware memory. The firmware-backed camera/codec contexts
 # (bcm2835-isp for the front 1080p libcamera path, bcm2835-codec for its
 # H.264 encode and the rear 720p H.264 encode; rear MJPEG decode is
