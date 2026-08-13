@@ -9,8 +9,12 @@ This file is the complete list of changes to make to a **fresh showmewebcam
 image**, so the card can be reproduced after a reflash. Without it a reflash
 silently reverts the rear camera, and the only symptom is a worse picture.
 
-Rationale for the 1080p mode choice is in PLAN.md **rev 8.1**; recording-side
-settings are in `sw/etc/dashberry.conf`.
+The rear records **1280x720@30** as of 2026-08-13, reverted from the 1920x1080@30
+that PLAN.md **rev 8.1** had selected on 2026-08-12. That survey's findings still
+stand — 1080p is the sharper mode on the centre of the frame, and 720p is the
+weakest mode the gadget offers — so the reasoning is worth reading before
+changing this back; what changed is the decision, not the evidence. Recording-side
+settings and the full trade are in `sw/etc/dashberry.conf`.
 
 Everything below is on the **FAT `/boot` partition** — put the card in any PC.
 No console or network needed.
@@ -51,7 +55,7 @@ own `gpu_mem=256` (`boot/config-snippet.txt`), which is unrelated.
 
 **Leave this file absent.** It is an *override* that does not ship; when it is
 missing the gadget uses `/etc/video_formats.txt` in the read-only rootfs, whose
-list already contains the `1920x1080` mode this project records. An override
+list already contains the `1280x720` mode this project records. An override
 **replaces the list wholesale**, so creating one can only remove modes.
 
 > ⚠ If a `video_formats.txt` exists on `/boot`, **delete it.** One was created
@@ -85,8 +89,8 @@ wedges the console wedges too. Unplug, wait 3 s, replug — the Zero is stateles
 
 ```sh
 v4l2-ctl -d /dev/video0 -C compression_quality      # matches §1
-v4l2-ctl -d /dev/video0 --list-formats-ext          # 1920x1080 present,
+v4l2-ctl -d /dev/video0 --list-formats-ext          # 1280x720 present,
                                                     # 1640x1232 absent
-cam/rear-modetest.sh /dev/video0 1080p30            # PC-side; shoots the
+cam/rear-modetest.sh /dev/video0 720p30             # PC-side; shoots the
                                                     # exact rear-rec chain
 ```

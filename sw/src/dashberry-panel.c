@@ -989,13 +989,18 @@ static int cpu_temp_c(void)
  * the only one readable at a glance, and it is the one that answers "is
  * there headroom left".
  *
- * This line exists because the rear moved to 1920x1080@30 (2026-08-12):
- * 2.25x the pixel rate of the old 720p30, through a SOFTWARE jpegdec and a
- * SOFTWARE openh264enc that between them were measured at ~1.3 cores at the
- * OLD mode. Whether the Pi 4 sustains the new one alongside front-rec is the
- * open question on that change, and nothing on the car could see it: TMP
- * shows heat AFTER the work, and the health check (segments growing) cannot
- * distinguish an encoder keeping up from one quietly dropping frames.
+ * This line was added because the rear moved to 1920x1080@30 (2026-08-12):
+ * 2.25x the pixel rate of 720p30, through a SOFTWARE jpegdec and a SOFTWARE
+ * openh264enc that between them were measured at ~1.3 cores at 720p30. The
+ * rear was REVERTED to 1280x720@30 on 2026-08-13, so that specific question
+ * is moot and the ~1.3 core figure applies directly again.
+ *
+ * The line STAYS. What made it worth adding outlives the mode it was added
+ * for: the rear's decode and encode are both software on a four-core Pi that
+ * is also running front-rec, and nothing else on the car can see headroom
+ * being spent. TMP shows heat AFTER the work, and the health check (segments
+ * growing) cannot distinguish an encoder keeping up from one quietly
+ * dropping frames.
  *
  * The counters are cumulative since boot, so the FIRST tick has no delta to
  * divide and shows ---. A failed read keeps the last figure rather than
