@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# dashberry-zero — flash and inspect the rear camera's Zero card.
+#
+# The Zero is the rear camera: a Pi Zero W + IMX219 running a DashBerry-built
+# showmewebcam that streams H.264 over UVC. It used to be a hand-modified card
+# whose changes lived only in ZERO_SETUP.md, and the failure that document
+# existed to prevent — a reflash silently reverting the rear camera, with no
+# symptom but a worse picture — is the reason this tool exists instead.
+#
+#   dashberry-zero --flash /dev/sdX [--image IMG]   write a built image
+#   dashberry-zero --check [--port DEV]             ask a plugged-in card what
+#                                                   it is and what it can do
+#
+# --check is the replacement for ZERO_SETUP.md's "Checking a card" section: it
+# answers by machine every question that document asked a human to answer by
+# hand, and it needs nothing but the USB cable.
+set -euo pipefail
+
+ME=${0##*/}
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+usage() {
+    sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+die()  { echo "$ME: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+need() { command -v "$1" >/dev/null || die "missing tool: $1"; }
+
+MODE=
+DEV=
+IMG=
+PORT=
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --flash) MODE=flash; shift; DEV=${1:-}; [ -n "$DEV" ] || die "--flash needs a device" ;;
+        --check) MODE=check ;;
+        --image) shift; IMG=${1:-}; [ -n "$IMG" ] || die "--image needs a path" ;;
+        --port)  shift; PORT=${1:-}; [ -n "$PORT" ] || die "--port needs a device" ;;
+        -h|--help) usage ;;
+        *) die "unknown option: $1 (try --help)" ;;
+    esac
+    shift
+done
+[ -n "$MODE" ] || usage 1
+
+# --------------------------------------------------------------------- check
+if [ "$MODE" = check ]; then
+    # /dev/rear-ctl is the udev name on a DashBerry Pi 4; on a laptop the card
+    # comes up as two ttyACMs and the control port is the second one. Both are
+    # tried, in that order, because the common case is a bench PC.
+    if [ -z "$PORT" ]; then
+        for cand in /dev/rear-ctl /dev/ttyACM1 /dev/ttyACM0; do
+            [ -e "$cand" ] && { PORT=$cand; break; }
+        done
+    fi
+    [ -n "$PORT" ] && [ -e "$PORT" ] || die "no control port found — plug the Zero in, or pass --port.
+  On a bench PC the card presents TWO CDC-ACM devices: the first is the login
+  console, the second is the control port. Do not confuse them — the console
+  will answer this with a login prompt and nothing will make sense."
+    [ -r "$PORT" ] && [ -w "$PORT" ] || die "cannot read/write $PORT (try sudo, or join the dialout group)"
+
+    need stty
+    info "asking $PORT"
+    stty -F "$PORT" 115200 raw -echo -echoe -echok clocal -hupcl min 0 time 20
+    exec 3<>"$PORT"
+    while read -r _junk <&3; do :; done 2>/dev/null || true
+
+    printf 'VERSION\r\n' >&3
+    if ! read -r ver <&3; then
+        die "no answer on $PORT.
+  A stock showmewebcam card cannot answer this — it has no control port at
+  all, and it streams MJPEG, which the Pi 4's pipeline will not accept.
+  Build and flash a DashBerry image: zero/build.sh"
+    fi
+    ver=${ver%$'\r'}
+    case $ver in
+        DASHBERRY-ZERO\ *) echo "  $ver" ;;
+        *) die "unexpected answer on $PORT: \"$ver\" — is this the login console rather than the control port?" ;;
+    esac
+
+    echo
+    printf 'LIST\r\n' >&3
+    while read -r line <&3; do printf '  %s\n' "${line%$'\r'}"; done
+    exec 3>&-
+    echo
+    echo "What to look for:"
+    echo "  * H.264 in --list-formats-ext, at the mode dashberry.conf records"
+    echo "    (REAR_W x REAR_H). An unadvertised mode fails v4l2src's caps"
+    echo "    request outright and the rear records NOTHING."
+    echo "  * horizontal_flip / vertical_flip present — INVERT_REAR has no"
+    echo "    other home now that the Pi 4 does not decode."
+    echo "  * video_bitrate, h264_i_period, h264_profile, auto_exposure_bias:"
+    echo "    the four rear-ctl pushes on every start of rear-rec."
+    exit 0
+fi
+
+# --------------------------------------------------------------------- flash
+[ "$(id -u)" = 0 ] || die "--flash needs root"
+for t in dd lsblk blockdev findmnt wipefs sync; do need "$t"; done
+
+if [ -z "$IMG" ]; then
+    IMG=$(ls -t "$HERE"/../zero/out/dashberry-zero-*.img.xz 2>/dev/null | head -n 1 || true)
+    [ -n "$IMG" ] || die "no image given and none built — run zero/build.sh, or pass --image"
+    info "using the newest built image: $IMG"
+fi
+[ -f "$IMG" ] || die "image not found: $IMG"
+case $IMG in
+    *.img)    DECOMP=cat ;;
+    *.img.xz) DECOMP=xz; need xz ;;
+    *) die "unrecognized image format (want .img or .img.xz): $IMG" ;;
+esac
+
+# Same three refusals as dashberry-install, for the same reason: this writes
+# to a raw block device and the only thing standing between a typo and
+# someone's laptop is this block.
+[ -b "$DEV" ] || die "$DEV is not a block device"
+devname=$(basename "$(readlink -f "$DEV")")
+[ -e "/sys/block/$devname" ] || die "$DEV looks like a partition, use the whole disk"
+rootsrc=$(findmnt -no SOURCE / 2>/dev/null || true)
+rootdisk=$(lsblk -no PKNAME "$rootsrc" 2>/dev/null | head -n1 || true)
+[ "$rootdisk" != "$devname" ] || die "refusing: $DEV holds the running system"
+lsblk -no MOUNTPOINT "$DEV" 2>/dev/null | grep -q . && die "$DEV has mounted partitions"
+
+MANIFEST=${IMG%.img.xz}.manifest; MANIFEST=${MANIFEST%.img}.manifest
+echo
+echo "  DashBerry Zero — REAR CAMERA CARD"
+echo "    image : ${IMG##*/}"
+[ -f "$MANIFEST" ] && sed 's/^/    /' "$MANIFEST"
+echo "    device: $DEV ($(lsblk -dno MODEL,SIZE "$DEV" | tr -s ' '))"
+echo
+echo "    ALL DATA ON $DEV WILL BE ERASED."
+echo
+printf 'Type the device path (%s) to continue: ' "$DEV"
+read -r answer
+[ "$answer" = "$DEV" ] || die "aborted"
+
+info "wiping old signatures"
+while read -r part; do [ -b "$part" ] && wipefs -a -q "$part"; done \
+    < <(lsblk -nro TYPE,PATH "$DEV" | awk '$1 == "part" {print $2}')
+wipefs -a -q "$DEV"
+
+info "writing"
+case $DECOMP in
+    cat) dd if="$IMG" of="$DEV" bs=4M conv=fsync status=progress ;;
+    xz)  xz -dc "$IMG" | dd of="$DEV" bs=4M conv=fsync status=progress ;;
+esac
+sync
+blockdev --rereadpt "$DEV" 2>/dev/null || true
+
+echo
+info "done"
+echo "Next:"
+echo "  1. Put the card in the Zero and plug the Zero into a PC."
+echo "  2. sudo $ME --check      — it should answer DASHBERRY-ZERO."
+echo "  3. Shoot the modes and LOOK at them before choosing one:"
+echo "       cam/rear-modetest.sh"
+echo "  4. Only then put it in the car."

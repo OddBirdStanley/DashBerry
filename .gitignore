@@ -1,8 +1,12 @@
 __pycache__/
 *.md
 !/README.md
-# ZERO_SETUP.md is the record of the rear Zero's card, which this tree does
-# not build and cannot reconstruct. Losing it means a reflash silently
-# reverts the rear camera with no symptom but a worse picture.
-!/ZERO_SETUP.md
+# zero/README.md documents the rear Zero's image — which this tree DOES build
+# now (zero/build.sh), replacing the old hand-modification checklist in
+# ZERO_SETUP.md. Tracked for the same reason that file was: losing it means a
+# reflash silently reverts the rear camera with no symptom but a worse picture.
+!/zero/README.md
 /*.txt
+# Build products of zero/build.sh: a showmewebcam checkout and a card image.
+/zero/work/
+/zero/out/

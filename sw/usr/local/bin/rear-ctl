@@ -1,0 +1,132 @@
+#!/bin/sh
+# rear-ctl — push this box's rear-camera settings to the Zero, then prove they
+# took. Runs as rear-rec.service's ExecStartPre. `rear-ctl check` is the
+# human-facing mode: it prints the card's version and its whole control
+# surface, and changes nothing.
+#
+# WHY THIS EXISTS
+# ---------------
+# The Zero encodes now (see rear-rec), so the settings that used to be
+# gstreamer element properties on this box are v4l2 controls on that one.
+# They must NOT become Zero-card settings: the card is built by zero/build.sh
+# and is IDENTICAL on every unit, deliberately, because the failure this
+# project kept hitting is a reflash silently reverting the rear camera with no
+# symptom but a worse picture. So the Pi 4 keeps owning them —
+# dashberry-install writes them into /etc/dashberry.conf exactly as before —
+# and this script carries them across the cable.
+#
+# The four rules it exists to obey:
+#
+#  1. RE-APPLY ON EVERY ENUMERATION. The Zero is stateless across replug:
+#     everything pushed here dies when it re-enumerates. Hence ExecStartPre
+#     rather than a boot-time push — it re-runs on every start of rear-rec,
+#     and rear-rec's Restart=always is already the project's replug strategy
+#     (the device node goes away, v4l2src dies, systemd starts us again).
+#  2. ORDER: enumerate → push → verify → start capture. Some of these cannot
+#     be changed once the encoder is running — video_bitrate and the flips in
+#     particular — so this has to finish before rear-rec opens the device.
+#  3. VERIFY BY READ-BACK AND FAULT ON MISMATCH. The failure mode is silent:
+#     wrong settings, no error, no symptom but a worse picture, discovered
+#     weeks later on footage that matters. Every SET is read back and
+#     compared; a mismatch exits nonzero, rear-rec never starts, and REAR
+#     faults on PAGE 0 through the same path a missing camera already takes.
+#  4. FAULT ON THE WRONG IMAGE. A stock showmewebcam card answers nothing here
+#     and would otherwise stream MJPEG into a pipeline expecting H.264, which
+#     fails as a caps negotiation error nobody can read. VERSION is checked
+#     first and names the problem.
+set -eu
+. /etc/dashberry.conf
+
+DEV=${REAR_CTL_DEV:-/dev/rear-ctl}
+MODE=${1:-push}
+
+[ -e "$DEV" ] || { echo "rear-ctl: $DEV not present yet" >&2; exit 1; }
+
+# min 0 time 20 = read(2) returns after at most 2 s with whatever arrived, so
+# a wedged or stock Zero costs two seconds per command instead of hanging the
+# boot. clocal/-hupcl keep the line up across our own open/close.
+stty -F "$DEV" 115200 raw -echo -echoe -echok clocal -hupcl min 0 time 20
+
+exec 3<>"$DEV"
+
+# Drain anything the port was mid-sentence on (a previous run's reply, the
+# daemon's banner) so a response cannot be attributed to the wrong command.
+while read -r _junk <&3; do :; done 2>/dev/null || true
+
+ask() {                            # $* = command → reply on stdout, nonzero on no reply
+    printf '%s\r\n' "$*" >&3
+    if read -r _reply <&3; then
+        printf '%s\n' "${_reply%$(printf '\r')}"
+    else
+        return 1
+    fi
+}
+
+fail() { echo "rear-ctl: $*" >&2; exit 1; }
+
+# --- 1. the card is ours -------------------------------------------------
+VER=$(ask VERSION) || fail "no answer on $DEV — is this a DashBerry Zero image? (zero/README.md)"
+case $VER in
+    DASHBERRY-ZERO\ *) ;;
+    *) fail "unexpected card on $DEV: \"$VER\" — expected a DASHBERRY-ZERO image" ;;
+esac
+
+if [ "$MODE" = check ]; then       # human mode: what is on the other end
+    echo "$VER"
+    printf 'LIST\r\n' >&3
+    while read -r line <&3; do printf '%s\n' "${line%$(printf '\r')}"; done
+    exit 0
+fi
+
+# --- 2. what to push -----------------------------------------------------
+# INVERT_REAR names the axes this camera's MOUNTING has to be corrected on —
+# v = it is upside down, h = its image arrives mirrored, "v,h" = both, empty =
+# neither. dashberry-install validated and normalized it (it is the last place
+# a human is present to read an error); the recorders still announce rather
+# than silently drop an axis they cannot parse, because a typo here otherwise
+# costs a whole drive's footage.
+#
+# This is where the front and rear finally agree: both flip AT CAPTURE, in the
+# ISP, for free. The rear used to pay a full-frame videoflip copy per frame on
+# the Pi 4 for the same result.
+V=0 H=0
+for axis in $(printf '%s' "${INVERT_REAR:-}" | tr ',' ' ' | tr '[:upper:]' '[:lower:]'); do
+    case $axis in
+    v) V=1 ;;
+    h) H=1 ;;
+    *) echo "rear-ctl: ignoring unknown INVERT_REAR axis '$axis'" >&2 ;;
+    esac
+done
+
+# name value pairs, pushed in this order. Encoder controls before flips: the
+# flips are the ones most likely to need the stream down, so they go last and
+# closest to rear-rec's open.
+set -- \
+    video_bitrate           "$REAR_BITRATE" \
+    h264_i_period           "${REAR_GOP:-27}" \
+    h264_profile            "${REAR_PROFILE:-high}" \
+    repeat_sequence_header  1 \
+    auto_exposure_bias      "${REAR_EXPOSURE_BIAS:-12}" \
+    horizontal_flip         "$H" \
+    vertical_flip           "$V"
+
+# --- 3. push, then read back ---------------------------------------------
+while [ $# -gt 0 ]; do
+    name=$1 want=$2; shift 2
+    r=$(ask "SET $name $want") || fail "no answer setting $name"
+    case $r in
+        OK*) ;;
+        *) fail "SET $name $want rejected: $r" ;;
+    esac
+    got=$(ask "GET $name") || fail "no answer reading back $name"
+    [ "$got" = "$want" ] || fail "$name read back as \"$got\", wanted \"$want\""
+done
+
+r=$(ask APPLY) || fail "no answer to APPLY"
+case $r in
+    OK*) ;;
+    *) fail "APPLY rejected: $r" ;;
+esac
+
+echo "rear-ctl: $VER — pushed and verified"
+exec 3>&-

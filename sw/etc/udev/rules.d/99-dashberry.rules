@@ -6,6 +6,18 @@
 # The index match keeps the symlink on the capture node (UVC exposes two).
 SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0104", ATTR{index}=="0", SYMLINK+="rear-cam"
 
+# Stable name for the DashBerry Zero's CONTROL port — the second CDC-ACM
+# function on the same gadget and the same cable, where rear-ctl pushes the
+# flips, bitrate, GOP and exposure bias this box owns. The FIRST ACM function
+# is the debug console (zero/README.md keeps it deliberately), so the two must
+# never be confused: the control port answers VERSION, the console answers a
+# login prompt, and a rear-ctl aimed at the console would hang on both.
+# They are told apart by USB interface number, which is fixed by the order
+# multi-gadget.sh links the functions into the config.
+# To confirm on a card: `dashberry-zero --check`, or
+#   udevadm info -q property -n /dev/ttyACM0 | grep ID_USB_INTERFACE_NUM
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0104", ENV{ID_USB_INTERFACE_NUM}=="04", SYMLINK+="rear-ctl"
+
 # Stable name for the u-blox GPS puck. A replug re-enumerates ttyACM0 ->
 # ttyACM1, so the raw node must never be pinned anywhere — GPS_DEV in
 # dashberry.conf (and through it /etc/default/gpsd) points at this symlink.

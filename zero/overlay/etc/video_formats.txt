@@ -1,0 +1,51 @@
+# DashBerry Zero — the modes this gadget advertises to the host.
+#
+# THIS IS BOOTSTRAP, AND IT IS THE ONE THING THAT CANNOT MOVE TO THE PI 4.
+# multi-gadget.sh reads this at gadget-construction time, before any host
+# exists to be asked. Everything else the Pi 4 owns and pushes at runtime
+# (see rear-ctld) — this file, the streaming format, and the gadget itself are
+# the whole of what is irreducibly Zero-side.
+#
+# An entry here is a PROMISE to everything that enumerates the device, and the
+# Pi 4's v4l2src caps request fails outright against a mode that is missing —
+# rear-rec exits, systemd restarts it, no segments, REAR faults on PAGE 0.
+#
+# h264 is the format that made this whole image necessary: the Pi 4 cannot
+# software-encode any of these at 30 fps (INVESTIGATE-REAR-ENCODE.md), and the
+# VideoCore here does 1080p30 in hardware while spending ~1 MB/s of USB
+# instead of MJPEG's ~48.
+# Comments are on their own lines throughout: multi-gadget.sh reads these as
+# whitespace-separated fields and nothing here should depend on it ignoring a
+# trailing one.
+#
+# sensor mode 5, 2x2-binned FULL field, 16:9. Production as it stands
+# (dashberry.conf REAR_W/REAR_H).
+h264  1640  922
+# sensor mode 1, unbinned CROP: 2x the detail per degree, 41.5% less
+# horizontal field. Reverted 2026-08-12 only because the PI 4 could not encode
+# it — that objection died with this image.
+h264  1920 1080
+# Kept for bench comparison. Not a production candidate: binned, downscaled,
+# AND below bcm2835-v4l2's 1280x720 port threshold, which routes it down the
+# driver's poor path.
+h264  1280  720
+
+# MJPEG, kept deliberately: it is the diagnostic fallback and the format any
+# non-DashBerry host (a laptop, a browser, ffplay) can read without knowing
+# anything about this project. cam/rear-modetest.sh still shoots it.
+mjpeg 1640  922
+mjpeg 1280  720
+
+# --- NOT ADVERTISED, and why -------------------------------------------
+# 1640x1232@30 — the full 4:3 field, the widest this lens gives, and the mode
+#   worth having. Under MJPEG it HUNG the entire gadget: camera and console
+#   both, until a power cycle, which on the car a Pi 4 reboot cannot deliver
+#   (both boards share the 12 V injection). The theory is that ~48 Mbps of
+#   MJPEG plus the encode was what the Zero could not sustain, and that H.264
+#   at ~1 MB/s lifts it. THAT IS ARITHMETIC, NOT A MEASUREMENT. Test it on the
+#   BENCH, with the card in a PC and nothing depending on it, before adding
+#   the line — and if the hang is the sensor readout rather than the
+#   bandwidth, it stays banned.
+# 2048x1152, 2560x1440 — hang the gadget too. The Zero cannot sustain the
+#   unbinned 3280x2464 readout plus an ISP downscale, which H.264 does nothing
+#   about.
