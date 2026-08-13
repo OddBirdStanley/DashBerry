@@ -101,6 +101,28 @@ echo "  showmewebcam @ $REF = $(git -C "$SMW_DIR" rev-parse --short HEAD)"
 step "DashBerry edits"
 "$HERE/edits.sh" "$SMW_DIR"
 
+# --- 2021-era buildroot on a 2026 host --------------------------------------
+# showmewebcam pins buildroot 2021.02.8. Its package versions are frozen there,
+# but the HOST tools are whatever this laptop has, and the two have drifted
+# five years apart. Each mismatch gets a narrow, named workaround here rather
+# than a blanket "disable the check", so that when the durable fix lands — a
+# buildroot bump to a recent LTS — it is obvious what can be deleted.
+#
+# CMake >= 4.0 removed compatibility with projects declaring a policy minimum
+# below 3.5. lzo 2.10 (host-lzo, pulled in by host-squashfs for the squashfs
+# rootfs) is one such project, and buildroot 2021.02 has no newer lzo to offer.
+# CMAKE_POLICY_VERSION_MINIMUM is CMake's own documented escape hatch for
+# exactly this, honoured as an environment variable since 3.31 — it makes the
+# old declaration read as 3.5 without touching any package source.
+if command -v cmake >/dev/null; then
+    CMAKE_MAJOR=$(cmake --version | sed -n '1s/.*version \([0-9]*\).*/\1/p')
+    if [ "${CMAKE_MAJOR:-0}" -ge 4 ]; then
+        export CMAKE_POLICY_VERSION_MINIMUM=3.5
+        echo "  cmake $CMAKE_MAJOR.x: exporting CMAKE_POLICY_VERSION_MINIMUM=3.5"
+        echo "  (buildroot 2021.02.8's lzo 2.10 predates cmake 4's policy floor)"
+    fi
+fi
+
 step "image ($BOARD)"
 [ -x "$SMW_DIR/build-showmewebcam.sh" ] || die "no build-showmewebcam.sh in $SMW_DIR — upstream's entry point moved"
 [ -f "$SMW_DIR/buildroot/Makefile" ] || die "the buildroot submodule is empty — run:
