@@ -21,6 +21,59 @@ sudo cli/dashberry-zero --check                # ask the card what it is
 the first run takes hours and several GB. `zero/work/` is kept between runs,
 so a second build is incremental. `BOARD=` defaults to `raspberrypi0w`.
 
+### Building it on your machine
+
+showmewebcam pins **buildroot 2021.02.8**, so this compiles 2021 sources with
+whatever toolchain you have. That gap is where every build failure so far has
+come from, and none of them looked like a version problem:
+
+| Host | What breaks |
+|---|---|
+| cmake ≥ 4 | dropped pre-3.5 policy minimums; buildroot's lzo 2.10 declares one |
+| gcc ≥ 14 | implicit-declaration, incompatible-pointer-types and int-conversion became errors |
+| gcc ≥ 15 | defaults to C23, where `void f()` means `void f(void)` |
+
+The gcc 14 change is the dangerous one, because it breaks **configure probes**,
+not just compiles. fakeroot decides `setgroups()`'s argument type with a probe
+that calls `puts()` without `<stdio.h>`; on a new host that probe fails for an
+unrelated reason, configure writes `#define SETGROUPS_SIZE_TYPE unknown`, and
+the build dies much later on a type that does not exist. Nothing in that chain
+mentions the compiler.
+
+**Check your host before committing to a multi-hour build:**
+
+```sh
+CHECK_HOST_ONLY=1 zero/build.sh
+```
+
+It prints your gcc/g++/cmake/make/perl/python3 versions, names any known-hostile
+one, shows the exact flags it will compensate with, and stops. Those flags are
+**probed, not assumed** — each is offered to your compiler first and dropped
+with a note if rejected, so the workaround cannot itself break a host with an
+older gcc or with clang.
+
+**Or remove the variable entirely:**
+
+```sh
+ZERO_CONTAINER=1 zero/build.sh
+```
+
+This builds inside Debian bookworm (gcc 12, cmake 3.25) — both of which predate
+every breaking change above, so **none of the workarounds fire in there**. That
+is also the test of whether the pin is still right: if the audit reports a
+workaround firing inside the container, the base image has drifted and
+`zero/Dockerfile` needs revisiting. `build.sh` recommends this path by itself
+whenever it detects a host that needs compensating.
+
+> The container path is **written but not yet exercised** — it was authored on a
+> machine whose Docker daemon was unreachable, so the image has never actually
+> been built. The Debian package names are verified to exist in bookworm; the
+> `docker build` and the build inside it are not. Try it before relying on it.
+
+Either way, the manifest beside the built image records what produced it —
+container or host, gcc version, cmake version, and the exact `HOST_CFLAGS` —
+so a card that misbehaves can be traced to the environment that built it.
+
 ---
 
 ## 1. Why the Zero encodes

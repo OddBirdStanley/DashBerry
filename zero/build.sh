@@ -70,12 +70,198 @@ die() { printf 'build.sh: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n== %s\n' "$*"; }
 
 BOARD=${BOARD:-raspberrypi0w}       # the Zero W. raspberrypi0 / raspberrypi4 also exist
+CONTAINER_TAG=${CONTAINER_TAG:-dashberry-zero-build}
+
+# --- ZERO_CONTAINER=1: build in a pinned environment ------------------------
+# The only mechanism here that ELIMINATES host drift rather than compensating
+# for it. Debian bookworm's gcc 12 and cmake 3.25 predate every breaking change
+# the audit below works around, so inside the container none of those
+# workarounds fire — which is also how you can tell the base image is still the
+# right pin.
+#
+# Everything lives under zero/, so one bind mount covers the source checkout,
+# buildroot's download cache and the output image. --user keeps the work tree
+# owned by the caller instead of root, which also satisfies buildroot's refusal
+# to run as root.
+if [ "${ZERO_CONTAINER:-0}" = 1 ]; then
+    command -v docker >/dev/null || die "ZERO_CONTAINER=1 needs docker on PATH"
+    step "container"
+    echo "  building $CONTAINER_TAG from zero/Dockerfile (cached after the first run)"
+    # Dockerfile on stdin, so the build context is EMPTY. Passing $HERE as the
+    # context would upload zero/work/ — a full showmewebcam checkout plus
+    # buildroot's download cache and output tree, several GB — on every run,
+    # for a Dockerfile that has no COPY and needs none of it.
+    docker build -t "$CONTAINER_TAG" - < "$HERE/Dockerfile" \
+        || die "could not build the build container"
+    echo "  handing off to the container; the host toolchain below is ITS toolchain"
+    exec docker run --rm -i \
+        --user "$(id -u):$(id -g)" \
+        -v "$HERE:/zero" \
+        -e "DASHBERRY_ZERO_VERSION=$VERSION" \
+        -e "BOARD=$BOARD" \
+        -e "SMW_REF=${SMW_REF:-}" \
+        -e "KERNEL_BRANCH=${KERNEL_BRANCH:-}" \
+        -e ZERO_CONTAINER=0 \
+        -e IN_CONTAINER=1 \
+        -e HOME=/tmp \
+        "$CONTAINER_TAG" /zero/build.sh
+fi
+
+
 
 # Buildroot's own dependency list is longer than this; these are just the ones
 # whose absence would fail late and confusingly.
 for t in git xz make gcc g++ bc rsync cpio unzip bzip2 perl; do
     command -v "$t" >/dev/null || die "missing tool: $t (buildroot needs a full build environment)"
 done
+
+# =========================== HOST TOOLCHAIN AUDIT ===========================
+# Everything from here to the build step exists because this tree is built by
+# other people on machines we have never seen. showmewebcam pins buildroot
+# 2021.02.8 and its 2021 package versions; the host compiler is whatever the
+# user has. Every build failure so far has come from that gap, so the rules
+# here are: probe, never assume; say what was decided and why; and offer the
+# one option that removes the variable entirely.
+
+probe_cflag() {                     # $1 = flag → 0 if the C compiler takes it
+    printf 'int main(void){return 0;}\n' > "$PROBE_C" 2>/dev/null || return 1
+    "${CC:-gcc}" "$1" -c -o /dev/null "$PROBE_C" >/dev/null 2>&1
+}
+
+version_of() {                      # $1 = tool → its version, or "absent"
+    command -v "$1" >/dev/null || { echo absent; return; }
+    case $1 in
+        gcc|g++) "$1" -dumpfullversion 2>/dev/null || "$1" -dumpversion ;;
+        cmake)   cmake --version | sed -n '1s/.*version //p' ;;
+        make)    make --version | sed -n '1s/^GNU Make //p' ;;
+        perl)    perl -e 'print $^V' 2>/dev/null | sed 's/^v//' ;;
+        python3) python3 --version 2>&1 | sed 's/^Python //' ;;
+        *)       echo present ;;
+    esac
+}
+
+major_of() { version_of "$1" | cut -d. -f1; }
+
+host_audit() {
+    GCC_MAJOR=$(major_of gcc)
+    CMAKE_MAJOR=$(major_of cmake)
+    RISKY=0
+
+    echo "  gcc      $(version_of gcc)"
+    echo "  g++      $(version_of g++)"
+    echo "  cmake    $(version_of cmake)"
+    echo "  make     $(version_of make)"
+    echo "  perl     $(version_of perl)"
+    echo "  python3  $(version_of python3)"
+
+    # Known-hostile combinations, each one a failure this tree actually hit.
+    case ${GCC_MAJOR:-0} in
+        ''|*[!0-9]*) ;;
+        *) if [ "$GCC_MAJOR" -ge 14 ]; then
+               RISKY=1
+               echo "  ! gcc $GCC_MAJOR turns implicit-declaration, incompatible-pointer-types"
+               echo "    and int-conversion into ERRORS, and (from 15) defaults to C23."
+               echo "    2021 sources trip all of these; flags below compensate."
+           fi ;;
+    esac
+    case ${CMAKE_MAJOR:-0} in
+        ''|*[!0-9]*) ;;
+        *) if [ "$CMAKE_MAJOR" -ge 4 ]; then
+               RISKY=1
+               echo "  ! cmake $CMAKE_MAJOR dropped compatibility with pre-3.5 policy"
+               echo "    minimums, which buildroot 2021.02's lzo 2.10 declares."
+           fi ;;
+    esac
+    if [ "${GCC_MAJOR:-0}" -ge 16 ] 2>/dev/null; then
+        echo "  ! gcc $GCC_MAJOR is NEWER than anything this has been run against."
+        echo "    Workarounds here were written for 14 and 15. If the build fails"
+        echo "    on a diagnostic that is not in the list below, that is why."
+    fi
+    return $RISKY
+}
+
+# --- the flags, probed rather than assumed ---------------------------------
+# gcc 14 and 15 turned four long-standing warnings into errors, and code from
+# 2019-2021 trips all of them:
+#
+#   implicit-function-declaration   an error since gcc 14, in EVERY -std mode
+#   incompatible-pointer-types      an error since gcc 14
+#   int-conversion                  an error since gcc 14
+#   `void f()` means `void f(void)`  gcc 15 defaults to -std=gnu23
+#
+# Both halves are needed and both were measured: squashfs-tools 4.4 will not
+# compile without the dialect flag, and fakeroot 1.25.3's CONFIGURE fails
+# without the -Wno-error ones — its probe for setgroups()'s argument type calls
+# puts() without <stdio.h>, so under gcc 15 it fails for an unrelated reason,
+# configure writes `#define SETGROUPS_SIZE_TYPE unknown`, and the build dies
+# much later on a type that does not exist. Any autoconf probe of that shape is
+# silently wrong on a new host, which is why these are global.
+#
+# EVERY FLAG IS PROBED. -std=gnu17 needs gcc >= 8, and a user on an older
+# distro (or on clang) must not have their build broken BY the workaround. A
+# flag the compiler rejects is dropped and reported, not passed and hoped for.
+select_host_cflags() {
+    local candidate keep=""
+    for candidate in -std=gnu17 \
+                     -Wno-error=implicit-function-declaration \
+                     -Wno-error=incompatible-pointer-types \
+                     -Wno-error=int-conversion; do
+        if probe_cflag "$candidate"; then
+            keep="$keep $candidate"
+        else
+            echo "  - $candidate rejected by this compiler, dropped"
+        fi
+    done
+    printf '%s' "$keep"
+}
+
+step "host toolchain"
+PROBE_C=$(mktemp --suffix=.c) || die "cannot create a temp file"
+trap 'rm -f "$PROBE_C"' EXIT
+
+host_audit || HOST_IS_RISKY=1
+: "${HOST_IS_RISKY:=0}"
+
+# The container is the real answer to host drift; recommend it exactly when
+# this host is one of the ones known to need workarounds.
+if [ "${ZERO_CONTAINER:-0}" != 1 ] && [ "$HOST_IS_RISKY" = 1 ]; then
+    if command -v docker >/dev/null; then
+        echo
+        echo "  This host needs compatibility workarounds (applied below, and each"
+        echo "  one is verified). To build in a pinned environment that needs NONE"
+        echo "  of them — Debian bookworm, gcc 12, cmake 3.25 — re-run as:"
+        echo "      ZERO_CONTAINER=1 $0"
+    else
+        echo
+        echo "  This host needs compatibility workarounds (applied below). Docker is"
+        echo "  not installed; with it, ZERO_CONTAINER=1 would build in a pinned"
+        echo "  environment needing none of them. See zero/Dockerfile."
+    fi
+fi
+
+HOST_CFLAGS_EXTRA=$(select_host_cflags)
+export HOST_CFLAGS="-O2$HOST_CFLAGS_EXTRA"
+echo "  HOST_CFLAGS=$HOST_CFLAGS"
+# buildroot's package/Makefile.in declares HOST_CFLAGS with `?=`, so the
+# environment wins and its own `+= $(HOST_CPPFLAGS)` still appends the include
+# path. pkg-cmake.mk passes it through as -DCMAKE_C_FLAGS, so cmake host
+# packages are covered too (checked, not assumed).
+#
+# The cost of setting this globally: buildroot does HOST_CXXFLAGS +=
+# HOST_CFLAGS, so C++ host packages see a C-only dialect flag and warn once per
+# compile. Noise, not breakage — g++ warns and exits 0.
+
+# CMake >= 4.0 removed compatibility with projects declaring a policy minimum
+# below 3.5. lzo 2.10 (host-lzo, pulled in by host-squashfs for the squashfs
+# rootfs) is one such project, and buildroot 2021.02 has no newer lzo to offer.
+# CMAKE_POLICY_VERSION_MINIMUM is CMake's own documented escape hatch, honoured
+# as an environment variable since 3.31.
+if [ "${CMAKE_MAJOR:-0}" -ge 4 ] 2>/dev/null; then
+    export CMAKE_POLICY_VERSION_MINIMUM=3.5
+    echo "  CMAKE_POLICY_VERSION_MINIMUM=3.5"
+fi
+
+[ "${CHECK_HOST_ONLY:-0}" = 1 ] && { echo; echo "host check only — stopping here."; exit 0; }
 
 step "sources"
 if [ -d "$SMW_DIR/.git" ]; then
@@ -118,51 +304,6 @@ step "DashBerry edits"
 # CMAKE_POLICY_VERSION_MINIMUM is CMake's own documented escape hatch for
 # exactly this, honoured as an environment variable since 3.31 — it makes the
 # old declaration read as 3.5 without touching any package source.
-# --- gcc: compile 2021 sources in the dialect they were written for --------
-# gcc 14 and 15 turned four long-standing warnings into errors by default, and
-# code from 2019-2021 trips all of them:
-#
-#   implicit-function-declaration   an error since gcc 14, in EVERY -std mode
-#   incompatible-pointer-types      an error since gcc 14
-#   int-conversion                  an error since gcc 14
-#   `void f()` means `void f(void)`  gcc 15 defaults to -std=gnu23
-#
-# The last needs -std=gnu17; the first three need -Wno-error, because gcc
-# promoted them regardless of dialect. BOTH are required, measured rather than
-# assumed: squashfs-tools 4.4 will not compile without the dialect flag, and
-# fakeroot 1.25.3's CONFIGURE fails without the -Wno-error one.
-#
-# That second failure is the nastier shape. fakeroot works out the first
-# argument type of setgroups() by compiling a probe that calls puts() without
-# including <stdio.h>. Under gcc 15 the probe fails for that unrelated reason,
-# configure concludes the type is `unknown`, writes
-# `#define SETGROUPS_SIZE_TYPE unknown` into config.h, and the build dies much
-# later on a nonsense type name. ANY autoconf probe of that shape is silently
-# wrong on this host, which is why this is not a per-package fix.
-#
-# Global, where the earlier policy in this file was one narrow fix per package:
-# three have now failed this way (host-lzo via cmake, host-squashfs,
-# host-fakeroot), and a configure probe that fails does not even announce
-# itself as a compiler problem. The cost is that buildroot does
-# HOST_CXXFLAGS += HOST_CFLAGS, so C++ host packages warn "valid for C but not
-# for C++" once per compile — noise, not breakage (checked: g++ warns, exits
-# 0). This is the point this file already named as where a buildroot bump
-# becomes the better answer; it is deferred, not forgotten.
-#
-# HOST_CFLAGS is `?=` in buildroot's package/Makefile.in, so the environment
-# wins and buildroot's own `+= $(HOST_CPPFLAGS)` still appends the include path.
-export HOST_CFLAGS="-O2 -std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion"
-echo "  gcc $(gcc -dumpversion): HOST_CFLAGS pinned to -std=gnu17 + 3 -Wno-error"
-
-if command -v cmake >/dev/null; then
-    CMAKE_MAJOR=$(cmake --version | sed -n '1s/.*version \([0-9]*\).*/\1/p')
-    if [ "${CMAKE_MAJOR:-0}" -ge 4 ]; then
-        export CMAKE_POLICY_VERSION_MINIMUM=3.5
-        echo "  cmake $CMAKE_MAJOR.x: exporting CMAKE_POLICY_VERSION_MINIMUM=3.5"
-        echo "  (buildroot 2021.02.8's lzo 2.10 predates cmake 4's policy floor)"
-    fi
-fi
-
 step "image ($BOARD)"
 [ -x "$SMW_DIR/build-showmewebcam.sh" ] || die "no build-showmewebcam.sh in $SMW_DIR — upstream's entry point moved"
 [ -f "$SMW_DIR/buildroot/Makefile" ] || die "the buildroot submodule is empty — run:
@@ -183,6 +324,10 @@ built          $(date -u +%Y-%m-%dT%H:%M:%SZ)
 showmewebcam   $REF = $(git -C "$SMW_DIR" rev-parse HEAD)
 board          $BOARD
 kernel         ${KERNEL_BRANCH:-rpi-6.16.y} @ $(cat "$SMW_DIR/.dashberry-kernel-sha" 2>/dev/null || echo '?')
+built by       $([ "${IN_CONTAINER:-0}" = 1 ] && echo "container ($CONTAINER_TAG)" || echo "host")
+host gcc       $(version_of gcc)
+host cmake     $(version_of cmake)
+host cflags    $HOST_CFLAGS
 image          $(basename "$DEST").xz
 sha256         $(sha256sum "$DEST.xz" | cut -d' ' -f1)
 EOF
