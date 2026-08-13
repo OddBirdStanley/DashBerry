@@ -446,7 +446,46 @@ open(p, 'w').write(s)
 PY2
 }
 
+# ---------------------------------------------------------------------------
+# 7. Download sites — a 2021 buildroot points at tarballs that have moved.
+#
+# buildroot 2021.02.8 pins package versions from five years ago and fetches
+# each from its upstream's own site. Plenty of those upstreams keep only the
+# CURRENT release: libzlib wants zlib-1.2.11.tar.xz from http://www.zlib.net,
+# which does not serve it any more — the fetch does not 404, it hangs, and
+# `wget -t 3` hangs three times before buildroot even tries its backup site.
+#
+# BR2_PRIMARY_SITE makes buildroot try a mirror FIRST. sources.buildroot.net
+# is buildroot's own archive and carries every tarball it has ever referenced,
+# so this fixes zlib and pre-empts every other vanished-tarball case in the
+# same build rather than one at a time.
+#
+# This is not a trust shortcut: every package carries a .hash file (libzlib's
+# pins sha256 4ff94144…) and buildroot verifies the tarball against it no
+# matter where it came from. The mirror changes WHERE the bytes come from, not
+# whether they are checked.
+#
+# BR2_PRIMARY_SITE_ONLY is deliberately NOT set: if the mirror is ever down,
+# falling through to upstream is better than failing.
+# ---------------------------------------------------------------------------
+patch_download_sites() {
+    if grep -q '^BR2_PRIMARY_SITE=' "$CFG"; then
+        say "download mirror already set — left alone"
+    else
+        say "downloads → sources.buildroot.net first (upstreams have moved on)"
+        printf '%s\n' 'BR2_PRIMARY_SITE="https://sources.buildroot.net"' >> "$CFG"
+    fi
+    # And so a site that is genuinely dead fails in seconds instead of
+    # stalling the build: the default is `wget --passive-ftp -nd -t 3` with no
+    # timeout at all, which is how a single moved tarball costs an afternoon.
+    if ! grep -q '^BR2_WGET=' "$CFG"; then
+        say "  wget → 15 s connect/read timeout"
+        printf '%s\n' 'BR2_WGET="wget --passive-ftp -nd -t 3 -T 15"' >> "$CFG"
+    fi
+}
+
 echo "edits.sh: patching ${SMW}"
+patch_download_sites
 repin_kernel
 patch_uvc_gadget
 patch_multi_gadget
