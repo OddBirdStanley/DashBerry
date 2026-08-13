@@ -38,8 +38,26 @@ OUT=${OUT:-$HERE/out}
 WORK=${WORK:-$HERE/work}
 
 SMW_REPO=${SMW_REPO:-https://github.com/showmewebcam/showmewebcam.git}
-SMW_REF=${SMW_REF:-main}            # pin this the moment a build succeeds
 SMW_DIR=${SMW_DIR:-$WORK/showmewebcam}
+
+# SMW_REF empty = whatever the remote calls its default branch. Not hardcoded:
+# upstream's is `master`, and guessing `main` cost a build. Set it to pin —
+# `v1.91` is the newest tag at the time of writing, and pinning to a tag or a
+# sha is what makes a card reproducible. Do that the moment a build succeeds.
+SMW_REF=${SMW_REF:-}
+
+resolve_ref() {                     # → the ref to check out
+    [ -n "$SMW_REF" ] && { printf '%s\n' "$SMW_REF"; return; }
+    local head
+    head=$(git -C "$SMW_DIR" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || true
+    if [ -z "$head" ]; then
+        # A clone made with --depth, or an older git, may not have set it.
+        git -C "$SMW_DIR" remote set-head origin -a >/dev/null 2>&1 || true
+        head=$(git -C "$SMW_DIR" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || true
+    fi
+    [ -n "$head" ] || die "cannot work out $SMW_REPO's default branch — pass SMW_REF=<branch|tag|sha>"
+    printf '%s\n' "${head#origin/}"
+}
 
 VERSION=${DASHBERRY_ZERO_VERSION:-$(git -C "$HERE/.." rev-parse --short HEAD 2>/dev/null || echo dev)}
 export DASHBERRY_ZERO_VERSION=$VERSION
@@ -49,21 +67,26 @@ step() { printf '\n== %s\n' "$*"; }
 
 for t in git docker xz; do command -v "$t" >/dev/null || die "missing tool: $t"; done
 
-step "sources ($SMW_REF)"
+step "sources"
 if [ -d "$SMW_DIR/.git" ]; then
     echo "  reusing $SMW_DIR"
     # A rebuild must not stack our edits on top of the last run's edits: every
     # change edits.sh makes is idempotent by intent, but "by intent" is not a
-    # guarantee worth a silently wrong card.
+    # guarantee worth a silently wrong card. `output` is buildroot's build
+    # tree — kept, because rebuilding it from scratch costs an hour.
     git -C "$SMW_DIR" reset --hard >/dev/null
     git -C "$SMW_DIR" clean -fdx -e output >/dev/null
-    git -C "$SMW_DIR" checkout -q "$SMW_REF"
 else
     mkdir -p "$WORK"
     git clone --recurse-submodules "$SMW_REPO" "$SMW_DIR"
-    git -C "$SMW_DIR" checkout -q "$SMW_REF"
 fi
-echo "  showmewebcam @ $(git -C "$SMW_DIR" rev-parse --short HEAD)"
+REF=$(resolve_ref)
+[ -n "$SMW_REF" ] || echo "  no SMW_REF set — using the remote default ($REF)"
+git -C "$SMW_DIR" checkout -q "$REF" 2>/dev/null \
+    || die "no such ref in $SMW_REPO: $REF
+  Branches and tags it does have:
+$(git -C "$SMW_DIR" branch -r --format='    %(refname:short)'; git -C "$SMW_DIR" tag | tail -n 5 | sed 's/^/    /')"
+echo "  showmewebcam @ $REF = $(git -C "$SMW_DIR" rev-parse --short HEAD)"
 
 step "DashBerry edits"
 "$HERE/edits.sh" "$SMW_DIR"
@@ -89,7 +112,7 @@ xz -T0 -f "$DEST"
 cat > "$OUT/dashberry-zero-$VERSION.manifest" <<EOF
 version        $VERSION
 built          $(date -u +%Y-%m-%dT%H:%M:%SZ)
-showmewebcam   $(git -C "$SMW_DIR" rev-parse HEAD)
+showmewebcam   $REF = $(git -C "$SMW_DIR" rev-parse HEAD)
 kernel branch  ${KERNEL_BRANCH:-rpi-6.16.y}
 image          $(basename "$DEST").xz
 sha256         $(sha256sum "$DEST.xz" | cut -d' ' -f1)
