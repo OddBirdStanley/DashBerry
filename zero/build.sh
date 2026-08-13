@@ -28,6 +28,10 @@
 # and the first run takes hours and several GB. Nothing about that is ours to
 # speed up, but `work/` is kept between runs so a second build is incremental.
 #
+# Run `CHECK_HOST_ONLY=1 zero/build.sh` first: it audits this machine's
+# toolchain against what buildroot 2021.02 expects and stops, which is seconds
+# rather than the hour it would otherwise take to find out.
+#
 # THE PART THAT IS NOT SETTLED
 # The kernel repin (5.10.11 → rpi-6.16.y) is the risk in this build, and it is
 # unproven at the time of writing: showmewebcam's buildroot pin predates 6.x
@@ -70,45 +74,6 @@ die() { printf 'build.sh: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n== %s\n' "$*"; }
 
 BOARD=${BOARD:-raspberrypi0w}       # the Zero W. raspberrypi0 / raspberrypi4 also exist
-CONTAINER_TAG=${CONTAINER_TAG:-dashberry-zero-build}
-
-# --- ZERO_CONTAINER=1: build in a pinned environment ------------------------
-# The only mechanism here that ELIMINATES host drift rather than compensating
-# for it. Debian bookworm's gcc 12 and cmake 3.25 predate every breaking change
-# the audit below works around, so inside the container none of those
-# workarounds fire — which is also how you can tell the base image is still the
-# right pin.
-#
-# Everything lives under zero/, so one bind mount covers the source checkout,
-# buildroot's download cache and the output image. --user keeps the work tree
-# owned by the caller instead of root, which also satisfies buildroot's refusal
-# to run as root.
-if [ "${ZERO_CONTAINER:-0}" = 1 ]; then
-    command -v docker >/dev/null || die "ZERO_CONTAINER=1 needs docker on PATH"
-    step "container"
-    echo "  building $CONTAINER_TAG from zero/Dockerfile (cached after the first run)"
-    # Dockerfile on stdin, so the build context is EMPTY. Passing $HERE as the
-    # context would upload zero/work/ — a full showmewebcam checkout plus
-    # buildroot's download cache and output tree, several GB — on every run,
-    # for a Dockerfile that has no COPY and needs none of it.
-    docker build -t "$CONTAINER_TAG" - < "$HERE/Dockerfile" \
-        || die "could not build the build container"
-    echo "  handing off to the container; the host toolchain below is ITS toolchain"
-    exec docker run --rm -i \
-        --user "$(id -u):$(id -g)" \
-        -v "$HERE:/zero" \
-        -e "DASHBERRY_ZERO_VERSION=$VERSION" \
-        -e "BOARD=$BOARD" \
-        -e "SMW_REF=${SMW_REF:-}" \
-        -e "KERNEL_BRANCH=${KERNEL_BRANCH:-}" \
-        -e ZERO_CONTAINER=0 \
-        -e IN_CONTAINER=1 \
-        -e HOME=/tmp \
-        "$CONTAINER_TAG" /zero/build.sh
-fi
-
-
-
 # Buildroot's own dependency list is longer than this; these are just the ones
 # whose absence would fail late and confusingly.
 for t in git xz make gcc g++ bc rsync cpio unzip bzip2 perl; do
@@ -222,21 +187,13 @@ trap 'rm -f "$PROBE_C"' EXIT
 host_audit || HOST_IS_RISKY=1
 : "${HOST_IS_RISKY:=0}"
 
-# The container is the real answer to host drift; recommend it exactly when
-# this host is one of the ones known to need workarounds.
-if [ "${ZERO_CONTAINER:-0}" != 1 ] && [ "$HOST_IS_RISKY" = 1 ]; then
-    if command -v docker >/dev/null; then
-        echo
-        echo "  This host needs compatibility workarounds (applied below, and each"
-        echo "  one is verified). To build in a pinned environment that needs NONE"
-        echo "  of them — Debian bookworm, gcc 12, cmake 3.25 — re-run as:"
-        echo "      ZERO_CONTAINER=1 $0"
-    else
-        echo
-        echo "  This host needs compatibility workarounds (applied below). Docker is"
-        echo "  not installed; with it, ZERO_CONTAINER=1 would build in a pinned"
-        echo "  environment needing none of them. See zero/Dockerfile."
-    fi
+if [ "$HOST_IS_RISKY" = 1 ]; then
+    echo
+    echo "  This host needs compatibility workarounds. They are applied below and"
+    echo "  each one was verified against the package that needed it — but they"
+    echo "  are compensation, not immunity. A host whose gcc and cmake predate"
+    echo "  the changes above (Debian bookworm's gcc 12 / cmake 3.25, say) needs"
+    echo "  none of them and is the surer footing if a build fights back."
 fi
 
 HOST_CFLAGS_EXTRA=$(select_host_cflags)
@@ -324,7 +281,6 @@ built          $(date -u +%Y-%m-%dT%H:%M:%SZ)
 showmewebcam   $REF = $(git -C "$SMW_DIR" rev-parse HEAD)
 board          $BOARD
 kernel         ${KERNEL_BRANCH:-rpi-6.16.y} @ $(cat "$SMW_DIR/.dashberry-kernel-sha" 2>/dev/null || echo '?')
-built by       $([ "${IN_CONTAINER:-0}" = 1 ] && echo "container ($CONTAINER_TAG)" || echo "host")
 host gcc       $(version_of gcc)
 host cmake     $(version_of cmake)
 host cflags    $HOST_CFLAGS

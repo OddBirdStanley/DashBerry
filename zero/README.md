@@ -52,27 +52,13 @@ one, shows the exact flags it will compensate with, and stops. Those flags are
 with a note if rejected, so the workaround cannot itself break a host with an
 older gcc or with clang.
 
-**Or remove the variable entirely:**
+**If a build fights back**, the surer footing is a host whose toolchain
+predates the changes above — Debian bookworm's gcc 12 and cmake 3.25 need none
+of these workarounds at all. The workarounds are compensation, not immunity.
 
-```sh
-ZERO_CONTAINER=1 zero/build.sh
-```
-
-This builds inside Debian bookworm (gcc 12, cmake 3.25) — both of which predate
-every breaking change above, so **none of the workarounds fire in there**. That
-is also the test of whether the pin is still right: if the audit reports a
-workaround firing inside the container, the base image has drifted and
-`zero/Dockerfile` needs revisiting. `build.sh` recommends this path by itself
-whenever it detects a host that needs compensating.
-
-> The container path is **written but not yet exercised** — it was authored on a
-> machine whose Docker daemon was unreachable, so the image has never actually
-> been built. The Debian package names are verified to exist in bookworm; the
-> `docker build` and the build inside it are not. Try it before relying on it.
-
-Either way, the manifest beside the built image records what produced it —
-container or host, gcc version, cmake version, and the exact `HOST_CFLAGS` —
-so a card that misbehaves can be traced to the environment that built it.
+The manifest beside the built image records the gcc version, the cmake version
+and the exact `HOST_CFLAGS` used, so a card that misbehaves can be traced back
+to the environment that built it.
 
 ---
 
