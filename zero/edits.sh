@@ -484,45 +484,8 @@ patch_download_sites() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# 8. host-squashfs - gcc 15 will not compile squashfs-tools 4.4.
-#
-# gcc defaults to -std=gnu23 now, where `void sighandler()` means
-# `void sighandler(void)` rather than "unspecified arguments". squashfs-tools
-# 4.4 (2019) declares its signal handlers that way, so every
-# signal(SIGTERM, sighandler) becomes a hard -Wincompatible-pointer-types
-# error: void (*)(void) passed where void (*)(int) is wanted. It hits
-# mksquashfs.c, unsquashfs.c and progressbar.c.
-#
-# The fix is to compile it in the dialect it was written for. This is
-# upstream's own idiom, not an invention: SQUASHFS_BUILD_CMDS one define above
-# already passes -fgnu89-inline to the TARGET build for the same class of
-# problem.
-#
-# Scoped to this package on purpose. The global knob, HOST_CFLAGS, would work -
-# host-squashfs passes it straight through as EXTRA_CFLAGS - but buildroot
-# defines HOST_CXXFLAGS += HOST_CFLAGS, so a C-only dialect flag would reach
-# every C++ host package and warn once per compile. If a THIRD host package
-# fails this way, that trade stops being worth it and the answer is a buildroot
-# bump, not a longer list here.
-#
-# This edits the buildroot SUBMODULE, which build.sh resets before every run
-# (tracked files only - the dl/ cache survives), so it cannot stack up.
-# ---------------------------------------------------------------------------
-patch_host_squashfs() {
-    local f="$SMW/buildroot/package/squashfs/squashfs.mk"
-    anchor "$f" 'EXTRA_CFLAGS="$(HOST_CFLAGS)"' "host-squashfs's compiler flags"
-    if grep -q 'std=gnu17' "$f"; then
-        say "host-squashfs already has a dialect flag - left alone"
-        return
-    fi
-    say "host-squashfs -> -std=gnu17 (squashfs-tools 4.4 predates C23)"
-    sed -i 's|EXTRA_CFLAGS="$(HOST_CFLAGS)"|EXTRA_CFLAGS="$(HOST_CFLAGS) -std=gnu17"|' "$f"
-}
-
 echo "edits.sh: patching ${SMW}"
 patch_download_sites
-patch_host_squashfs
 repin_kernel
 patch_uvc_gadget
 patch_multi_gadget

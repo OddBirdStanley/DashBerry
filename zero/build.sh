@@ -118,6 +118,42 @@ step "DashBerry edits"
 # CMAKE_POLICY_VERSION_MINIMUM is CMake's own documented escape hatch for
 # exactly this, honoured as an environment variable since 3.31 — it makes the
 # old declaration read as 3.5 without touching any package source.
+# --- gcc: compile 2021 sources in the dialect they were written for --------
+# gcc 14 and 15 turned four long-standing warnings into errors by default, and
+# code from 2019-2021 trips all of them:
+#
+#   implicit-function-declaration   an error since gcc 14, in EVERY -std mode
+#   incompatible-pointer-types      an error since gcc 14
+#   int-conversion                  an error since gcc 14
+#   `void f()` means `void f(void)`  gcc 15 defaults to -std=gnu23
+#
+# The last needs -std=gnu17; the first three need -Wno-error, because gcc
+# promoted them regardless of dialect. BOTH are required, measured rather than
+# assumed: squashfs-tools 4.4 will not compile without the dialect flag, and
+# fakeroot 1.25.3's CONFIGURE fails without the -Wno-error one.
+#
+# That second failure is the nastier shape. fakeroot works out the first
+# argument type of setgroups() by compiling a probe that calls puts() without
+# including <stdio.h>. Under gcc 15 the probe fails for that unrelated reason,
+# configure concludes the type is `unknown`, writes
+# `#define SETGROUPS_SIZE_TYPE unknown` into config.h, and the build dies much
+# later on a nonsense type name. ANY autoconf probe of that shape is silently
+# wrong on this host, which is why this is not a per-package fix.
+#
+# Global, where the earlier policy in this file was one narrow fix per package:
+# three have now failed this way (host-lzo via cmake, host-squashfs,
+# host-fakeroot), and a configure probe that fails does not even announce
+# itself as a compiler problem. The cost is that buildroot does
+# HOST_CXXFLAGS += HOST_CFLAGS, so C++ host packages warn "valid for C but not
+# for C++" once per compile — noise, not breakage (checked: g++ warns, exits
+# 0). This is the point this file already named as where a buildroot bump
+# becomes the better answer; it is deferred, not forgotten.
+#
+# HOST_CFLAGS is `?=` in buildroot's package/Makefile.in, so the environment
+# wins and buildroot's own `+= $(HOST_CPPFLAGS)` still appends the include path.
+export HOST_CFLAGS="-O2 -std=gnu17 -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion"
+echo "  gcc $(gcc -dumpversion): HOST_CFLAGS pinned to -std=gnu17 + 3 -Wno-error"
+
 if command -v cmake >/dev/null; then
     CMAKE_MAJOR=$(cmake --version | sed -n '1s/.*version \([0-9]*\).*/\1/p')
     if [ "${CMAKE_MAJOR:-0}" -ge 4 ]; then
