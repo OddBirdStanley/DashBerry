@@ -365,20 +365,59 @@ install_overlay() {
 }
 
 # ---------------------------------------------------------------------------
-# 6. gpu_mem=256 on a 512 MB Zero W — one of the three deviations this card
-# already carried before H.264 (with advertised resolutions and USB peripheral
-# mode), tracked now instead of hand-edited onto each card.
+# 6. /boot/config.txt — the two deviations that live there.
 #
-# It CANNOT go in the rootfs overlay: /boot is a separate FAT partition built
-# by genimage from ${BINARIES_DIR}/rpi-firmware/config.txt, and fstab mounts
-# it over anything the overlay put at /boot. post-image.sh's --configure-picam
-# block is where that file is assembled, so this appends there, in the same
-# shape as the dwc2/enable_uart/boot_delay lines beside it.
+# This card carried THREE deviations from the official image before H.264 ever
+# came up: advertised resolutions (video_formats.txt, handled in the overlay),
+# USB PERIPHERAL MODE, and memory allocation. Both of the latter land in
+# config.txt, and neither can go in the rootfs overlay: /boot is a separate FAT
+# partition built by genimage from ${BINARIES_DIR}/rpi-firmware/config.txt, and
+# fstab mounts it over anything the overlay put at /boot. post-image.sh's
+# --configure-picam block is where that file is assembled, so both append
+# there, in the same shape as the enable_uart/boot_delay lines beside them.
+#
+# (a) dr_mode=peripheral. Upstream appends a BARE `dtoverlay=dwc2`, which
+#     leaves the controller in OTG mode, where the port's role is decided by
+#     the ID pin in the cable. A micro-USB converter or right-angle adapter
+#     that grounds ID — and the BOM has two of those in the rear cable run —
+#     tells the Zero to be a HOST, and it then never enumerates as a camera at
+#     all. The Zero is only ever a peripheral in this design, so saying so is
+#     both correct and deterministic: the role stops depending on which
+#     adapter is in the run.
+# (b) gpu_mem=256 on a 512 MB Zero W. The hardware encoder needs it, and it
+#     needs it MORE now than when this was an MJPEG card.
 # ---------------------------------------------------------------------------
 patch_post_image() {
     local f="$SMW/board/post-image.sh"
     anchor "$f" "--configure-picam)" "the boot config.txt assembly"
     anchor "$f" "dtoverlay=dwc2" "the picam boot-config block"
+
+    if grep -q 'dr_mode=peripheral' "$f"; then
+        say "post-image.sh already forces peripheral mode — left alone"
+    else
+        say "post-image.sh → dtoverlay=dwc2,dr_mode=peripheral"
+        # The existing guard greps ^dtoverlay=dwc2, which still matches the
+        # longer line, so this stays idempotent across rebuilds.
+        python3 - "$f" <<'PY2'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = '''			cat << __EOF__ >> "${BINARIES_DIR}/rpi-firmware/config.txt"
+dtoverlay=dwc2
+__EOF__'''
+new = '''			cat << __EOF__ >> "${BINARIES_DIR}/rpi-firmware/config.txt"
+# DashBerry: dr_mode=peripheral, not the overlay's default of otg. In OTG the
+# port's role is decided by the ID pin, so a micro-USB converter or
+# right-angle adapter that grounds ID makes the Zero try to be a HOST and it
+# never enumerates as a camera. This board is only ever a peripheral.
+dtoverlay=dwc2,dr_mode=peripheral
+__EOF__'''
+assert old in s, "post-image.sh's dwc2 append has changed shape"
+s = s.replace(old, new, 1)
+open(p, 'w').write(s)
+PY2
+    fi
+
     if grep -q 'gpu_mem=256' "$f"; then
         say "post-image.sh already sets gpu_mem — left alone"
         return

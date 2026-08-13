@@ -38,9 +38,25 @@ against its ~62. Moving the encode there deletes ~1.2 cores of Pi 4 work —
 both the decode and the encode thread — and drops USB traffic from tens of
 Mbps of MJPEG to ~1 MB/s.
 
-**This is the fourth deliberate deviation from the official image**, alongside
-the three the card already carried: advertised resolutions, USB peripheral
-mode, and memory allocation.
+**This is the fourth deliberate deviation from the official image**, and the
+build carries all four — the three the card already had were hand-edits that a
+reflash silently lost, which is the whole reason `ZERO_SETUP.md` existed:
+
+| Deviation | Where it lives now |
+|---|---|
+| Advertised resolutions | `overlay/etc/video_formats.txt` |
+| **USB peripheral mode** | `dtoverlay=dwc2,dr_mode=peripheral`, appended by `edits.sh` to `post-image.sh`'s boot-config block |
+| Memory allocation | `gpu_mem=256`, same block |
+| H.264 encode | the kernel repin + the gadget changes below |
+
+**`dr_mode=peripheral` is not cosmetic.** Upstream appends a bare
+`dtoverlay=dwc2`, which leaves the controller in **OTG**, where the port's role
+is decided by the ID pin in the cable. A micro-USB converter or right-angle
+adapter that grounds ID tells the Zero to be a *host* — and it then never
+enumerates as a camera at all, with nothing on either end saying why. The BOM
+has two such adapters in the rear cable run. This board is only ever a
+peripheral, so saying so is both correct and deterministic: the role stops
+depending on which adapter is in the run that day.
 
 ## 2. What the image contains
 
