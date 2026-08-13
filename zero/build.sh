@@ -86,6 +86,10 @@ if [ -d "$SMW_DIR/.git" ]; then
     # tree — kept, because rebuilding it from scratch costs an hour.
     git -C "$SMW_DIR" reset --hard >/dev/null
     git -C "$SMW_DIR" clean -fdx -e output >/dev/null
+    # The buildroot submodule is patched too (host-squashfs' dialect flag), and
+    # `reset --hard` above does not reach into it. Tracked files only - no
+    # clean - so buildroot's dl/ tarball cache survives between builds.
+    git -C "$SMW_DIR" submodule foreach --quiet --recursive 'git reset --hard >/dev/null' || true
 else
     mkdir -p "$WORK"
     git clone --recurse-submodules "$SMW_REPO" "$SMW_DIR"
