@@ -162,6 +162,20 @@ host_audit() {
 # much later on a type that does not exist. Any autoconf probe of that shape is
 # silently wrong on a new host, which is why these are global.
 #
+# The last two are a different case: they are not gcc changing its defaults but
+# a PACKAGE promoting warnings itself. systemd 247's meson.build carries its own
+# list — '-Werror=format=2' among them — and gcc 15's sharper format analysis
+# then flags src/core/job.c:990, a debug log line where it can prove a %s
+# argument may be null. systemd is from 2020 and gcc's analysis is from 2025, so
+# the code was never wrong against the compiler it was written for.
+#
+# That these help at all depends on meson placing environment CFLAGS AFTER a
+# project's own arguments, so ours override. Verified rather than assumed:
+# host-systemd fails without them and builds clean with them.
+# -Wno-error=format-truncation is PREEMPTIVE — same warning family, same
+# promotion, and busybox already emits truncation warnings — but nothing has
+# actually failed on it yet.
+#
 # EVERY FLAG IS PROBED. -std=gnu17 needs gcc >= 8, and a user on an older
 # distro (or on clang) must not have their build broken BY the workaround. A
 # flag the compiler rejects is dropped and reported, not passed and hoped for.
@@ -170,7 +184,9 @@ select_host_cflags() {
     for candidate in -std=gnu17 \
                      -Wno-error=implicit-function-declaration \
                      -Wno-error=incompatible-pointer-types \
-                     -Wno-error=int-conversion; do
+                     -Wno-error=int-conversion \
+                     -Wno-error=format-overflow \
+                     -Wno-error=format-truncation; do
         if probe_cflag "$candidate"; then
             keep="$keep $candidate"
         else
