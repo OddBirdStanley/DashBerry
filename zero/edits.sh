@@ -484,8 +484,41 @@ patch_download_sites() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# 9. busybox — the first casualty of the kernel repin.
+#
+# busybox 1.33.2's `tc` applet reads TCA_CBQ_*, struct tc_cbq_lssopt and
+# friends out of <linux/pkt_sched.h>. Linux removed the CBQ queueing
+# discipline and deleted those uapi definitions with it, so against the
+# rpi-6.16.y headers this image now builds on, networking/tc.c does not
+# compile at all.
+#
+# There is nothing to repair: the kernel does not implement CBQ any more, so
+# the applet would have nothing to configure even if it built. It is disabled
+# via a config fragment, which is buildroot's own hook for this
+# (BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES, empty upstream) and leaves
+# buildroot's busybox.config untouched. Upstream busybox disables tc by
+# default in later releases for the same reason.
+#
+# Expect more of this shape as the target build proceeds: this is target
+# source written against 5.10 uapi meeting 6.16 uapi, which is a different
+# problem from the host-tooling drift build.sh works around.
+# ---------------------------------------------------------------------------
+patch_busybox() {
+    local frag="board/dashberry-busybox.fragment"
+    say "busybox → disabling the tc applet (CBQ is gone from the kernel uapi)"
+    cp "$HERE/busybox.fragment" "$SMW/$frag"
+    if grep -q '^BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES=' "$CFG"; then
+        say "  a busybox fragment is already configured — appending ours"
+        sed -i "s|^BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES=\"\(.*\)\"|BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES=\"\1 \$(BR2_EXTERNAL_PICAM_PATH)/$frag\"|" "$CFG"
+    else
+        printf '%s\n' "BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES=\"\$(BR2_EXTERNAL_PICAM_PATH)/$frag\"" >> "$CFG"
+    fi
+}
+
 echo "edits.sh: patching ${SMW}"
 patch_download_sites
+patch_busybox
 repin_kernel
 patch_uvc_gadget
 patch_multi_gadget

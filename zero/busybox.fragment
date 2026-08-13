@@ -1,0 +1,24 @@
+# DashBerry busybox config fragment, merged over buildroot's default
+# busybox.config (BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES).
+#
+# CONFIG_TC — Linux traffic control (`tc`). Disabled because it does not
+# COMPILE any more, and because this card has no use for it.
+#
+# busybox 1.33.2's networking/tc.c reads TCA_CBQ_*, struct tc_cbq_lssopt,
+# struct tc_cbq_wrropt, TCF_CBQ_LSS_BOUNDED and friends out of
+# <linux/pkt_sched.h>. The CBQ queueing discipline was removed from Linux and
+# its uapi definitions went with it, so on the rpi-6.16.y headers this image
+# now builds against, every one of those identifiers is undeclared and the
+# applet fails to compile. Nothing about that is fixable from here: the kernel
+# does not implement CBQ any more, so an applet that configures it has nothing
+# to talk to even if it did build.
+#
+# This is the first failure caused by the kernel repin rather than by host
+# tooling — and it is the benign shape of it. `tc` shapes network traffic on a
+# board whose only network interface is the USB gadget it streams video over.
+# Upstream busybox reached the same conclusion independently and disables the
+# applet by default in later releases.
+#
+# If a future busybox is picked up that builds tc against modern headers, this
+# line can go; nothing else in the image depends on it being absent.
+# CONFIG_TC is not set
