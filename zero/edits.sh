@@ -418,6 +418,42 @@ open(p, 'w').write(s)
 PY2
     fi
 
+    if grep -q 'disable-wifi' "$f"; then
+        say "post-image.sh already disables the radios — left alone"
+    else
+        say "post-image.sh → dtoverlay=disable-wifi, dtoverlay=disable-bt"
+        python3 - "$f" <<'PY3'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = """		# Configure uart on 40-pin header"""
+new = """		# DashBerry: RADIO SILENCE. Disable the BCM43438 in the device
+		# tree, so the SDIO link to the Wi-Fi side and the UART to the
+		# Bluetooth side are never brought up. This is the second of
+		# three layers — the drivers are also built out of the kernel
+		# (board/linux-base.config) and no brcm firmware ships — and it
+		# is the one that keeps the hardware itself dark.
+		# Both .dtbo files ship with rpi-firmware; verified present at
+		# the pinned revision.
+		# NOTE disable-bt also frees the PL011 (ttyAMA0) for the 40-pin
+		# header, which is where BR2_TARGET_GENERIC_GETTY_PORT points.
+		# The console this project actually uses is the USB one
+		# (ttyGS0), so that is a bonus rather than a change of plan.
+		if ! grep -qE '^dtoverlay=disable-wifi' "${BINARIES_DIR}/rpi-firmware/config.txt"; then
+
+			cat << __EOF__ >> "${BINARIES_DIR}/rpi-firmware/config.txt"
+dtoverlay=disable-wifi
+dtoverlay=disable-bt
+__EOF__
+		fi
+
+		# Configure uart on 40-pin header"""
+assert old in s, "post-image.sh's picam block has changed shape"
+s = s.replace(old, new, 1)
+open(p, 'w').write(s)
+PY3
+    fi
+
     if grep -q 'gpu_mem=256' "$f"; then
         say "post-image.sh already sets gpu_mem — left alone"
         return
@@ -516,9 +552,62 @@ patch_busybox() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# 10. RADIO SILENCE — the Zero must be RF-killed, like the Pi 4 beside it.
+#
+# The Pi Zero W has a BCM43438: 2.4 GHz Wi-Fi and Bluetooth on one die. This
+# board sits in a locked car recording continuously and has exactly one
+# interface it is meant to speak on — the USB gadget. Every radio on it is
+# attack surface and battery draw for no function, and the Pi 4 half of this
+# project already boots RF-KILLED as a rule.
+#
+# Three independent layers, because "fail closed" means no single mistake
+# turns a radio back on:
+#
+#   1. the DRIVERS are not built (here). No brcmfmac, no cfg80211/mac80211, no
+#      Bluetooth stack — the code to drive the radio does not exist in the
+#      kernel, so nothing can load it, and no userspace toggle can undo it.
+#   2. the HARDWARE is disabled in the device tree (patch_post_image), so the
+#      SDIO link to the Wi-Fi side and the UART to the BT side are never
+#      brought up at all.
+#   3. no FIRMWARE ships. There is no /lib/firmware/brcm in this rootfs, so
+#      even a driver that appeared could not bring the part out of reset.
+#
+# Layer 1 is the one that cannot be argued with, and it is why this is a
+# kernel-config change rather than an rfkill service: showmewebcam has no
+# rfkill binary, and a runtime kill is a thing that can fail to run.
+# ---------------------------------------------------------------------------
+patch_kernel_config() {
+    local f="$SMW/board/linux-base.config"
+    anchor "$f" "CONFIG_BRCMFMAC" "the kernel's Wi-Fi driver selection"
+    if grep -q "DashBerry: radio silence" "$f"; then
+        say "kernel config already RF-silenced — left alone"
+        return
+    fi
+    say "kernel → Wi-Fi and Bluetooth built out entirely"
+    # The existing =m lines have to go, not just be followed by a disable:
+    # merge_config takes the LAST value, but leaving both is unreadable.
+    sed -i -E '/^CONFIG_(BRCMFMAC|BRCMUTIL|BT|BT_[A-Z0-9_]*|CFG80211|MAC80211|WLAN|RFKILL)(=| )/d' "$f"
+    cat >> "$f" <<'EOK'
+
+# DashBerry: radio silence. The BCM43438's Wi-Fi and Bluetooth are built out
+# of the kernel entirely — this board records in a locked car and speaks only
+# over its USB gadget, so both radios are pure attack surface. Disabling the
+# drivers is the layer that cannot be undone at runtime; the device tree
+# (dtoverlay=disable-wifi / disable-bt in config.txt) and the absence of any
+# brcm firmware in the rootfs are the other two.
+# CONFIG_WLAN is not set
+# CONFIG_CFG80211 is not set
+# CONFIG_MAC80211 is not set
+# CONFIG_BRCMFMAC is not set
+# CONFIG_BT is not set
+EOK
+}
+
 echo "edits.sh: patching ${SMW}"
 patch_download_sites
 patch_busybox
+patch_kernel_config
 repin_kernel
 patch_uvc_gadget
 patch_multi_gadget

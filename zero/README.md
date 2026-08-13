@@ -48,6 +48,7 @@ reflash silently lost, which is the whole reason `ZERO_SETUP.md` existed:
 | **USB peripheral mode** | `dtoverlay=dwc2,dr_mode=peripheral`, appended by `edits.sh` to `post-image.sh`'s boot-config block |
 | Memory allocation | `gpu_mem=256`, same block |
 | H.264 encode | the kernel repin + the gadget changes below |
+| **Radio silence** | Wi-Fi and Bluetooth built out of the kernel, disabled in the device tree, no firmware shipped — see below |
 
 **`dr_mode=peripheral` is not cosmetic.** Upstream appends a bare
 `dtoverlay=dwc2`, which leaves the controller in **OTG**, where the port's role
@@ -126,6 +127,44 @@ Userspace changes, all in `edits.sh` except the first:
 - **`post-image.sh`** appends `gpu_mem=256`. It cannot go in the rootfs
   overlay — `/boot` is a separate FAT partition assembled by genimage, and
   fstab mounts it over anything the overlay put there.
+
+## 2b. Radio silence
+
+The Pi Zero W has a BCM43438 — 2.4 GHz Wi-Fi and Bluetooth on one die. This
+board sits in a locked car recording continuously, and has exactly one
+interface it is meant to speak on: the USB gadget. Both radios are attack
+surface and power draw for no function, and the Pi 4 beside it already boots
+RF-KILLED as a project rule.
+
+**Three independent layers**, because fail-closed means no single mistake
+turns a radio back on:
+
+1. **The drivers are not built.** `board/linux-base.config` loses
+   `CONFIG_BRCMFMAC`, `CONFIG_CFG80211`, `CONFIG_MAC80211`, `CONFIG_BT` and the
+   whole `CONFIG_BT_*` family, and gains explicit `is not set` lines. The code
+   to drive the radio is not in the kernel, so nothing can load it and no
+   userspace toggle can undo it. This is the layer that cannot be argued with —
+   and it is why this is a kernel-config change and not an rfkill service:
+   showmewebcam ships no `rfkill` binary, and a runtime kill is a thing that
+   can fail to run.
+2. **The hardware is off in the device tree.** `dtoverlay=disable-wifi` and
+   `dtoverlay=disable-bt` in `config.txt`, so the SDIO link to the Wi-Fi side
+   and the UART to the Bluetooth side are never brought up. Both `.dtbo` files
+   ship with `rpi-firmware` — verified present at the revision buildroot pins.
+3. **No firmware ships.** There is no `/lib/firmware/brcm` in this rootfs, so
+   even a driver that somehow appeared could not bring the part out of reset.
+
+Verified by running the kernel's own `olddefconfig` over the patched config:
+the symbols stay off after dependency resolution, and `USB_CONFIGFS_F_UVC`,
+`USB_CONFIGFS_ACM` and `VIDEO_BCM2835` are untouched. (`CONFIG_WIRELESS=y`
+survives — it is the now-empty menu symbol, with no driver under it. So do
+`CONFIG_BRCM_CHAR_DRIVERS` and `CONFIG_BTREE`, which are the VideoCore drivers
+and a data structure, neither of them a radio.)
+
+One side effect worth knowing: `disable-bt` frees the PL011 (`ttyAMA0`) for
+the 40-pin header, which is where `BR2_TARGET_GENERIC_GETTY_PORT` points. The
+console this project uses is the USB one (`ttyGS0`), so that is a bonus rather
+than a change of plan.
 
 ## 3. The division of ownership
 
