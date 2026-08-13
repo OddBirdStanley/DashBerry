@@ -3,225 +3,415 @@
 #
 # Called by build.sh with the checkout directory as $1. Every change is
 # ANCHORED: it finds an exact string in upstream, fails loudly if that string
-# is not there, and only then rewrites it. Nothing here is a .patch file,
-# deliberately — a patch that fails to apply says "hunk #2 failed", while this
-# says which upstream assumption moved and what it was for.
+# is not there, and only then rewrites it. A failed anchor names the upstream
+# assumption that moved and what it was for, instead of "hunk #2 failed".
 #
-# The anchors come from a source review dated 2026-08-13
-# (INVESTIGATE-REAR-ENCODE.md §2). They are checked at BUILD time, not at
-# review time: if upstream has moved since, this stops rather than producing a
-# card that looks right and streams the wrong thing.
+# The exception is the one change that IS a patch file: uvc-gadget is fetched
+# by buildroot from a pinned git SHA rather than vendored in this checkout, so
+# there is no source here to edit. Buildroot applies package/<pkg>/*.patch to
+# the fetched source, which is the correct idiom, and the patch was generated
+# against that exact SHA rather than written by hand.
 set -euo pipefail
 
 SMW=${1:?usage: edits.sh <showmewebcam-checkout>}
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-say()  { printf '  %s\n' "$*"; }
-die()  { printf 'edits.sh: %s\n' "$*" >&2; exit 1; }
+CFG="$SMW/configs/config"                  # merged into every board defconfig
+PIWEBCAM="$SMW/package/piwebcam"
+OVERLAY="$SMW/rootfs"                      # BR2_ROOTFS_OVERLAY, applied after
+                                           # packages install, so our files win
+
+say() { printf '  %s\n' "$*"; }
+die() { printf '\nedits.sh: %s\n\n' "$*" >&2; exit 1; }
 
 # anchor <file> <fixed-string> <what-it-is-for>
 anchor() {
-    [ -f "$1" ] || die "expected file missing: $1
+    [ -f "$1" ] || die "expected file missing: ${1#"$SMW"/}
     ($3)
-    Upstream layout has changed. Re-read the file and update edits.sh."
-    grep -qF -- "$2" "$1" || die "anchor not found in $1:
-      \"$2\"
+  Upstream layout has changed. Read the tree and update edits.sh."
+    grep -qF -- "$2" "$1" || die "anchor not found in ${1#"$SMW"/}:
+    \"$2\"
     ($3)
-    Upstream has moved. Do NOT loosen this check — read the file, work out
-    what replaced it, and update edits.sh so the next build is still honest."
+  Upstream has moved. Do NOT loosen this check — read the file, work out what
+  replaced it, and update edits.sh so the next build is still honest."
 }
 
 # ---------------------------------------------------------------------------
 # 1. KERNEL — repin off 5.10.11.
 #
-# showmewebcam pins raspberrypi/linux @ 6af8ae32 = Linux 5.10.11, and in that
-# tree drivers/usb/gadget/function/uvc_configfs.c has:
+# showmewebcam fetches raspberrypi/linux as a GitHub TARBALL at
+# 6af8ae321a801a4e20183454c65eb0d23069d8ac = Linux 5.10.11, and in that tree
+# drivers/usb/gadget/function/uvc_configfs.c has:
 #
 #     static const char * const uvcg_format_names[] = { "uncompressed", "mjpeg", };
 #
 # No framebased, no H264, no guidFormat: there is no configfs directory the
 # gadget could advertise H.264 in, so the whole design is blocked on that one
 # array. Frame-based format support was accepted upstream in Sept 2024
-# (commit 7b5a5895) and reaches the RPi tree in rpi-6.13.y.
+# (commit 7b5a5895) and reaches the RPi tree at rpi-6.13.y.
 #
 # We take rpi-6.16.y, which needs NO kernel patch and still carries
 # drivers/staging/vc04_services/bcm2835-camera — the legacy MMAL driver this
-# image depends on for the sensor AND for the encoder controls
-# (video_bitrate, h264_i_period, compression_quality, auto_exposure_bias).
-# Fallback if an ARMv6 Zero W will not build or boot on it: rpi-6.12.y (the
-# protected long-term branch) plus a single backport of 7b5a5895.
+# image depends on for the sensor AND for the encoder controls (video_bitrate,
+# h264_i_period, compression_quality, auto_exposure_bias).
+#
+# The branch is resolved to a SHA here, not left as a branch name: buildroot's
+# $(call github,...) will happily fetch a moving branch, and a card you cannot
+# rebuild byte for byte is not a card you can debug.
+#
+# UNVERIFIED, and this is the risk in the whole image: no ARMv6 Zero W has
+# been built or booted on 6.16 here, board/linux-base.config was written for
+# 5.10, and showmewebcam's buildroot submodule predates 6.x host tooling.
+# Fallback: KERNEL_BRANCH=rpi-6.12.y (RPi's protected branch) plus a backport
+# of 7b5a5895.
 # ---------------------------------------------------------------------------
 KERNEL_BRANCH=${KERNEL_BRANCH:-rpi-6.16.y}
 
 repin_kernel() {
-    local cfg
-    say "kernel → $KERNEL_BRANCH"
-    mapfile -t cfg < <(grep -rl 'BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION' "$SMW" \
-                       --include='*_defconfig' --include='*.config' 2>/dev/null || true)
-    [ "${#cfg[@]}" -gt 0 ] || die "no defconfig carrying BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION.
-    Upstream may have switched to a released-tarball kernel. Read the
-    buildroot config before changing anything."
-    for f in "${cfg[@]}"; do
-        sed -i "s|^BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION=.*|BR2_LINUX_KERNEL_CUSTOM_REPO_VERSION=\"$KERNEL_BRANCH\"|" "$f"
-        say "  repinned $(basename "$f")"
-    done
+    anchor "$CFG" "BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION" "the kernel pin"
+    local old sha
+    old=$(sed -n 's/.*linux,\([0-9a-f]\{40\}\)).*/\1/p' "$CFG" | head -n 1)
+    [ -n "$old" ] || die "cannot read the current kernel SHA out of configs/config.
+  Upstream may have switched away from \$(call github,raspberrypi,linux,SHA)."
 
-    # showmewebcam's own kernel patches are written against 5.10 and will not
-    # apply. Removing them is EXPECTED, not a workaround — but it is also the
-    # single most likely reason a first build on this branch misbehaves, so it
-    # is announced rather than done quietly.
-    if [ -d "$SMW/patches/linux-custom" ] && [ -n "$(ls -A "$SMW/patches/linux-custom" 2>/dev/null)" ]; then
-        say "  dropping patches/linux-custom (written against 5.10, will not apply):"
-        ls "$SMW/patches/linux-custom" | sed 's/^/    /'
-        rm -rf "$SMW/patches/linux-custom"
+    sha=${KERNEL_SHA:-}
+    if [ -z "$sha" ]; then
+        say "resolving raspberrypi/linux $KERNEL_BRANCH"
+        sha=$(git ls-remote https://github.com/raspberrypi/linux.git "refs/heads/$KERNEL_BRANCH" | cut -f1)
+        [ -n "$sha" ] || die "no such branch in raspberrypi/linux: $KERNEL_BRANCH
+  Pass KERNEL_SHA=<sha> to pin one directly."
+    fi
+    say "kernel → $KERNEL_BRANCH @ ${sha:0:12} (was ${old:0:12}, Linux 5.10.11)"
+    sed -i "s/$old/$sha/g" "$CFG"
+    echo "$sha" > "$SMW/.dashberry-kernel-sha"
+
+    # Kernel headers were pinned to 5.10 to match. AS_KERNEL follows whatever
+    # kernel is being built, which is the only answer that stays correct
+    # across a repin — and it sidesteps an old buildroot not knowing 6.16 as a
+    # headers version at all.
+    if grep -q '^BR2_KERNEL_HEADERS_5_10=y' "$CFG"; then
+        say "  kernel headers → AS_KERNEL (were pinned to 5.10)"
+        sed -i 's/^BR2_KERNEL_HEADERS_5_10=y/BR2_KERNEL_HEADERS_AS_KERNEL=y/' "$CFG"
+    fi
+
+    # showmewebcam's kernel patch is written against 5.10 and will not apply.
+    # It is also OBSOLETE on this branch, which is the only reason dropping it
+    # is safe: patches/linux-custom/0001-linux-enable-more-video-controls.patch
+    # exists to widen two descriptor bitfields that f_uvc.c hardcoded —
+    # camera-terminal bmControls {2,0,0} -> {10,0,0} and processing-unit
+    # bmControls {1,0} -> {219,4}. Those are what make the seven UVC controls
+    # (brightness, contrast, saturation, sharpness, ...) visible to the host at
+    # all. Since ~5.15 both are WRITABLE CONFIGFS ATTRIBUTES —
+    #   control/terminal/camera/default/bmControls
+    #   control/processing/default/bmControls
+    # (verified in rpi-6.16.y's uvc_configfs.c: uvcg_default_camera_bm_controls
+    # _store / uvcg_default_processing_bm_controls_store, newline-separated
+    # bytes) — so multi-gadget.sh sets the identical values from userspace and
+    # the host-visible control surface is unchanged. DashBerry itself does not
+    # need those controls (rear-ctl uses the control port and reaches every
+    # v4l2 control, not the seven the gadget forwards), but the bench
+    # rootscripts drive them from the Pi 4 and would otherwise break silently.
+    if grep -q '^BR2_LINUX_KERNEL_PATCH=' "$CFG"; then
+        say "  dropping BR2_LINUX_KERNEL_PATCH — obsolete on >= 5.15, replaced"
+        say "    by configfs bmControls writes in multi-gadget.sh:"
+        ls "$SMW/patches/linux-custom" 2>/dev/null | sed 's/^/      /' || true
+        sed -i '/^BR2_LINUX_KERNEL_PATCH=/d' "$CFG"
     fi
 }
 
 # ---------------------------------------------------------------------------
-# 2. uvc-gadget — teach it the H.264 fourcc.
+# 2. uvc-gadget — teach it the H.264 fourcc, via a buildroot patch.
 #
-# peterbay's uvc-gadget picks the V4L2 pixel format from THE FIRST CHARACTER
-# of the configfs format instance name: 'm' → V4L2_PIX_FMT_MJPEG, 'u' →
-# V4L2_PIX_FMT_YUYV, and nothing else. That is the entire format-selection
-# logic, which is why this change is small — but it is also why an unpatched
-# daemon silently streams the wrong thing rather than failing.
+# piwebcam.mk fetches peterbay/uvc-gadget at a pinned SHA, so there is nothing
+# in this checkout to sed. Buildroot applies package/<pkg>/*.patch to the
+# fetched source; the patch in zero/patches/ was generated against that same
+# SHA, so if the pin moves, the patch fails to apply and the build stops —
+# which is what should happen.
 # ---------------------------------------------------------------------------
+PINNED_UVC_SHA=e9a733fe5c4a7fcb48e963e8d994bc33d24d814e
+
 patch_uvc_gadget() {
-    local src
-    src=$(grep -rl 'V4L2_PIX_FMT_MJPEG' "$SMW" --include='*.c' 2>/dev/null \
-          | grep -i 'configfs\|uvc' | head -n 1 || true)
-    [ -n "$src" ] || die "cannot find uvc-gadget's format-selection source in $SMW.
-    It is normally fetched as a buildroot package rather than vendored — run
-    build.sh with PREFETCH=1 first so the source tree exists, or point
-    UVC_GADGET_SRC at it."
-    anchor "$src" "V4L2_PIX_FMT_MJPEG" "uvc-gadget's fourcc selection"
-    say "uvc-gadget → +h264 ($(basename "$src"))"
-
-    if grep -q 'V4L2_PIX_FMT_H264' "$src"; then
-        say "  already carries an H264 branch — left alone"
-        return
+    anchor "$PIWEBCAM/piwebcam.mk" "PIWEBCAM_SITE = https://github.com/peterbay/uvc-gadget.git" \
+        "the uvc-gadget source pin"
+    local pinned
+    pinned=$(sed -n 's/^PIWEBCAM_VERSION = \(.*\)/\1/p' "$PIWEBCAM/piwebcam.mk")
+    if [ "$pinned" != "$PINNED_UVC_SHA" ]; then
+        die "uvc-gadget's pin moved: piwebcam.mk now wants
+    $pinned
+  but zero/patches/0001-*.patch was generated against
+    $PINNED_UVC_SHA
+  Regenerate the patch against the new SHA before building. It adds one
+  branch to configfs_video_format() ('h' -> V4L2_PIX_FMT_H264) and widens a
+  diagnostic filter; both are three-line changes, but a patch that applies
+  with fuzz to a moved file is exactly how a card ends up streaming the
+  wrong thing."
     fi
-    # Insert the 'h' case beside the existing 'm'. The case is on the first
-    # character of the configfs instance name, so a format directory called
-    # framebased.h/ selects H.264.
-    python3 - "$src" <<'PY'
-import re, sys
-p = sys.argv[1]
-s = open(p).read()
-m = re.search(r"case\s+'m'\s*:", s)
-if not m:
-    sys.exit("edits.sh: no \"case 'm':\" in %s — uvc-gadget's fourcc switch has "
-             "changed shape. Read it and update edits.sh." % p)
-ins = ("case 'h':\t\t/* DashBerry: framebased.h -> H.264 from the Zero's\n"
-       "\t\t\t * hardware encoder. The Pi 4 cannot software-encode\n"
-       "\t\t\t * any usable mode at 30 fps; see\n"
-       "\t\t\t * INVESTIGATE-REAR-ENCODE.md. */\n"
-       "\t\tformat = V4L2_PIX_FMT_H264;\n"
-       "\t\tbreak;\n\t")
-s = s[:m.start()] + ins + s[m.start():]
-open(p, 'w').write(s)
-PY
+    say "uvc-gadget → +h264 (patch into package/piwebcam/)"
+    cp "$HERE"/patches/*.patch "$PIWEBCAM/"
 }
 
 # ---------------------------------------------------------------------------
-# 3. multi-gadget.sh — accept the h264 keyword in video_formats.txt.
+# 3. multi-gadget.sh — advertise H.264, and add the control port.
 #
-# Upstream parses that file with
-#   grep -E "^(mjpeg|uncompressed)[[:space:]]+..."
-# so an h264 line is silently DROPPED — the gadget comes up advertising
-# nothing new and the failure looks like a caps mismatch on the Pi 4.
+# Four changes, and only the first is the obvious one:
+#   a) the video_formats.txt parser greps ^(mjpeg|uncompressed), so an h264
+#      line is silently DROPPED — the gadget comes up advertising nothing new
+#      and the failure surfaces on the Pi 4 as a caps mismatch.
+#   b) config_frame() writes dwMaxVideoFrameBufferSize, which the framebased
+#      format does not carry — the mkdir would succeed and the write would
+#      fail, leaving a half-built format.
+#   c) the streaming header hardcodes symlinks to mjpeg/m and uncompressed/u.
+#      Without a framebased/h link the format exists in configfs and is never
+#      advertised to the host.
+#   d) acm.usb0 is the login console (post-build.sh puts a getty on ttyGS0).
+#      The control port needs a SECOND ACM function, and it must be linked
+#      LAST so its interface number is stable for the Pi 4's udev rule.
+#   e) the descriptor bitfields that showmewebcam's dropped kernel patch used
+#      to hardcode are set here instead, from configfs. Same values, no patch.
 # ---------------------------------------------------------------------------
 patch_multi_gadget() {
-    local f="$SMW/package/piwebcam/multi-gadget.sh"
-    anchor "$f" "mjpeg|uncompressed" "multi-gadget.sh's video_formats.txt parser"
-    say "multi-gadget.sh → +h264 keyword"
-    sed -i 's/mjpeg|uncompressed/mjpeg|uncompressed|h264/g' "$f"
+    local f="$PIWEBCAM/multi-gadget.sh"
+    anchor "$f" 'grep -E "^(mjpeg|uncompressed)' "the video_formats.txt parser"
+    anchor "$f" 'ln -s functions/uvc.usb0/streaming/mjpeg/m' "the streaming header links"
+    anchor "$f" 'mkdir -p functions/acm.usb0' "the serial console function"
+    anchor "$f" 'mkdir -p functions/uvc.usb0/control/header/h' "the control header setup"
+    anchor "$f" 'FRAMEDIR="functions/uvc.usb0/streaming/$FORMAT/$NAME/${HEIGHT}p"' \
+        "the frame-directory layout"
+    say "multi-gadget.sh → h264 + control port"
 
-    # A format directory's TYPE decides the descriptor: uncompressed/ and
-    # mjpeg/ exist on every kernel, framebased/ only from rpi-6.13.y on, and
-    # it is what carries a guidFormat (H.264 by default). The instance name
-    # must start with 'h' for the daemon patched above to pick the fourcc.
-    if ! grep -q 'framebased' "$f"; then
-        anchor "$f" "mjpeg" "the format-directory name multi-gadget.sh creates"
-        say "  NOTE: multi-gadget.sh needs a framebased/ branch for h264 lines."
-        say "        It is scripted below, but READ THE RESULT — this is the"
-        say "        one edit here that is a guess at upstream's shape."
-        cat >> "$f" <<'SH'
+    python3 - "$f" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
 
-# --- DashBerry ---------------------------------------------------------
-# h264 lines in video_formats.txt become framebased/ format instances. The
-# UVC gadget's framebased format defaults to the H.264 GUID, so nothing more
-# has to be said; the instance name starting with 'h' is what tells
-# uvc-gadget to ask the capture device for V4L2_PIX_FMT_H264.
-# Kernel >= 6.13 only: on anything older this directory cannot be created,
-# and the build should have failed at the kernel repin long before here.
-dashberry_h264_format() {          # $1 = width, $2 = height, $3 = index
-    local d="$FUNC/streaming/framebased/h$3"
-    mkdir -p "$d/${1}x${2}p" || {
-        echo "multi-gadget: no framebased/ support in this kernel — the" >&2
-        echo "  DashBerry image needs >= rpi-6.13.y. Refusing to advertise" >&2
-        echo "  MJPEG in its place: the Pi 4 expects H.264." >&2
-        return 1
-    }
-    echo "$1" > "$d/${1}x${2}p/wWidth"
-    echo "$2" > "$d/${1}x${2}p/wHeight"
-    echo 333333 > "$d/${1}x${2}p/dwDefaultFrameInterval"
-    echo 333333 > "$d/${1}x${2}p/dwFrameInterval"
-}
-SH
+# (a) the parser
+s = s.replace('grep -E "^(mjpeg|uncompressed)', 'grep -E "^(mjpeg|uncompressed|h264)')
+
+# The format directory type is not the keyword: h264 lives under framebased/,
+# which is where the kernel's guidFormat (H.264 by default) lives. The
+# INSTANCE name still has to start with 'h' — that first character is how
+# uvc-gadget picks V4L2_PIX_FMT_H264.
+s = s.replace(
+    '''    VIDEO_FORMAT=$(echo "$line" | awk '{print $1}')
+    HDR_DESC=$(echo "$VIDEO_FORMAT" | cut -c 1)''',
+    '''    VIDEO_FORMAT=$(echo "$line" | awk '{print $1}')
+    HDR_DESC=$(echo "$VIDEO_FORMAT" | cut -c 1)
+    # DashBerry: h264 lines are frame-based UVC descriptors. The configfs
+    # directory is framebased/, the instance name stays "h" (uvc-gadget reads
+    # that first character to choose the fourcc), and the keyword itself is
+    # only what appears in video_formats.txt.
+    if [ "$VIDEO_FORMAT" = "h264" ] ; then
+      VIDEO_FORMAT=framebased
+    fi''')
+
+# (b) frame attributes that the framebased format does not have
+s = s.replace(
+    '''  echo $((WIDTH * HEIGHT * 2))     > "$FRAMEDIR"/dwMaxVideoFrameBufferSize''',
+    '''  # dwMaxVideoFrameBufferSize exists on uncompressed/mjpeg frames; the
+  # frame-based format has no such attribute, and writing it is not fatal.
+  if [ -e "$FRAMEDIR"/dwMaxVideoFrameBufferSize ] ; then
+    echo $((WIDTH * HEIGHT * 2))   > "$FRAMEDIR"/dwMaxVideoFrameBufferSize
+  fi''')
+
+# ...and a mkdir that fails means the kernel has no framebased support at all,
+# which must stop the gadget rather than quietly advertise less.
+s = s.replace(
+    '''  FRAMEDIR="functions/uvc.usb0/streaming/$FORMAT/$NAME/${HEIGHT}p"
+
+  mkdir -p "$FRAMEDIR"''',
+    '''  FRAMEDIR="functions/uvc.usb0/streaming/$FORMAT/$NAME/${HEIGHT}p"
+
+  if ! mkdir -p "$FRAMEDIR" 2>/dev/null ; then
+    echo "Cannot create $FRAMEDIR"
+    if [ "$FORMAT" = "framebased" ] ; then
+      echo "  This kernel has no frame-based UVC format (needs >= rpi-6.13.y)."
+      echo "  Refusing to fall back to MJPEG: the host expects H.264."
     fi
+    return 1
+  fi''')
+
+# (e) the control-descriptor bitfields. These used to come from
+# patches/linux-custom/0001-linux-enable-more-video-controls.patch, which
+# hardcoded them in f_uvc.c; since ~5.15 they are configfs attributes, so the
+# patch is obsolete and this is the same change made from userspace. Without
+# them the host sees ONE control instead of seven, and nothing says why.
+s = s.replace(
+    '''  mkdir -p functions/uvc.usb0/control/header/h''',
+    '''  mkdir -p functions/uvc.usb0/control/header/h
+
+  # DashBerry: widen the advertised control bitfields. Values are exactly
+  # those showmewebcam's kernel patch used to compile in (camera terminal
+  # 10,0,0 and processing unit 219,4); they became writable configfs
+  # attributes in ~5.15, which is why that patch is gone. Newline-separated,
+  # matching the kernel's own show() format. Best effort: an older kernel
+  # without these attributes still gives a working camera, just the narrower
+  # UVC control set — and DashBerry drives controls over the control port,
+  # not through UVC.
+  CAM_CTRL=functions/uvc.usb0/control/terminal/camera/default/bmControls
+  PU_CTRL=functions/uvc.usb0/control/processing/default/bmControls
+  if [ -w "$CAM_CTRL" ] && [ -w "$PU_CTRL" ] ; then
+    printf '10\\n0\\n0\\n' > "$CAM_CTRL"
+    printf '219\\n4\\n'      > "$PU_CTRL"
+  else
+    echo "Warning: bmControls not writable — host will see the narrow UVC control set"
+  fi''')
+
+# (c) the streaming header links: only link what exists, and include
+# framebased/h so the host is actually told about it.
+s = s.replace(
+    '''  ln -s functions/uvc.usb0/streaming/mjpeg/m        functions/uvc.usb0/streaming/header/h
+  ln -s functions/uvc.usb0/streaming/uncompressed/u functions/uvc.usb0/streaming/header/h''',
+    '''  for FMTDIR in framebased/h mjpeg/m uncompressed/u ; do
+    if [ -d "functions/uvc.usb0/streaming/$FMTDIR" ] ; then
+      ln -s "functions/uvc.usb0/streaming/$FMTDIR" functions/uvc.usb0/streaming/header/h
+    fi
+  done''')
+
+# (d) the control port. Linked after acm.usb0 so the interface numbering is
+# uvc(0,1) acm.usb0(2,3) acm.usb1(4,5) — the Pi 4's udev rule matches on 04.
+s = s.replace(
+    '''config_usb_serial () {
+  mkdir -p functions/acm.usb0
+  ln -s functions/acm.usb0 configs/c.1/acm.usb0
+}''',
+    '''config_usb_serial () {
+  mkdir -p functions/acm.usb0
+  ln -s functions/acm.usb0 configs/c.1/acm.usb0
+}
+
+# DashBerry control port: a SECOND CDC-ACM function, where the Pi 4 pushes the
+# camera settings it owns (flips, bitrate, I-period, profile, exposure bias)
+# and reads them back. Kept separate from acm.usb0, which is the login console
+# a getty sits on — a control protocol must not fight a shell for a port.
+# Linked LAST on purpose: interface numbering is what the Pi 4's udev rule
+# uses to tell the two apart.
+config_usb_control () {
+  mkdir -p functions/acm.usb1
+  ln -s functions/acm.usb1 configs/c.1/acm.usb1
+}''')
+
+s = s.replace(
+    '''if [ "$CONFIGURE_USB_SERIAL" = true ] ; then
+  echo "Configuring USB gadget serial interface"
+  config_usb_serial
+fi''',
+    '''if [ "$CONFIGURE_USB_SERIAL" = true ] ; then
+  echo "Configuring USB gadget serial interface"
+  config_usb_serial
+fi
+
+echo "Configuring USB gadget control interface"
+config_usb_control''')
+
+open(p, 'w').write(s)
+PY
+
+    grep -q 'config_usb_control' "$f" || die "multi-gadget.sh edits did not take — read it."
 }
 
 # ---------------------------------------------------------------------------
 # 4. camera.txt — stop shipping a live 25 Mbps setting.
 #
-# showmewebcam's camera.txt carries video_bitrate=25000000. On an MJPEG card
-# that line is INERT — it is V4L2_CID_MPEG_VIDEO_BITRATE, an H.264 control on
-# a gadget that never encoded H.264, and it is the origin of the retracted
-# "~25 Mbps MJPEG floor" claim. THE MOMENT THIS IMAGE ENCODES H.264 IT BECOMES
-# LIVE, and it would quietly make the rear a 25 Mbps camera: ~11 GB/h, which
-# on its own halves the drive history a 256 GB card holds.
+# start-webcam.sh feeds every key in /boot/camera.txt to v4l2-ctl before the
+# gadget streams. On an MJPEG card video_bitrate=25000000 was INERT — it is
+# V4L2_CID_MPEG_VIDEO_BITRATE, an H.264 control on a gadget that never encoded
+# H.264, and it is the origin of the retracted "~25 Mbps MJPEG floor" claim.
+# THE MOMENT THIS IMAGE ENCODES H.264 IT BECOMES LIVE, and would quietly make
+# the rear a 25 Mbps camera (~11 GB/h).
 #
 # It does not get a corrected value here. It LEAVES, because bitrate is the
 # Pi 4's to own (dashberry.conf REAR_BITRATE, pushed by rear-ctl) and nothing
 # per-installation may live on this card.
+#
+# auto_exposure_bias=12 stays: it is the shipped default and the Pi 4 pushes
+# the same value, so an un-pushed card still looks like the one it replaced.
 # ---------------------------------------------------------------------------
 patch_camera_txt() {
-    local f
-    f=$(find "$SMW" -name camera.txt -not -path '*/.git/*' | head -n 1 || true)
-    [ -n "$f" ] || { say "camera.txt not in the tree (generated at boot?) — skipped"; return; }
-    if grep -q '^video_bitrate' "$f"; then
-        say "camera.txt → dropping the shipped video_bitrate (rear-ctl owns it)"
-        sed -i 's/^video_bitrate=.*/# video_bitrate: REMOVED by DashBerry — the Pi 4 pushes it (rear-ctl).\n# Left here it would be a live 25 Mbps setting the moment this card encodes./' "$f"
-    fi
+    local f="$PIWEBCAM/camera.txt"
+    anchor "$f" "video_bitrate=25000000" "the shipped camera settings"
+    say "camera.txt → dropping video_bitrate (rear-ctl owns it)"
+    python3 - "$f" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace("video_bitrate=25000000\n",
+    "# video_bitrate: REMOVED by DashBerry. It was inert while this gadget\n"
+    "# streamed MJPEG; it is a LIVE 25 Mbps setting now that it encodes H.264,\n"
+    "# and bitrate belongs to the Pi 4 (dashberry.conf REAR_BITRATE, pushed by\n"
+    "# rear-ctl on every start of rear-rec).\n")
+open(p, 'w').write(s)
+PY
 }
 
 # ---------------------------------------------------------------------------
-# 5. Our own files.
+# 5. Our own files, into BR2_ROOTFS_OVERLAY.
+#
+# The overlay is applied after every package installs, so rootfs/etc/
+# video_formats.txt wins over the one package/piwebcam/ installs.
+# The image is systemd (BR2_INIT_SYSTEMD=y), so rear-ctld gets a unit and a
+# basic.target.wants symlink — the same shape piwebcam.mk uses for its own.
 # ---------------------------------------------------------------------------
 install_overlay() {
-    local dest
-    dest=$(grep -rhoP '(?<=^BR2_ROOTFS_OVERLAY=").*(?=")' "$SMW"/*_defconfig "$SMW"/configs/*_defconfig 2>/dev/null | head -n 1 || true)
-    dest=${dest:-board/raspberrypi/rootfs_overlay}
-    dest="$SMW/${dest#\$(BR2_EXTERNAL_*_PATH)/}"
-    say "overlay → ${dest#"$SMW"/}"
-    mkdir -p "$dest"
-    cp -a "$HERE/overlay/." "$dest/"
-    chmod 755 "$dest/usr/bin/rear-ctld" "$dest/etc/init.d/S95rear-ctld"
-    printf '%s\n' "${DASHBERRY_ZERO_VERSION:-dev}" > "$dest/etc/dashberry-zero-version"
+    anchor "$CFG" 'BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_PICAM_PATH)/rootfs"' \
+        "the rootfs overlay location"
+    say "overlay → rootfs/"
+    mkdir -p "$OVERLAY"
+    cp -a "$HERE/overlay/." "$OVERLAY/"
+    chmod 755 "$OVERLAY/usr/bin/rear-ctld"
+    printf '%s\n' "${DASHBERRY_ZERO_VERSION:-dev}" > "$OVERLAY/etc/dashberry-zero-version"
 
-    # gpu_mem=256 on a 512 MB Zero W — one of the three deviations this card
-    # already carried before H.264 (with advertised resolutions and USB
-    # peripheral mode), now tracked instead of hand-edited.
-    local cfg="$dest/boot/config.txt"
-    mkdir -p "$(dirname "$cfg")"
-    grep -q '^gpu_mem=256' "$cfg" 2>/dev/null || echo 'gpu_mem=256' >> "$cfg"
+    mkdir -p "$OVERLAY/etc/systemd/system/basic.target.wants"
+    ln -sf ../rear-ctld.service "$OVERLAY/etc/systemd/system/basic.target.wants/rear-ctld.service"
 }
 
-echo "edits.sh: patching $SMW"
+# ---------------------------------------------------------------------------
+# 6. gpu_mem=256 on a 512 MB Zero W — one of the three deviations this card
+# already carried before H.264 (with advertised resolutions and USB peripheral
+# mode), tracked now instead of hand-edited onto each card.
+#
+# It CANNOT go in the rootfs overlay: /boot is a separate FAT partition built
+# by genimage from ${BINARIES_DIR}/rpi-firmware/config.txt, and fstab mounts
+# it over anything the overlay put at /boot. post-image.sh's --configure-picam
+# block is where that file is assembled, so this appends there, in the same
+# shape as the dwc2/enable_uart/boot_delay lines beside it.
+# ---------------------------------------------------------------------------
+patch_post_image() {
+    local f="$SMW/board/post-image.sh"
+    anchor "$f" "--configure-picam)" "the boot config.txt assembly"
+    anchor "$f" "dtoverlay=dwc2" "the picam boot-config block"
+    if grep -q 'gpu_mem=256' "$f"; then
+        say "post-image.sh already sets gpu_mem — left alone"
+        return
+    fi
+    say "post-image.sh → gpu_mem=256"
+    python3 - "$f" <<'PY2'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = '''		# Configure uart on 40-pin header'''
+new = '''		# DashBerry: the H.264 encoder and the ISP need the GPU split
+		# raised on a 512 MB Zero W. Not gpu_mem_512= — the stock
+		# config.txt has no such line for a sed to land on, and this
+		# block appends rather than substitutes for exactly that reason.
+		if ! grep -qE '^gpu_mem=' "${BINARIES_DIR}/rpi-firmware/config.txt"; then
+
+			cat << __EOF__ >> "${BINARIES_DIR}/rpi-firmware/config.txt"
+gpu_mem=256
+__EOF__
+		fi
+
+		# Configure uart on 40-pin header'''
+assert old in s, "post-image.sh's picam block has changed shape"
+s = s.replace(old, new, 1)
+open(p, 'w').write(s)
+PY2
+}
+
+echo "edits.sh: patching ${SMW}"
 repin_kernel
 patch_uvc_gadget
 patch_multi_gadget
 patch_camera_txt
 install_overlay
+patch_post_image
 echo "edits.sh: done"

@@ -1,0 +1,21 @@
+[Unit]
+Description=DashBerry rear-camera control port
+# The gadget has to exist before /dev/ttyGS1 does, and uvc-webcam.service is
+# what brings the camera up. Ordering after both means a push from the Pi 4
+# lands on a device that is ready to answer.
+After=usb-gadget-config.service uvc-webcam.service
+
+[Service]
+ExecStart=/usr/bin/rear-ctld
+# The Pi 4 opens and closes this port many times across a drive (rear-rec
+# restarts on every camera replug, and each restart pushes again), and the
+# daemon reopens rather than exiting — but if it ever does die, it must come
+# back, or the next start of rear-rec faults REAR on PAGE 0.
+Restart=always
+RestartSec=2
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=rear-ctld
+
+[Install]
+WantedBy=basic.target

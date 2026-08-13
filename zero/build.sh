@@ -20,9 +20,13 @@
 #   2. runs edits.sh, which repins the kernel, teaches the gadget H.264 and
 #      lays our overlay down — every change anchored to an upstream string and
 #      hard-failing if that string moved
-#   3. runs upstream's own Docker build, so the toolchain is theirs, not this
-#      laptop's
+#   3. runs upstream's own build-showmewebcam.sh, which merges configs/config
+#      with the board config, merges the kernel config, and drives buildroot
 #   4. compresses, and writes a manifest beside the image
+#
+# It is a BUILDROOT build: it fetches a toolchain and every package source,
+# and the first run takes hours and several GB. Nothing about that is ours to
+# speed up, but `work/` is kept between runs so a second build is incremental.
 #
 # THE PART THAT IS NOT SETTLED
 # The kernel repin (5.10.11 → rpi-6.16.y) is the risk in this build, and it is
@@ -65,7 +69,13 @@ export DASHBERRY_ZERO_VERSION=$VERSION
 die() { printf 'build.sh: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n== %s\n' "$*"; }
 
-for t in git docker xz; do command -v "$t" >/dev/null || die "missing tool: $t"; done
+BOARD=${BOARD:-raspberrypi0w}       # the Zero W. raspberrypi0 / raspberrypi4 also exist
+
+# Buildroot's own dependency list is longer than this; these are just the ones
+# whose absence would fail late and confusingly.
+for t in git xz make gcc g++ bc rsync cpio unzip bzip2 perl; do
+    command -v "$t" >/dev/null || die "missing tool: $t (buildroot needs a full build environment)"
+done
 
 step "sources"
 if [ -d "$SMW_DIR/.git" ]; then
@@ -91,18 +101,14 @@ echo "  showmewebcam @ $REF = $(git -C "$SMW_DIR" rev-parse --short HEAD)"
 step "DashBerry edits"
 "$HERE/edits.sh" "$SMW_DIR"
 
-step "image"
-# Upstream ships a containerized build; use theirs rather than reproducing it.
-if [ -x "$SMW_DIR/build.sh" ]; then
-    ( cd "$SMW_DIR" && ./build.sh )
-elif [ -f "$SMW_DIR/Makefile" ]; then
-    ( cd "$SMW_DIR" && make )
-else
-    die "no build entry point in $SMW_DIR — read its README and update build.sh"
-fi
+step "image ($BOARD)"
+[ -x "$SMW_DIR/build-showmewebcam.sh" ] || die "no build-showmewebcam.sh in $SMW_DIR — upstream's entry point moved"
+[ -f "$SMW_DIR/buildroot/Makefile" ] || die "the buildroot submodule is empty — run:
+  git -C $SMW_DIR submodule update --init --recursive"
+( cd "$SMW_DIR" && BUILDROOT_DIR=buildroot ./build-showmewebcam.sh "$BOARD" )
 
-IMG=$(find "$SMW_DIR" -name 'sdcard.img' -newer "$SMW_DIR/.git/HEAD" | head -n 1 || true)
-[ -n "$IMG" ] || die "the build produced no sdcard.img — read the log above"
+IMG="$SMW_DIR/output/$BOARD/images/sdcard.img"
+[ -f "$IMG" ] || die "the build produced no $IMG — read the log above"
 
 step "package"
 mkdir -p "$OUT"
@@ -113,7 +119,8 @@ cat > "$OUT/dashberry-zero-$VERSION.manifest" <<EOF
 version        $VERSION
 built          $(date -u +%Y-%m-%dT%H:%M:%SZ)
 showmewebcam   $REF = $(git -C "$SMW_DIR" rev-parse HEAD)
-kernel branch  ${KERNEL_BRANCH:-rpi-6.16.y}
+board          $BOARD
+kernel         ${KERNEL_BRANCH:-rpi-6.16.y} @ $(cat "$SMW_DIR/.dashberry-kernel-sha" 2>/dev/null || echo '?')
 image          $(basename "$DEST").xz
 sha256         $(sha256sum "$DEST.xz" | cut -d' ' -f1)
 EOF

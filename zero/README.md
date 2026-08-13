@@ -16,6 +16,11 @@ sudo cli/dashberry-zero --flash /dev/sdX       # write it
 sudo cli/dashberry-zero --check                # ask the card what it is
 ```
 
+`build.sh` is a **buildroot** build driven by upstream's own
+`build-showmewebcam.sh`: it fetches a toolchain and every package source, so
+the first run takes hours and several GB. `zero/work/` is kept between runs,
+so a second build is incremental. `BOARD=` defaults to `raspberrypi0w`.
+
 ---
 
 ## 1. Why the Zero encodes
@@ -43,8 +48,8 @@ mode, and memory allocation.
 |---|---|
 | **Kernel** | `raspberrypi/linux` **`rpi-6.16.y`**, repinned from showmewebcam's `6af8ae32` (5.10.11) |
 | **Format** | H.264 over UVC, via the kernel's `framebased` configfs format |
-| **Control** | `rear-ctld` on a second CDC-ACM function (`/dev/ttyGS1`) |
-| **Console** | the first CDC-ACM function, unchanged — still a login prompt |
+| **Control** | `rear-ctld` on a second CDC-ACM function (`/dev/ttyGS1`), a systemd unit ordered after the gadget comes up |
+| **Console** | the first CDC-ACM function (`/dev/ttyGS0`), unchanged — `post-build.sh` puts an autologin getty there |
 | **Modes** | `overlay/etc/video_formats.txt` |
 
 **The kernel repin is the whole reason this is not a five-line patch.** In
@@ -69,14 +74,42 @@ driver this image depends on for the sensor and for every encoder control.
 > 6.12 is RPi's protected long-term branch and the line `bcm2835-v4l2` is
 > known good on. Try it the moment 6.16 costs more than an afternoon.
 
-Two userspace changes ride along, both anchored in `edits.sh`:
+The pin is a GitHub **tarball**, not a git ref, and `edits.sh` resolves the
+branch to a SHA before substituting it — a card you cannot rebuild byte for
+byte is not a card you can debug. `KERNEL_SHA=` pins one directly.
+
+**showmewebcam's own kernel patch is dropped, and that is safe only because it
+is obsolete.** `patches/linux-custom/0001-linux-enable-more-video-controls.patch`
+widens two descriptor bitfields that `f_uvc.c` hardcoded — camera terminal
+`bmControls` `{2,0,0}` → `{10,0,0}`, processing unit `{1,0}` → `{219,4}` —
+and those are what make the seven UVC controls visible to a host at all. Since
+~5.15 both are **writable configfs attributes**
+(`control/terminal/camera/default/bmControls`,
+`control/processing/default/bmControls`; verified in `rpi-6.16.y`'s
+`uvc_configfs.c`), so `multi-gadget.sh` writes the identical values from
+userspace and the host-visible control surface is unchanged. DashBerry does
+not need those controls — `rear-ctl` reaches *every* v4l2 control over the
+control port — but the bench rootscripts drive them from the Pi 4 and would
+otherwise break silently.
+
+Userspace changes, all in `edits.sh` except the first:
 
 - **`uvc-gadget`** picks its V4L2 fourcc from the *first character* of the
   configfs format instance name — `m` → MJPEG, `u` → YUYV, and nothing else.
-  A `h` → `V4L2_PIX_FMT_H264` branch is added.
-- **`multi-gadget.sh`** parses `video_formats.txt` with
-  `grep -E "^(mjpeg|uncompressed)…"`, so an `h264` line is silently dropped.
-  The keyword is added, and h264 lines become `framebased/` instances.
+  A `h` → `V4L2_PIX_FMT_H264` branch is added. This one is a real patch file
+  (`zero/patches/`), because `piwebcam.mk` fetches uvc-gadget from a pinned
+  SHA rather than vendoring it; buildroot applies `package/<pkg>/*.patch`, and
+  `edits.sh` refuses to build if that pin has moved out from under the patch.
+- **`multi-gadget.sh`** needs four changes, and only the first is obvious:
+  its parser greps `^(mjpeg|uncompressed)`, so an `h264` line is silently
+  dropped; `config_frame` writes `dwMaxVideoFrameBufferSize`, which the
+  frame-based format does not have (it carries `dwBytesPerLine` instead); the
+  streaming header hardcodes symlinks to `mjpeg/m` and `uncompressed/u`, so a
+  `framebased/h` format would exist in configfs and never be advertised; and
+  the control port needs a second ACM function.
+- **`post-image.sh`** appends `gpu_mem=256`. It cannot go in the rootfs
+  overlay — `/boot` is a separate FAT partition assembled by genimage, and
+  fstab mounts it over anything the overlay put there.
 
 ## 3. The division of ownership
 
@@ -107,7 +140,9 @@ card.** Reflash it and the Pi 4 heals it on the next start.
 ### The control protocol
 
 Line based, on `/dev/ttyGS1` (the Pi 4 sees `/dev/rear-ctl`; a bench PC sees
-the second `ttyACM`):
+the second `ttyACM`). The functions are linked UVC → acm.usb0 → acm.usb1, so
+the control port is USB interface 4 — which is what the Pi 4's udev rule
+matches on, and why the link order in `multi-gadget.sh` is not incidental:
 
 ```
 VERSION            -> DASHBERRY-ZERO <version> <kernel>
