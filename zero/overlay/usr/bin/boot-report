@@ -106,10 +106,11 @@ remount rw || { echo "boot-report: cannot remount /boot rw" >&2; exit 1; }
     echo "  --- what the streaming header links to ---"
     ls -l "$G/functions/uvc.usb0/streaming/header/h" 2>/dev/null | sed 's/^/  /'
     echo "  --- gadget deactivation state (bind_deactivated) ---"
-    echo "  If uvc-gadget is not running, the UVC function keeps the WHOLE"
-    echo "  gadget deactivated and nothing enumerates - see usr/bin/uvc-activate."
+    echo "  f_uvc sets bind_deactivated, so while uvc-gadget is not running the"
+    echo "  UVC function holds the WHOLE gadget deactivated: no camera, no"
+    echo "  console, no control port. That is why a daemon failure costs the"
+    echo "  entire device and not just the video."
     echo "  uvc-gadget running: $(pidof uvc-gadget >/dev/null 2>&1 && echo yes || echo NO)"
-    echo "  uvc-activate running: $(pidof -x uvc-activate >/dev/null 2>&1 && echo yes || echo no)"
     echo "  --- what uvc-gadget said (FULL) ---"
     # NOT a tail. When discovery fails the card does not enumerate, so there is
     # no console to read this on — and /boot/no-camera, which would give you a
