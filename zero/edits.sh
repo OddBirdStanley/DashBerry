@@ -267,6 +267,39 @@ s = s.replace(
     fi
   done''')
 
+# (f) WAIT FOR A UDC. Upstream does `ls /sys/class/udc > UDC` the instant the
+# functions are built, and on 6.16 that is a race it loses: dwc2 finishes
+# registering the gadget controller AFTER this script has run. The first
+# working card produced a fully-built gadget with `bound UDC: ''` and an empty
+# /sys/class/udc, and the dwc2 line proving the controller had come up
+# ("EPs: 8, dedicated fifos, 4080 entries in SPRAM" — dwc2_hsotg_hw_cfg, on
+# the peripheral path) appeared at the very END of the kernel log, well after
+# this script exited.
+#
+# Building the gadget stack into the kernel makes it probe long before
+# userspace and should close the race on its own. This loop is the belt to
+# that braces: it costs nothing when the UDC is already there, and it turns
+# "silently no USB at all" into a message that says which half failed.
+s = s.replace(
+    '''ls /sys/class/udc > UDC''',
+    '''# DashBerry: wait for the USB controller to register a UDC before binding.
+# See the note in edits.sh: upstream assumes it already exists, and on 6.16
+# dwc2 can finish after this script does.
+UDC_TRIES=0
+while [ -z "$(ls /sys/class/udc 2>/dev/null)" ] ; do
+  UDC_TRIES=$((UDC_TRIES + 1))
+  if [ "$UDC_TRIES" -ge 15 ] ; then
+    echo "No UDC after ${UDC_TRIES}s: the USB controller never registered."
+    echo "  Nothing will enumerate - not the camera, not the console."
+    echo "  Check 'dmesg | grep dwc2' and /sys/kernel/debug/devices_deferred."
+    exit 1
+  fi
+  echo "Waiting for a UDC to appear (${UDC_TRIES}s)..."
+  sleep 1
+done
+echo "Binding gadget to UDC: $(ls /sys/class/udc)"
+ls /sys/class/udc > UDC''')
+
 # (d) the control port. Linked after acm.usb0 so the interface numbering is
 # uvc(0,1) acm.usb0(2,3) acm.usb1(4,5) — the Pi 4's udev rule matches on 04.
 s = s.replace(
