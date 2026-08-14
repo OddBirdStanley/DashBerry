@@ -1,0 +1,84 @@
+#!/bin/sh
+# boot-report — write what happened at boot to the FAT /boot partition, so a
+# card that comes up but does not ENUMERATE can still be diagnosed with
+# nothing but an SD card reader.
+#
+# WHY
+# ---
+# Every debug channel this board has runs over the USB gadget: the console is
+# a CDC-ACM function, the control port is another, the camera is a third. When
+# the gadget fails to bind, all three vanish at once and the card looks dead
+# from outside — which is exactly the case you most need to see inside.
+# The only other channels are a UART adapter on the 40-pin header and HDMI,
+# both of which need hardware and physical access.
+#
+# /boot is FAT and is the one thing any PC can read. So on every boot we write
+# the answer there: whether the gadget bound, what the camera did, what the
+# kernel said.
+#
+# GATED BY A MARKER FILE, deliberately, mirroring showmewebcam's own
+# enable-serial-debug: this remounts /boot read-write, and a dashcam is
+# power-cut without warning thousands of times. A FAT write in progress when
+# the 12 V dies can corrupt the boot partition. Delete /boot/enable-boot-report
+# for a card that lives in the car; keep it on the bench.
+set -u
+
+MARKER=/boot/enable-boot-report
+REPORT=/boot/boot-report.txt
+
+[ -f "$MARKER" ] || exit 0
+
+# Let the gadget and the camera finish trying before reporting on them.
+sleep 8
+
+remount() { mount -o "remount,$1" /boot 2>/dev/null; }
+
+remount rw || { echo "boot-report: cannot remount /boot rw" >&2; exit 1; }
+
+{
+    echo "DashBerry Zero boot report"
+    echo "  version : $(cat /etc/dashberry-zero-version 2>/dev/null || echo '?')"
+    echo "  kernel  : $(uname -r)"
+    echo "  date    : $(date 2>/dev/null || echo 'no clock')"
+    echo
+
+    echo "== USB gadget"
+    G=/sys/kernel/config/usb_gadget/piwebcam
+    if [ -d "$G" ]; then
+        echo "  configfs   : present"
+        echo "  functions  : $(ls "$G/functions" 2>/dev/null | tr '\n' ' ')"
+        echo "  linked     : $(ls "$G/configs/c.1" 2>/dev/null | tr '\n' ' ')"
+        echo "  bound UDC  : '$(cat "$G/UDC" 2>/dev/null)'   <- EMPTY MEANS THE BIND FAILED"
+        echo "  formats    : $(ls "$G/functions/uvc.usb0/streaming" 2>/dev/null | tr '\n' ' ')"
+        for f in "$G"/functions/uvc.usb0/streaming/framebased/*; do
+            [ -d "$f" ] && echo "  framebased : ${f##*/} -> $(ls "$f" 2>/dev/null | tr '\n' ' ')"
+        done
+    else
+        echo "  configfs   : ABSENT — multi-gadget.sh never ran, or configfs is not mounted"
+    fi
+    echo "  UDCs seen  : $(ls /sys/class/udc 2>/dev/null | tr '\n' ' ')"
+    echo "  (no UDC at all means dwc2 did not bind: check dr_mode and the cable)"
+    echo
+
+    echo "== camera"
+    echo "  video nodes: $(ls /dev/video* 2>/dev/null | tr '\n' ' ')"
+    echo "  /dev/video0 is the SENSOR (bcm2835-v4l2); /dev/video1 is the gadget."
+    echo "  start-webcam.sh needs BOTH before it will start uvc-gadget."
+    echo
+
+    echo "== services"
+    for s in usb-gadget-config uvc-webcam rear-ctld; do
+        echo "  $s: $(systemctl is-active "$s" 2>/dev/null) / $(systemctl is-failed "$s" 2>/dev/null)"
+    done
+    echo
+
+    echo "== journal (gadget, camera, control port)"
+    journalctl -b --no-pager 2>/dev/null | grep -iE "gadget|uvc|dwc2|bcm2835|video|rear-ctld" | tail -60
+    echo
+
+    echo "== kernel messages, last 120 lines"
+    dmesg 2>/dev/null | tail -120
+} > "$REPORT" 2>&1
+
+sync
+remount ro

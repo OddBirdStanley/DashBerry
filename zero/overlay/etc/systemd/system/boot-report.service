@@ -1,0 +1,18 @@
+[Unit]
+Description=Write a boot report to /boot so a non-enumerating card can be read
+# After everything it reports on, so it captures their outcome rather than
+# their absence.
+After=usb-gadget-config.service uvc-webcam.service rear-ctld.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/boot-report
+# It exits immediately unless /boot/enable-boot-report is present, and a
+# failure here must never hold up the camera.
+SuccessExitStatus=0 1
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=boot-report
+
+[Install]
+WantedBy=basic.target

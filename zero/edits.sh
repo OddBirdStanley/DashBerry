@@ -360,8 +360,10 @@ install_overlay() {
     chmod 755 "$OVERLAY/usr/bin/rear-ctld"
     printf '%s\n' "${DASHBERRY_ZERO_VERSION:-dev}" > "$OVERLAY/etc/dashberry-zero-version"
 
+    chmod 755 "$OVERLAY/usr/bin/boot-report"
     mkdir -p "$OVERLAY/etc/systemd/system/basic.target.wants"
-    ln -sf ../rear-ctld.service "$OVERLAY/etc/systemd/system/basic.target.wants/rear-ctld.service"
+    ln -sf ../rear-ctld.service   "$OVERLAY/etc/systemd/system/basic.target.wants/rear-ctld.service"
+    ln -sf ../boot-report.service "$OVERLAY/etc/systemd/system/basic.target.wants/boot-report.service"
 }
 
 # ---------------------------------------------------------------------------
@@ -685,6 +687,82 @@ patch_dts_name() {
   vendor-qualified for kernels >= 6.5 and edits.sh could not find where."
 }
 
+# ---------------------------------------------------------------------------
+# 12. DIAGNOSABLE WITHOUT A UART ADAPTER.
+#
+# Every debug channel this board has is a function of the USB gadget: the
+# console is a CDC-ACM, the control port is a second one, the camera is a
+# third. When the gadget fails to bind they all disappear at once — which is
+# precisely the failure you most need to see inside. That leaves a UART
+# adapter on the 40-pin header, or physical access with HDMI.
+#
+# Two cheaper channels, both built in here:
+#
+#   `quiet` LEAVES the kernel command line. The kernel already has
+#   CONFIG_FB_SIMPLE and CONFIG_FRAMEBUFFER_CONSOLE, and cmdline already
+#   carries console=tty1, so a mini-HDMI cable shows the boot — including a
+#   panic — with no adapter to buy. `quiet` was blanking exactly that.
+#
+#   /boot/boot-report.txt, written on every boot by boot-report.service:
+#   gadget state (crucially whether the UDC bound), camera nodes, service
+#   status, and the tail of the kernel log. /boot is FAT, so ANY PC can read
+#   it with just the SD card. Gated by /boot/enable-boot-report in the same
+#   spirit as enable-serial-debug, because writing there means remounting it
+#   read-write and a dashcam is power-cut without warning.
+# ---------------------------------------------------------------------------
+patch_boot_debug() {
+    local f="$SMW/board/post-image.sh"
+    anchor "$f" "Add default enable-serial-debug file" "the boot-file assembly"
+    if grep -q 'enable-boot-report' "$f"; then
+        say "boot diagnostics already wired — left alone"
+    else
+        say "cmdline → dropping 'quiet' (HDMI console is a debug channel)"
+        say "boot → shipping the enable-boot-report marker"
+        python3 - "$f" <<'PY4'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "\t\t# Add default enable-serial-debug file"
+new = (
+ "\t\t# DashBerry: DROP `quiet`. Every debug channel on this board is\n"
+ "\t\t# a function of the USB gadget, so when the gadget fails to bind\n"
+ "\t\t# there is nothing left to ask. HDMI still works in that case\n"
+ "\t\t# (CONFIG_FB_SIMPLE + FRAMEBUFFER_CONSOLE are on and cmdline\n"
+ "\t\t# already carries console=tty1) and `quiet` was blanking it. A\n"
+ "\t\t# boot that fails before the gadget exists is when its messages\n"
+ "\t\t# matter most.\n"
+ "\t\tsed -e 's/ quiet//g' -i \"${BINARIES_DIR}/rpi-firmware/cmdline.txt\"\n"
+ "\n"
+ "\t\t# DashBerry: marker for the boot report, same spirit as\n"
+ "\t\t# enable-serial-debug below. See usr/bin/boot-report.\n"
+ "\t\tcat << __EOF__ >> \"${BINARIES_DIR}/enable-boot-report\"\n"
+ "# Present = the Zero writes /boot/boot-report.txt every boot: gadget state,\n"
+ "# camera nodes, service status, tail of the kernel log. It exists so a card\n"
+ "# that boots but does not ENUMERATE can be diagnosed with only an SD card\n"
+ "# reader - when the gadget fails, console, control port and camera go too.\n"
+ "#\n"
+ "# DELETE THIS FILE for a card going into the car: the report remounts /boot\n"
+ "# read-write, and a dashcam loses power without warning.\n"
+ "__EOF__\n"
+ "\n"
+ "\t\t# Add default enable-serial-debug file")
+assert old in s, "post-image.sh's boot-file block has changed shape"
+s = s.replace(old, new, 1)
+open(p, 'w').write(s)
+PY4
+    fi
+
+    # genimage lists the boot partition's files explicitly, so a new file that
+    # is not named there is simply never copied onto the card.
+    local g
+    for g in "$SMW"/board/genimage-*.cfg; do
+        grep -q 'enable-serial-debug' "$g" || continue
+        grep -q 'enable-boot-report' "$g" && continue
+        say "genimage → +enable-boot-report ($(basename "$g"))"
+        sed -i 's|"enable-serial-debug",|"enable-serial-debug",\n      "enable-boot-report",|' "$g"
+    done
+}
+
 echo "edits.sh: patching ${SMW}"
 patch_download_sites
 patch_busybox
@@ -696,4 +774,5 @@ patch_multi_gadget
 patch_camera_txt
 install_overlay
 patch_post_image
+patch_boot_debug
 echo "edits.sh: done"
