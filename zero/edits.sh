@@ -374,7 +374,26 @@ bind_gadget() {
   return 1
 }
 
-if ! bind_gadget "camera + console + control port" ; then
+# DashBerry: /boot/no-camera - a deliberate escape hatch, toggled by editing
+# the FAT boot partition on any PC, no rebuild.
+#
+# f_uvc sets bind_deactivated, so the UVC function keeps the WHOLE gadget
+# deactivated until a userspace app subscribes to UVC_EVENT_SETUP on the
+# gadget's video node. uvc-gadget does that - and when uvc-gadget fails, as it
+# does with "configfs settings for uvc gadget not found", the card enumerates
+# NOTHING: no camera, no console, no control port. The one channel that could
+# explain the failure is removed by the failure.
+#
+# With this file present the camera function is left out entirely, so the
+# gadget has nothing that deactivates it and the console comes up. That is a
+# card you can log into and run uvc-gadget on by hand.
+if [ -f /boot/no-camera ] ; then
+  echo "/boot/no-camera present: binding WITHOUT the camera."
+  echo "  This is the debugging shape - console and control port only."
+  echo "  Delete /boot/no-camera to go back to a camera card."
+  rm -f configs/c.1/uvc.usb0
+  bind_gadget "console + control port, camera deliberately omitted"
+elif ! bind_gadget "camera + console + control port" ; then
   echo "Retrying without the control port (acm.usb1)..."
   rm -f configs/c.1/acm.usb1
   if ! bind_gadget "camera + console, NO control port" ; then
@@ -481,11 +500,10 @@ install_overlay() {
     chmod 755 "$OVERLAY/usr/bin/rear-ctld"
     printf '%s\n' "${DASHBERRY_ZERO_VERSION:-dev}" > "$OVERLAY/etc/dashberry-zero-version"
 
-    chmod 755 "$OVERLAY/usr/bin/boot-report" "$OVERLAY/usr/bin/uvc-activate"
+    chmod 755 "$OVERLAY/usr/bin/boot-report"
     mkdir -p "$OVERLAY/etc/systemd/system/basic.target.wants"
     ln -sf ../rear-ctld.service   "$OVERLAY/etc/systemd/system/basic.target.wants/rear-ctld.service"
     ln -sf ../boot-report.service "$OVERLAY/etc/systemd/system/basic.target.wants/boot-report.service"
-    ln -sf ../uvc-activate.service "$OVERLAY/etc/systemd/system/basic.target.wants/uvc-activate.service"
 }
 
 # ---------------------------------------------------------------------------
