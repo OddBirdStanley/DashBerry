@@ -825,6 +825,18 @@ patch_kernel_config() {
     #
     # raspberrypi/linux's own bcmrpi_defconfig sets CONFIG_NOP_USB_XCEIV=y.
     # This is not a workaround; it is the driver the device tree asks for.
+    # dwc2's own tracing. -DDEBUG turns its dev_dbg() calls into real output,
+    # including dwc2_hsotg_pullup()'s "is_on: %d op_state: %d" and
+    # dwc2_hsotg_core_connect()'s "called" - i.e. exactly whether the pull-up
+    # reached the hardware and what state the core thought it was in. Every
+    # round so far has had to INFER that from silence.
+    #
+    # It is verbose and belongs off once the port enumerates; the cost while
+    # bringing up is a longer log, and the log is the only instrument here.
+    say "kernel → +USB_DWC2_DEBUG (dwc2's own pull-up tracing)"
+    sed -i -E '/^(# )?CONFIG_USB_DWC2_(DEBUG|VERBOSE)( is not set|=.*)$/d' "$f"
+    printf 'CONFIG_USB_DWC2_DEBUG=y\n' >> "$f"
+
     say "kernel → +NOP_USB_XCEIV (the DT's usb-nop-xceiv phy, never built)"
     sed -i -E '/^(# )?CONFIG_(NOP_USB_XCEIV|USB_PHY|GENERIC_PHY)( is not set|=.*)$/d' "$f"
     cat >> "$f" <<'EOP'
