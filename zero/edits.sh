@@ -346,6 +346,26 @@ bind_gadget() {
   ls /sys/class/udc > UDC 2>/tmp/udc-bind.err
   if [ -n "$(cat UDC 2>/dev/null)" ] ; then
     echo "Gadget bound to $(cat UDC)  [$1]"
+    # DashBerry: BINDING IS NOT ATTACHING. In dr_mode=peripheral - which the
+    # car needs, because its converter grounds ID and an OTG port would become
+    # a HOST - dwc2 runs no OTG session state machine, so
+    # usb_udc_vbus_handler() never reports VBUS, udc->vbus stays false, and
+    # usb_udc_connect_control() DISCONNECTS instead of connecting. The result
+    # is a gadget that binds, registers its video node, and is never on the
+    # bus: the host sees nothing at all, not even a failed enumeration.
+    #
+    # soft_connect calls usb_gadget_connect_locked() directly, and that path
+    # checks only ->pullup, ->started and ->allow_connect - never vbus - all of
+    # which hold once the bind above succeeded.
+    for sc in /sys/class/udc/*/soft_connect ; do
+      [ -e "$sc" ] || continue
+      if echo connect > "$sc" 2>/dev/null ; then
+        echo "Pull-up asserted via $sc"
+      else
+        echo "WARNING: could not assert pull-up via $sc"
+        echo "  The gadget is bound but may never appear on the bus."
+      fi
+    done
     return 0
   fi
   echo "Bind FAILED [$1]: $(cat /tmp/udc-bind.err 2>/dev/null)"
@@ -494,10 +514,20 @@ install_overlay() {
 #     configfs-gadget.piwebcam", /dev/video1 present — and the host saw
 #     nothing at all, not even a failed enumeration attempt.
 #
-#     OTG is what stock showmewebcam uses and what is proven to enumerate on
-#     this hardware, so that is the default. ZERO_DR_MODE=peripheral restores
-#     the old behaviour for a cable that grounds ID — but expect to have to
-#     solve the pull-up problem before it is usable.
+#     PERIPHERAL REMAINS THE DEFAULT, because the CAR needs it: the rear run
+#     uses a micro-USB converter, and an OTG port with ID grounded becomes a
+#     HOST — the camera would disappear exactly where it matters. Choosing OTG
+#     would trade a bench that works for a car that does not.
+#
+#     The pull-up is asserted explicitly instead. multi-gadget.sh writes
+#     "connect" to /sys/class/udc/<udc>/soft_connect after binding, which calls
+#     usb_gadget_connect_locked() directly — and that path checks only
+#     ->pullup, ->started and ->allow_connect, never udc->vbus. So the gadget
+#     attaches without depending on a session interrupt that forced-peripheral
+#     dwc2 never delivers.
+#
+#     ZERO_DR_MODE=otg selects stock's behaviour, for a bench cable that leaves
+#     ID floating.
 # (b) gpu_mem=256 on a 512 MB Zero W. The hardware encoder needs it, and it
 #     needs it MORE now than when this was an MJPEG card.
 # ---------------------------------------------------------------------------
@@ -506,7 +536,7 @@ patch_post_image() {
     anchor "$f" "--configure-picam)" "the boot config.txt assembly"
     anchor "$f" "dtoverlay=dwc2" "the picam boot-config block"
 
-    ZERO_DR_MODE=${ZERO_DR_MODE:-otg}
+    ZERO_DR_MODE=${ZERO_DR_MODE:-peripheral}
     case $ZERO_DR_MODE in
         otg) DR_SUFFIX= ;;
         *)   DR_SUFFIX=",dr_mode=$ZERO_DR_MODE" ;;

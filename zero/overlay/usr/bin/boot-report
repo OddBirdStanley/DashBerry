@@ -80,6 +80,13 @@ remount rw || { echo "boot-report: cannot remount /boot rw" >&2; exit 1; }
         echo "  configfs   : ABSENT — multi-gadget.sh never ran, or configfs is not mounted"
     fi
     echo "  UDCs seen  : $(ls /sys/class/udc 2>/dev/null | tr '\n' ' ')"
+    # Bound is not attached. `state` is the UDC's own view: "not attached"
+    # means the pull-up was never asserted and the host cannot see us however
+    # correct the gadget is; "configured" means a host enumerated it.
+    for u in /sys/class/udc/*; do
+        [ -d "$u" ] || continue
+        echo "  ${u##*/} state: $(cat "$u/state" 2>/dev/null)   soft_connect: $(cat "$u/soft_connect" 2>/dev/null)"
+    done
     echo "  (no UDC at all means dwc2 did not bind: check dr_mode and the cable)"
     echo
 
