@@ -124,6 +124,15 @@ handle() {                         # $1.. = one command line → one reply line
         ;;
     "")
         ;;
+    AT*|at*|At*|aT*)
+        # ModemManager, on the host, probing whether this is a modem. Answer
+        # nothing at all: a reply of any kind — even an error — reads as a
+        # response and invites more probing, whereas silence makes it time out
+        # and mark the port as not-a-modem. The Pi 4 also tells it to skip
+        # these ports outright (99-dashberry.rules), but a bench PC will not
+        # have that rule, and a card should not depend on the host being
+        # configured.
+        ;;
     *)
         echo "ERR unknown command \"$cmd\" — VERSION LIST GET SET APPLY"
         ;;

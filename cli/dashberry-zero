@@ -162,7 +162,25 @@ if [ "$MODE" = check ]; then
     while read -r _junk <&3; do :; done 2>/dev/null || true
 
     printf 'VERSION\r\n' >&3
-    if ! read -r ver <&3; then
+        # Skip host-side noise rather than treating it as the answer.
+        # ModemManager probes new CDC-ACM ports by writing AT commands at
+        # them, and those bytes come back interleaved with ours — the symptom
+        # was a VERSION reply reading "ATAT...". udev tells it to skip these
+        # ports and the daemon stays silent at them, but a port can already be
+        # mid-probe when we open it, so the reader drops what it recognises as
+        # not-an-answer instead of failing on it.
+    ver=""
+    tries=0
+    while [ "$tries" -lt 6 ]; do
+        tries=$((tries + 1))
+        read -r ver <&3 || { ver=""; break; }
+        ver=${ver%$'\r'}
+        case $ver in
+            ''|AT*|at*|At*|aT*|OK|ERROR) continue ;;
+            *) break ;;
+        esac
+    done
+    if [ -z "$ver" ]; then
         die "no answer from $PORT, though the port exists.
   The gadget is up and the control function enumerated, so the Zero booted —
   what is missing is rear-ctld answering on it. Log in on the console
@@ -171,7 +189,6 @@ if [ "$MODE" = check ]; then
       ls -l /dev/ttyGS1
   A stock showmewebcam card also lands here: it has no rear-ctld at all."
     fi
-    ver=${ver%$'\r'}
     case $ver in
         DASHBERRY-ZERO\ *) echo "  $ver" ;;
         *) die "unexpected answer on $PORT: \"$ver\" — is this the login console rather than the control port?" ;;

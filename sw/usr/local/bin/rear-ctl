@@ -55,11 +55,24 @@ while read -r _junk <&3; do :; done 2>/dev/null || true
 
 ask() {                            # $* = command → reply on stdout, nonzero on no reply
     printf '%s\r\n' "$*" >&3
-    if read -r _reply <&3; then
-        printf '%s\n' "${_reply%$(printf '\r')}"
-    else
-        return 1
-    fi
+    # Skip host-side noise rather than treating it as the answer. ModemManager
+    # probes new CDC-ACM ports by writing AT commands at them, and those bytes
+    # come back interleaved with ours — the symptom was a VERSION reply reading
+    # "ATAT...". udev tells it to skip these ports and the daemon stays silent
+    # at them, but a port can already be mid-probe when we open it, so the
+    # reader drops what it recognises as not-an-answer instead of failing.
+    # A bare "OK"/"ERROR" is a modem reply; ours are always "OK <something>".
+    _tries=0
+    while [ "$_tries" -lt 6 ]; do
+        _tries=$((_tries + 1))
+        read -r _reply <&3 || return 1
+        _reply=${_reply%$(printf '\r')}
+        case $_reply in
+            ''|AT*|at*|At*|aT*|OK|ERROR) continue ;;
+            *) printf '%s\n' "$_reply"; return 0 ;;
+        esac
+    done
+    return 1
 }
 
 fail() { echo "rear-ctl: $*" >&2; exit 1; }
