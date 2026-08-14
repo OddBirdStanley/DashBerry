@@ -7,38 +7,42 @@ contain "streaming/class/". Those paths exist only through symlinks:
     streaming/class/<speed>/<header>  ->  streaming/header/<header>
     streaming/header/<header>/<inst>  ->  streaming/<format>/<inst>
 
-and ftw() does not descend into them on configfs. Measured on the device with
-the diagnostics from 0002:
+and ftw() does not descend into them on configfs. Measured on the device:
 
     ftw returned 0 (errno 0: none); files seen 122, under streaming/class 0
 
 122 files walked, not one under streaming/class - while find -follow reaches
-them and cat reads through them fine. So no format is ever recorded, and the
+them and cat reads through them fine. So no format is ever recorded and the
 only symptom is "configfs settings for uvc gadget not found".
 
 The real path carries everything except the speed:
 
     .../streaming/<format>/<instance>/<frame>/<attribute>
 
-so this matches that shape as well and registers each frame for fs, hs and ss.
+so this matches that shape too and registers each frame for fs, hs and ss.
 That is not an assumption: multi-gadget.sh links the same header into all three
-class/<speed> groups, so every format really is offered at every speed, and the
-result is what walking the class/ view would have produced.
+class/<speed> groups, so every format really is offered at every speed.
 
-Only 4-component paths are used - format/instance/frame/attribute. Shorter ones
-are format- or header-level attributes with no frame to belong to, and feeding
-them in would produce noise from the value parser.
+bFormatIndex is taken from the FORMAT level as well, and it has to be. It is
+the format's position in the USB descriptors - the number the host selects by -
+and without it the table is built in readdir order, so the daemon maps the
+host's choice onto the wrong entry. The symptom is exact and was seen:
+
+    Tried to capture in H264, but device returned format MJPG
+
+No other format-level attribute is taken: guidFormat, bmaControls and the
+aspect ratios are not integers and would only produce parse noise.
 
 NOT EXPLAINED: the same binary at the same SHA is said to work on a stock
-5.10 card with the same tree shape. If ftw() behaved differently there, this
-change is harmless on it - the class/ branch still runs first and this one only
-adds paths it would otherwise ignore.
+5.10 card with the same tree shape. If ftw() behaves differently there this
+change is harmless - the class/ branch still runs first and this only adds
+paths it would otherwise ignore.
 ---
 diff --git a/uvc-gadget.c b/uvc-gadget.c
-index b16475a..15a4f86 100644
+index b16475a..cc1144a 100644
 --- a/uvc-gadget.c
 +++ b/uvc-gadget.c
-@@ -2211,10 +2211,55 @@ static void configfs_fill_streaming_params(const char* path, const char * part)
+@@ -2211,10 +2211,67 @@ static void configfs_fill_streaming_params(const char* path, const char * part)
  static int dashberry_files_seen = 0;
  static int dashberry_files_matched = 0;
  
@@ -73,12 +77,24 @@ index b16475a..15a4f86 100644
 +        tok = strtok(NULL, "/");
 +    }
 +
-+    /* <format>/<instance>/<frame>/<attribute> only: anything shorter is a
-+     * format- or header-level attribute and has no frame to belong to. */
 +    if (n == 4) {
++        /* <format>/<instance>/<frame>/<attribute> - the frame geometry. */
 +        for (i = 0; i < sizeof(speeds) / sizeof(speeds[0]); i++) {
 +            snprintf(synth, sizeof(synth), "%s/h/%s/%s/%s",
 +                     speeds[i], arr[1], arr[2], arr[3]);
++            configfs_fill_formats(path, synth);
++        }
++    } else if (n == 3 && !strcmp(arr[2], "bFormatIndex")) {
++        /* <format>/<instance>/bFormatIndex - the format's position in the
++         * descriptors, which is what the host selects by. Without it the
++         * table is built in readdir order and the daemon maps the host's
++         * chosen index onto the wrong format: asking for H.264 and being
++         * handed MJPEG. Only this one attribute is taken from the format
++         * level; the rest (guidFormat, bmaControls, aspect ratios) are not
++         * numbers and would only produce parse noise. */
++        for (i = 0; i < sizeof(speeds) / sizeof(speeds[0]); i++) {
++            snprintf(synth, sizeof(synth), "%s/h/%s/%s",
++                     speeds[i], arr[1], arr[2]);
 +            configfs_fill_formats(path, synth);
 +        }
 +    }
@@ -94,7 +110,7 @@ index b16475a..15a4f86 100644
      int streaming_params = find_text_pos(fpath, "/streaming_");
      (void)(tflag); /* avoid warning: unused parameter 'tflag' */
  
-@@ -2224,6 +2269,10 @@ static int configfs_path_check(const char* fpath, const struct stat * sb, int tf
+@@ -2224,6 +2281,10 @@ static int configfs_path_check(const char* fpath, const struct stat * sb, int tf
              dashberry_files_matched++;
              configfs_fill_formats(fpath, fpath + streaming + 16);
  
