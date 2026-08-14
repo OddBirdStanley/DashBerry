@@ -293,7 +293,13 @@ step "image ($BOARD)"
 # a few hundred KB and builds in seconds.
 if [ -f "$SMW_DIR/output/$BOARD/.config" ]; then
     step "invalidate patched packages"
-    for pkg in piwebcam; do
+    # rpi-firmware owns images/rpi-firmware/config.txt, and post-image.sh
+    # APPENDS to that file guarded by "if not already present". The file
+    # survives in output/ across builds, so after the first build every
+    # dtoverlay line is frozen: changing dr_mode in edits.sh had no effect on
+    # the card for several rounds, and the card was tested against a config
+    # nobody had written that week.
+    for pkg in piwebcam rpi-firmware; do
         echo "  $pkg-dirclean (its sources are patched by edits.sh)"
         make -C "$SMW_DIR/output/$BOARD" "$pkg-dirclean" >/dev/null 2>&1 \
             || die "could not dirclean $pkg — a stale build of it would ship silently"
@@ -391,6 +397,30 @@ verify_patched_files() {
     echo "  patched-file gate: what we patched is what shipped"
 }
 verify_patched_files
+
+# --- gate: is the boot config the one we asked for? ------------------------
+# Same failure as the stale package, one directory over: post-image.sh only
+# appends what is not already in config.txt, and that file outlives the build
+# that wrote it. This checks the USB role actually shipped, because getting it
+# wrong costs a card that never enumerates and looks like a driver bug.
+verify_boot_config() {
+    local cfg="$SMW_DIR/output/$BOARD/images/rpi-firmware/config.txt" want
+    [ -f "$cfg" ] || { echo "  (no config.txt to check — skipped)"; return 0; }
+    case ${ZERO_DR_MODE:-otg} in
+        otg) want="dtoverlay=dwc2" ;;
+        *)   want="dtoverlay=dwc2,dr_mode=${ZERO_DR_MODE}" ;;
+    esac
+    grep -qx "$want" "$cfg" || die "the built config.txt does not carry the USB role we asked for.
+    wanted: $want
+    found : $(grep -E '^dtoverlay=dwc2' "$cfg" || echo '(no dtoverlay=dwc2 line at all)')
+
+  post-image.sh appends that line only when it is absent, and
+  images/rpi-firmware/config.txt persists across builds — so a stale one is
+  never corrected. rpi-firmware should have been dircleaned above.
+  Refusing to package this image."
+    echo "  boot config gate: $want"
+}
+verify_boot_config
 
 IMG="$SMW_DIR/output/$BOARD/images/sdcard.img"
 [ -f "$IMG" ] || die "the build produced no $IMG — read the log above"
