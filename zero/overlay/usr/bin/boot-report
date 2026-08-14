@@ -42,6 +42,22 @@ remount rw || { echo "boot-report: cannot remount /boot rw" >&2; exit 1; }
     echo "  date    : $(date 2>/dev/null || echo 'no clock')"
     echo
 
+    echo "== WHY IS THERE NO UDC   (the question that matters)"
+    echo "  driver owning the USB node:"
+    for d in /sys/bus/platform/devices/*.usb; do
+        [ -e "$d" ] || continue
+        echo "    ${d##*/} -> $(basename "$(readlink -f "$d/driver" 2>/dev/null)" 2>/dev/null || echo 'NO DRIVER BOUND')"
+    done
+    # A probe that DEFERS prints nothing at all, which is exactly what the
+    # first dead card looked like. This is the list that says so out loud.
+    mount -t debugfs none /sys/kernel/debug 2>/dev/null
+    echo "  deferred probes:"
+    sed 's/^/    /' /sys/kernel/debug/devices_deferred 2>/dev/null || echo "    (debugfs unavailable)"
+    echo "  loaded modules: $(lsmod 2>/dev/null | tail -n +2 | cut -d' ' -f1 | tr '\n' ' ')"
+    echo "  dwc2/udc/gadget kernel messages:"
+    dmesg 2>/dev/null | grep -iE "dwc2|dwc_otg|udc|gadget|usb" | tail -40 | sed 's/^/    /'
+    echo
+
     echo "== USB gadget"
     G=/sys/kernel/config/usb_gadget/piwebcam
     if [ -d "$G" ]; then
@@ -76,8 +92,10 @@ remount rw || { echo "boot-report: cannot remount /boot rw" >&2; exit 1; }
     journalctl -b --no-pager 2>/dev/null | grep -iE "gadget|uvc|dwc2|bcm2835|video|rear-ctld" | tail -60
     echo
 
-    echo "== kernel messages, last 120 lines"
-    dmesg 2>/dev/null | tail -120
+    echo "== kernel messages, in full"
+    # NOT a tail: the first dead card's decisive lines were the last two, and
+    # a truncated log hid whether anything followed them.
+    dmesg 2>/dev/null
 } > "$REPORT" 2>&1
 
 sync

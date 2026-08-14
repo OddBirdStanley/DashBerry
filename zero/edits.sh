@@ -612,6 +612,33 @@ patch_kernel_config() {
     say "kernel → renaming symbols that moved since 5.10"
     sed -i 's/^CONFIG_MMC_BCM2835_SDHOST=/CONFIG_MMC_BCM2835=/' "$f"
 
+    # THE GADGET STACK IS BUILT IN, NOT MODULAR.
+    #
+    # showmewebcam ships CONFIG_USB_DWC2=m, CONFIG_USB_GADGET=m and
+    # CONFIG_USB_CONFIGFS=m, and relies on `modules-load=dwc2,libcomposite` on
+    # the kernel command line to bring them up. On 6.16 that leaves the USB
+    # controller probing LATE, after the deferred-probe pass has settled, and
+    # the first card built here bound no UDC at all: dwc2 attached to
+    # 20980000.usb, logged its two dummy-regulator warnings, and then went
+    # silent. Several early returns in dwc2_driver_probe() exit without
+    # printing anything — a deferred probe most of all — so silence is
+    # consistent with a probe that never completed.
+    #
+    # Building it in removes module ordering from the question entirely, and
+    # is what this board should have been doing anyway: its whole purpose is
+    # to be a USB gadget. It also settles a complaint already visible in the
+    # log — "Unknown kernel command line parameters modules-load=dwc2,
+    # libcomposite, will be passed to user space".
+    #
+    # This does NOT prove the ordering was the fault. If the next card still
+    # binds no UDC, the boot report now carries what does prove it: which
+    # driver owns the USB node, the deferred-probe list, and a forced re-probe.
+    say "kernel → USB gadget stack built in (was modular + modules-load)"
+    sed -i -E 's/^CONFIG_USB_(DWC2|GADGET|CONFIGFS|LIBCOMPOSITE)=m$/CONFIG_USB_\1=y/' "$f"
+    for k in CONFIG_USB_DWC2 CONFIG_USB_GADGET CONFIG_USB_CONFIGFS CONFIG_USB_LIBCOMPOSITE; do
+        grep -q "^$k=y" "$f" || printf '%s=y\n' "$k" >> "$f"
+    done
+
     say "kernel → Wi-Fi and Bluetooth built out entirely"
     # The existing =m lines have to go, not just be followed by a disable:
     # merge_config takes the LAST value, but leaving both is unreadable.
