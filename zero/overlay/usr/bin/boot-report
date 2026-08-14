@@ -85,7 +85,10 @@ remount rw || { echo "boot-report: cannot remount /boot rw" >&2; exit 1; }
     # correct the gadget is; "configured" means a host enumerated it.
     for u in /sys/class/udc/*; do
         [ -d "$u" ] || continue
-        echo "  ${u##*/} state: $(cat "$u/state" 2>/dev/null)   soft_connect: $(cat "$u/soft_connect" 2>/dev/null)"
+        # soft_connect is write-only, so it always reads empty - state is the
+        # one that matters. "not attached" = the bus never reset us.
+        echo "  ${u##*/} state: $(cat "$u/state" 2>/dev/null)"
+        echo "    is_otg=$(cat "$u/is_otg" 2>/dev/null) is_a_peripheral=$(cat "$u/is_a_peripheral" 2>/dev/null) speed=$(cat "$u/current_speed" 2>/dev/null) driver=$(cat "$u/function" 2>/dev/null)"
     done
     echo "  (no UDC at all means dwc2 did not bind: check dr_mode and the cable)"
     echo
