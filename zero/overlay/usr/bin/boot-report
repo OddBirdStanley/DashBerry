@@ -98,8 +98,18 @@ remount rw || { echo "boot-report: cannot remount /boot rw" >&2; exit 1; }
     # the form <speed>/<header>/<format>/<frame>/<attr> under streaming/class/.
     # It reported "configfs settings for uvc gadget not found", so print what
     # is actually there rather than guessing at the shape.
-    find "$G/functions/uvc.usb0/streaming/class" "$G/functions/uvc.usb0/control/class" \
-         -maxdepth 4 2>/dev/null | sed "s|$G/functions/uvc.usb0/|  |" | head -40
+    # -L: FOLLOW the symlinks. Without it find stops at class/<speed>/h and
+    # shows nothing of what uvc-gadget actually walks, which is the format and
+    # frame tree behind it. (ftw() does follow them - verified.)
+    find -L "$G/functions/uvc.usb0/streaming/class" "$G/functions/uvc.usb0/control/class" \
+         -maxdepth 6 2>/dev/null | sed "s|$G/functions/uvc.usb0/|  |" | head -60
+    echo "  --- what the streaming header links to ---"
+    ls -l "$G/functions/uvc.usb0/streaming/header/h" 2>/dev/null | sed 's/^/  /'
+    echo "  --- gadget deactivation state (bind_deactivated) ---"
+    echo "  If uvc-gadget is not running, the UVC function keeps the WHOLE"
+    echo "  gadget deactivated and nothing enumerates - see usr/bin/uvc-activate."
+    echo "  uvc-gadget running: $(pidof uvc-gadget >/dev/null 2>&1 && echo yes || echo NO)"
+    echo "  uvc-activate running: $(pidof -x uvc-activate >/dev/null 2>&1 && echo yes || echo no)"
     echo "  --- what uvc-gadget said ---"
     journalctl -b --no-pager -u uvc-webcam 2>/dev/null | tail -15 | sed 's/^/  /'
     echo

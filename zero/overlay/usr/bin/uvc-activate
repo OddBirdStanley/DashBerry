@@ -1,0 +1,68 @@
+#!/bin/sh
+# uvc-activate — hold the UVC gadget's V4L2 node open so the card can enumerate
+# even when uvc-gadget is not running.
+#
+# WHY THIS IS NOT A HACK, OR NOT ONLY ONE
+# ---------------------------------------
+# f_uvc.c sets `uvc->func.bind_deactivated = true`, so composite deactivates
+# the whole gadget when the UVC function binds. usb_gadget_connect_locked()
+# then returns WITHOUT calling ->pullup while gadget->deactivated is set, so D+
+# is never asserted and the device never appears on the bus. The function is
+# activated only when userspace opens the gadget's video node —
+# uvc_v4l2_open() -> uvc_function_connect() -> usb_function_activate().
+#
+# Normally uvc-gadget does that. When it fails — as it does here, with
+# "configfs settings for uvc gadget not found" — the consequence is not "no
+# video". It is NO USB DEVICE AT ALL: no camera, no console, no control port,
+# because a composite gadget is all-or-nothing. The one channel that could
+# explain the failure disappears because of the failure.
+#
+# So this opens the node itself and holds it. The camera produces no frames
+# without the real daemon, but the card enumerates, the console comes back, and
+# the control port answers — which is the difference between debugging a
+# running system and reflashing to read a file.
+#
+# It exits immediately if uvc-gadget is already running, so on a healthy card
+# it does nothing at all.
+set -u
+
+# The gadget's own video node, not the sensor's. bcm2835-v4l2 registers
+# /dev/video0 plus the codec nodes; the UVC gadget registers its own, and its
+# name is the function's.
+find_gadget_node() {
+    for d in /sys/class/video4linux/video*; do
+        [ -r "$d/name" ] || continue
+        case "$(cat "$d/name" 2>/dev/null)" in
+        *uvc*|*UVC*) echo "/dev/${d##*/}"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Give uvc-gadget its chance first.
+sleep 12
+
+if pidof uvc-gadget >/dev/null 2>&1; then
+    echo "uvc-activate: uvc-gadget is running, nothing to do" >&2
+    exit 0
+fi
+
+NODE=$(find_gadget_node) || {
+    echo "uvc-activate: no UVC gadget video node found — the function never bound" >&2
+    exit 1
+}
+
+echo "uvc-activate: uvc-gadget is NOT running; opening $NODE to activate the" >&2
+echo "  gadget so the card enumerates. The camera will produce no frames, but" >&2
+echo "  the console and control port will work. Fix uvc-gadget, then this" >&2
+echo "  becomes a no-op." >&2
+
+# Holding the descriptor open is what keeps the function activated; closing it
+# would call uvc_function_disconnect() and take the whole device off the bus
+# again.
+exec 3<>"$NODE" || {
+    echo "uvc-activate: could not open $NODE" >&2
+    exit 1
+}
+
+while :; do sleep 3600; done

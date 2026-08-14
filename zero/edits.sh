@@ -481,10 +481,11 @@ install_overlay() {
     chmod 755 "$OVERLAY/usr/bin/rear-ctld"
     printf '%s\n' "${DASHBERRY_ZERO_VERSION:-dev}" > "$OVERLAY/etc/dashberry-zero-version"
 
-    chmod 755 "$OVERLAY/usr/bin/boot-report"
+    chmod 755 "$OVERLAY/usr/bin/boot-report" "$OVERLAY/usr/bin/uvc-activate"
     mkdir -p "$OVERLAY/etc/systemd/system/basic.target.wants"
     ln -sf ../rear-ctld.service   "$OVERLAY/etc/systemd/system/basic.target.wants/rear-ctld.service"
     ln -sf ../boot-report.service "$OVERLAY/etc/systemd/system/basic.target.wants/boot-report.service"
+    ln -sf ../uvc-activate.service "$OVERLAY/etc/systemd/system/basic.target.wants/uvc-activate.service"
 }
 
 # ---------------------------------------------------------------------------
