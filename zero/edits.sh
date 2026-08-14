@@ -517,9 +517,31 @@ PY
 patch_start_webcam() {
     local f="$PIWEBCAM/start-webcam.sh"
     anchor "$f" '-b 3 -u /dev/video1 -v /dev/video0' "the uvc-gadget command line"
-    say "start-webcam.sh → -n ${ZERO_UVC_NBUFS:-8} video buffers (was the default 2)"
-    sed -i "s|-b 3 -u /dev/video1|-b 3 -n ${ZERO_UVC_NBUFS:-8} -u /dev/video1|" "$f"
-    grep -q -- "-n ${ZERO_UVC_NBUFS:-8}" "$f" || die "start-webcam.sh edit did not take — read it."
+    say "start-webcam.sh → -n from /boot/uvc-nbufs (default ${ZERO_UVC_NBUFS:-8})"
+    python3 - "$f" "${ZERO_UVC_NBUFS:-8}" <<'PY'
+import sys
+path, default = sys.argv[1], sys.argv[2]
+s = open(path).read()
+old = "exec /opt/uvc-webcam/uvc-gadget -l -p 21 -b 3 -u /dev/video1 -v /dev/video0"
+assert s.count(old) == 1, "the uvc-gadget command line moved"
+new = f"""# DashBerry: -n is the V4L2 buffer count and was never passed, so this ran at
+# uvc-gadget's built-in 2 — the minimum the option accepts. It is read from
+# /boot here rather than baked in because it is a TUNING knob: too few starves
+# the pipeline, and too many appears to delay the sensor's first frame. Both
+# ends of that cost a bench session to measure, and rebuilding the image to
+# try one number costs far more than editing a file on the card.
+#
+# NOTE -b is not a buffer count. It is "blink the LED X times on startup".
+NBUFS={default}
+[ -r /boot/uvc-nbufs ] && read -r NBUFS < /boot/uvc-nbufs
+case "$NBUFS" in ''|*[!0-9]*) NBUFS={default} ;; esac
+[ "$NBUFS" -ge 2 ] && [ "$NBUFS" -le 32 ] || NBUFS={default}
+logger -t "$LOGGER_TAG" "uvc-gadget: $NBUFS video buffers"
+
+exec /opt/uvc-webcam/uvc-gadget -l -p 21 -b 3 -n "$NBUFS" -u /dev/video1 -v /dev/video0"""
+open(path, "w").write(s.replace(old, new))
+PY
+    grep -q '/boot/uvc-nbufs' "$f" || die "start-webcam.sh edit did not take — read it."
 }
 
 patch_camera_txt() {
