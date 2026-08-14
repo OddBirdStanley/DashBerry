@@ -514,10 +514,21 @@ install_overlay() {
 #     configfs-gadget.piwebcam", /dev/video1 present — and the host saw
 #     nothing at all, not even a failed enumeration attempt.
 #
-#     PERIPHERAL REMAINS THE DEFAULT, because the CAR needs it: the rear run
-#     uses a micro-USB converter, and an OTG port with ID grounded becomes a
-#     HOST — the camera would disappear exactly where it matters. Choosing OTG
-#     would trade a bench that works for a car that does not.
+#     OTG IS THE DEFAULT, because it is the only mode observed to attach on
+#     this hardware. A stock 5.10 card's log shows dwc2 doing FULL dual-role
+#     init - "DWC OTG Controller", "new USB bus registered", "hub 1-0:1.0" -
+#     and only then "new device is high-speed / new address 4", which is the
+#     gadget reporting that a host enumerated it. dr_mode=peripheral skips
+#     that entire path, and on 6.16 it binds, asserts a pull-up, and never
+#     attaches - with or without the PHY driver.
+#
+#     THE CAR STILL NEEDS ID TO FLOAT. In OTG the role comes from the ID pin,
+#     so a converter that grounds it makes the Zero a HOST and the camera
+#     disappears. That has to be fixed in the CABLE, not the driver: the Zero
+#     is the device, so a plain USB-A-to-micro-B cable is correct and leaves ID
+#     floating. Only an OTG-style adapter (micro-B male to A female) grounds
+#     it, and masking pin 4 defeats one that does. Fighting it in software
+#     means dr_mode=peripheral, which does not work on this kernel.
 #
 #     The pull-up is asserted explicitly instead. multi-gadget.sh writes
 #     "connect" to /sys/class/udc/<udc>/soft_connect after binding, which calls
@@ -536,7 +547,7 @@ patch_post_image() {
     anchor "$f" "--configure-picam)" "the boot config.txt assembly"
     anchor "$f" "dtoverlay=dwc2" "the picam boot-config block"
 
-    ZERO_DR_MODE=${ZERO_DR_MODE:-peripheral}
+    ZERO_DR_MODE=${ZERO_DR_MODE:-otg}
     case $ZERO_DR_MODE in
         otg) DR_SUFFIX= ;;
         *)   DR_SUFFIX=",dr_mode=$ZERO_DR_MODE" ;;
