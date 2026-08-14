@@ -275,7 +275,7 @@ things the Pi 4 actually needs to say could never have ridden that path.
   night with no way to clip a bright sky. Exposure bias moves the whole
   metering target. Judge a real night segment.
 - **`REAR_BITRATE` / `REAR_GOP`** → the Zero's `video_bitrate` and
-  `h264_i_period`. The profile is **high** now, not `openh264`'s baseline-only
+  `h264_i_frame_period`. The profile is **high** now, not `openh264`'s baseline-only
   — worth ~10–20% of the bitrate for nothing.
 - **`camera.txt`'s shipped `video_bitrate=25000000`** is **removed by the
   build**. On an MJPEG card it was inert (an H.264 control on a gadget that

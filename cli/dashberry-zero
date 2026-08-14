@@ -205,7 +205,7 @@ if [ "$MODE" = check ]; then
     echo "    request outright and the rear records NOTHING."
     echo "  * horizontal_flip / vertical_flip present — INVERT_REAR has no"
     echo "    other home now that the Pi 4 does not decode."
-    echo "  * video_bitrate, h264_i_period, h264_profile, auto_exposure_bias:"
+    echo "  * video_bitrate, h264_i_frame_period, h264_profile, auto_exposure_bias:"
     echo "    the four rear-ctl pushes on every start of rear-rec."
     exit 0
 fi

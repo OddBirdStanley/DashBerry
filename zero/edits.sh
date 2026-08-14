@@ -53,7 +53,7 @@ anchor() {
 # We take rpi-6.16.y, which needs NO kernel patch and still carries
 # drivers/staging/vc04_services/bcm2835-camera — the legacy MMAL driver this
 # image depends on for the sensor AND for the encoder controls (video_bitrate,
-# h264_i_period, compression_quality, auto_exposure_bias).
+# h264_i_frame_period, compression_quality, auto_exposure_bias).
 #
 # The branch is resolved to a SHA here, not left as a branch name: buildroot's
 # $(call github,...) will happily fetch a moving branch, and a card you cannot

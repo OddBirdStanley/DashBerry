@@ -116,7 +116,7 @@ done
 # closest to rear-rec's open.
 set -- \
     video_bitrate           "$REAR_BITRATE" \
-    h264_i_period           "${REAR_GOP:-27}" \
+    h264_i_frame_period     "${REAR_GOP:-27}" \
     h264_profile            "${REAR_PROFILE:-high}" \
     repeat_sequence_header  1 \
     auto_exposure_bias      "${REAR_EXPOSURE_BIAS:-12}" \
