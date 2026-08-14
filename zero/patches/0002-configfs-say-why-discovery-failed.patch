@@ -1,31 +1,25 @@
 From: DashBerry <zero/README.md>
-Subject: [PATCH] configfs: say why format discovery failed
+Subject: [PATCH] configfs: say why discovery failed, and never lose the log
 
-uvc-gadget reports exactly one thing when it cannot find its settings:
+uvc-gadget reports one message when it cannot find its settings:
 
     ERROR: configfs settings for uvc gadget not found!
 
-That single message covers three completely different failures - ftw() failing
-outright, the walk finding no file under streaming/class/, and every candidate
-file being rejected by the parser - and the parser's two most likely bails
-(unreadable value, wrong number of path components) print nothing at all.
+which covers ftw() failing, the walk matching nothing, and every candidate
+being rejected - three different bugs. The parser's two most likely bails print
+nothing at all. This prints ftw()'s return and errno, files seen versus files
+matched, the reason for each bail, and the path derived for every candidate.
 
-On a card where the tree is demonstrably correct, this left no way to tell
-which had happened. Verified from a shell on the device: the class/ paths ARE
-walkable (find -follow reaches them, 25 hits), the attribute reads fine
-(wWidth is exactly "1640\n", 5 bytes), the header links both formats
-(h -> framebased/h, m -> mjpeg/m), and the H.264 fourcc branch is in the
-binary - and discovery still yields nothing.
+It also line-buffers stdout. That is not cosmetic: stdout is a pipe into the
+journal and therefore block buffered, so when the process died on a SIGSEGV the
+whole buffered log died with it - a crash with NO output at all, not even the
+"Initial path" line printed before any work is done. Line buffering means
+whatever it managed to say survives the crash.
 
-So this prints ftw()'s return and errno, how many files the walk saw versus how
-many were under streaming/class/, and the reason for each parser bail. It
-distinguishes "the walk failed", "the walk saw nothing", and "the walk saw
-everything and rejected it", which are three different bugs.
-
-Diagnostic only - no behaviour change. Applies on top of 0001.
+Diagnostic only; no behaviour change.
 ---
 diff --git a/uvc-gadget.c b/uvc-gadget.c
-index f147304..b16475a 100644
+index f147304..a51acdb 100644
 --- a/uvc-gadget.c
 +++ b/uvc-gadget.c
 @@ -2141,6 +2141,7 @@ static void configfs_fill_formats(const char * path, const char * part)
@@ -93,3 +87,17 @@ index f147304..b16475a 100644
          return -1;
      }
  
+@@ -2298,6 +2317,13 @@ int main(int argc, char * argv[])
+     sigaction(SIGTERM, &action, NULL);
+     sigaction(SIGINT, &action, NULL);
+ 
++    /* Line-buffer stdout. It is a pipe into the journal, so it is block
++     * buffered by default - and when this process died on a SIGSEGV the entire
++     * buffered log went with it, including the "CONFIGFS: Initial path" line
++     * that is printed before any of the work. The result was a crash with no
++     * output whatsoever and no way to tell where it happened. */
++    setvbuf(stdout, NULL, _IOLBF, 0);
++
+     ret = configfs_get_uvc_settings();
+     if (ret < 0) {
+         printf("ERROR: configfs settings for uvc gadget not found!\n");
