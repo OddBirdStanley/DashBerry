@@ -1,0 +1,98 @@
+From: DashBerry <zero/README.md>
+Subject: [PATCH] uvc: do not dereference the frame format we failed to find
+
+uvc_get_frame_format() returns -1 and leaves the caller's pointer untouched
+when no table entry matches. Its result was discarded:
+
+    struct uvc_frame_format * frame_format;
+    uvc_get_frame_format(&frame_format, iformat, iframe);
+    uvc_dump_frame_format(frame_format, "FRAME");     /* uninitialised */
+
+so a host asking for a (format, frame) pair the table does not hold reads an
+uninitialised stack pointer one line later.
+
+This is not a corner case on this image. uvc_fill_streaming_control() runs at
+startup with (0, 0), and both indices are clamped against ranges that are -1
+when the table is empty - so a discovery that recorded nothing arrives here
+directly.
+
+What makes it expensive is that it is invisible from the host. f_uvc answers
+standard requests out of the kernel, so the device enumerates perfectly, with
+correct H.264 descriptors, whether or not uvc-gadget parsed anything: the
+gadget's descriptors and uvc-gadget's table are two independent readings of
+the same configfs tree. Only the first CLASS-specific request reaches this
+code. When it dies there, ep0 stops being serviced for the entire gadget, and
+the symptom is the host timing out on control transfers and the login console
+hanging along with the camera - which reads like a USB or driver fault rather
+than a userspace crash.
+
+Measured: gst-launch failing after 10.5 s (two 5 s control-transfer timeouts)
+with "Buffer pool activation failed", ttyACM0 hung afterwards, and identical
+behaviour at 1280x720 and 1640x922 - i.e. not resolution or bandwidth.
+
+Answer badly rather than not at all. A missing entry now names itself, prints
+the whole table, and falls back to the first defined entry so the gadget keeps
+servicing ep0; an EMPTY table says so in as many words and returns a zeroed
+control. The host can reject a wrong answer. It cannot do anything with
+silence, and silence also costs the console and the control port.
+---
+--- a/uvc-gadget.c
++++ b/uvc-gadget.c
+@@ -1425,8 +1425,55 @@
+         iframe = clamp(iframe, format_frame_first, format_frame_last);
+     }
+ 
+-    struct uvc_frame_format * frame_format;
+-    uvc_get_frame_format(&frame_format, iformat, iframe);
++    /* DashBerry: uvc_get_frame_format() returns -1 and leaves the pointer
++     * ALONE when nothing matches, and its result was discarded - so a host
++     * asking for a (format, frame) the table does not hold dereferenced an
++     * uninitialised stack pointer one line later.
++     *
++     * That is not a corner case here. This function runs at startup with
++     * (0, 0), and both indices are clamped against ranges that are -1 when the
++     * table is empty, so a discovery that recorded nothing lands straight on
++     * it. And the failure is invisible from the host: f_uvc answers standard
++     * requests from the kernel, so the device still ENUMERATES perfectly with
++     * correct H.264 descriptors - it is only the first class-specific request
++     * that reaches this code. When it dies, ep0 stops being serviced for the
++     * whole gadget, so the symptom is the host timing out (2 x 5 s) and the
++     * CONSOLE hanging with the camera, which reads like a USB fault rather
++     * than a userspace crash.
++     *
++     * Answer badly rather than not at all: a zeroed control is a wrong answer
++     * the host can reject, whereas silence costs the console and the control
++     * port too.
++     */
++    struct uvc_frame_format * frame_format = NULL;
++    int have;
++
++    if (uvc_get_frame_format(&frame_format, iformat, iframe) < 0 || frame_format == NULL) {
++        printf("UVC: NO TABLE ENTRY for format %d frame %d - the host asked for "
++               "something discovery never recorded.\n", iformat, iframe);
++        printf("UVC: format range [%d, %d], frame range [%d, %d]; the table holds:\n",
++               format_first, format_last, frame_first, frame_last);
++
++        frame_format = NULL;
++        for (have = 0; have <= last_format_index; have++) {
++            if (uvc_frame_format[have].defined) {
++                uvc_dump_frame_format(&uvc_frame_format[have], "UVC:   have");
++                if (frame_format == NULL) {
++                    frame_format = &uvc_frame_format[have];
++                }
++            }
++        }
++
++        if (frame_format == NULL) {
++            printf("UVC:   (nothing - the format table is EMPTY)\n");
++            printf("UVC: configfs discovery found no format, so this gadget cannot "
++                   "answer any streaming request. Read the CONFIGFS lines above.\n");
++            memset(ctrl, 0, sizeof * ctrl);
++            return;
++        }
++        printf("UVC: falling back to the first entry above so the gadget keeps "
++               "answering; expect the host to reject it.\n");
++    }
+ 
+     uvc_dump_frame_format(frame_format, "FRAME");
+ 
