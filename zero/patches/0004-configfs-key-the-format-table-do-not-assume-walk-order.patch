@@ -1,0 +1,232 @@
+From: DashBerry <zero/README.md>
+Subject: [PATCH] configfs: key the format table, do not assume walk order
+
+The header-based discovery in the previous patch made uvc-gadget die on a
+SIGSEGV with no message at all:
+
+    piwebcam[196]: CONFIGFS: Initial path: /sys/kernel/config/usb_gadget
+    systemd[1]: uvc-webcam.service: Main process exited, code=killed, status=11/SEGV
+
+and, because f_uvc sets bind_deactivated, that took the whole gadget with it -
+no camera, no console, no control port.
+
+The fault is in this file, not in the header walk. configfs_fill_formats()
+decided whether a file belonged to a new table entry by comparing it against
+the LAST entry allocated. That held only because ftw() visited every attribute
+of one frame consecutively, for a single USB speed. Header-based discovery
+registers each file for fs, hs AND ss in turn, so consecutive calls alternate
+speed, the adjacency test never matches, and it allocated a fresh entry per
+attribute per speed: about 120 where 15 were wanted.
+
+uvc_frame_format[] holds 30. The bounds check ran on the INCREMENT only:
+
+    if (uvc_frame_format[last_format_index].defined) {
+        last_format_index++;
+        if (last_format_index > 29) {
+            goto free;              /* leaves the counter at 30 */
+        }
+    }
+    uvc_frame_format[last_format_index].usb_speed = usb_speed;   /* writes [30] */
+
+so on the next call [30] read back undefined, the increment was skipped, and
+the write went ahead one past the end. It then walked further out on each
+call, scribbling structs through .bss until something the process needed was
+gone. That is why the crash landed after the walk rather than at the overflow,
+and why it left nothing in the log.
+
+Matching on the key - speed, format, frame name - is order-independent, which
+is all ftw() actually guarantees, and the write is now bounded by the array's
+own size rather than a literal.
+
+Two things fall out of the same walk-order assumption:
+
+  - bFormatIndex lives one level above the frames it applies to, so readdir
+    can hand it over before them, and set_uvc_format_index() only stamps
+    entries that already exist. On that ordering the value was dropped and the
+    table ended up in walk order - which is precisely the bug where a host
+    asking for H.264 was handed MJPEG. It is now remembered and applied at
+    entry creation as well.
+
+  - dwFrameInterval is a list, one interval per line, and nothing consumes it
+    (set_uvc_format_value knows dwDefaultFrameInterval, not this one).
+    configfs_read_value() caps reads at 10 bytes, so it reported -ENODATA once
+    per frame per speed - 15 lines of failure in the boot report for a file
+    that was never wanted. Skipped by name instead.
+
+Measured before this patch: 15 "unreadable value (-61) for */dwFrameInterval"
+lines, then SIGSEGV.
+---
+--- a/uvc-gadget.c
++++ b/uvc-gadget.c
+@@ -2107,9 +2107,114 @@
+     return 0;
+ }
+ 
++/* DashBerry: bFormatIndex arrives out of band.
++ *
++ * It lives one level above the frames it applies to
++ * (streaming/header/<h>/<fmt>/bFormatIndex), and ftw() hands out a directory's
++ * entries in readdir order, so it can be seen either before or after the frame
++ * directories under it. set_uvc_format_index() only stamps entries that
++ * ALREADY exist, so on the before-ordering the value is silently dropped - and
++ * a table with no bFormatIndex is built in walk order, which is exactly the
++ * bug where a host asking for H.264 was handed MJPEG.
++ *
++ * Remembering it makes the walk order irrelevant: entries created later are
++ * stamped at creation, entries created earlier are stamped as before.
++ */
++static struct {
++    enum usb_device_speed usb_speed;
++    int video_format;
++    unsigned int bFormatIndex;
++    bool seen;
++} dashberry_format_index[16];
++
++static void remember_format_index(enum usb_device_speed usb_speed, int video_format,
++    unsigned int bFormatIndex)
++{
++    unsigned int i;
++
++    set_uvc_format_index(usb_speed, video_format, bFormatIndex);
++
++    for (i = 0; i < sizeof(dashberry_format_index) / sizeof(dashberry_format_index[0]); i++) {
++        if (!dashberry_format_index[i].seen ||
++            (dashberry_format_index[i].usb_speed == usb_speed &&
++             dashberry_format_index[i].video_format == video_format)) {
++            dashberry_format_index[i].usb_speed = usb_speed;
++            dashberry_format_index[i].video_format = video_format;
++            dashberry_format_index[i].bFormatIndex = bFormatIndex;
++            dashberry_format_index[i].seen = true;
++            return;
++        }
++    }
++}
++
++static unsigned int recall_format_index(enum usb_device_speed usb_speed, int video_format)
++{
++    unsigned int i;
++
++    for (i = 0; i < sizeof(dashberry_format_index) / sizeof(dashberry_format_index[0]); i++) {
++        if (dashberry_format_index[i].seen &&
++            dashberry_format_index[i].usb_speed == usb_speed &&
++            dashberry_format_index[i].video_format == video_format) {
++            return dashberry_format_index[i].bFormatIndex;
++        }
++    }
++    return 0;
++}
++
++/* DashBerry: find - or create - the table entry for one speed+format+frame.
++ *
++ * This used to be "is it the same as the LAST entry?", which held only because
++ * ftw() visited every attribute of a frame consecutively, for a single speed.
++ * Header-based discovery (below) registers each file for fs, hs AND ss in
++ * turn, so consecutive calls alternate speed and the adjacency test never
++ * matches: it allocated a fresh entry per attribute per speed - about 120
++ * where 15 were wanted - walked off the end of a 30-entry array and, because
++ * the bounds check ran only on the increment and not on the write, scribbled
++ * structs through .bss until the process died on a SIGSEGV with no message.
++ *
++ * Matching on the key itself is order-independent, which is all the walk
++ * actually guarantees. The table needs 3 speeds x 2 formats x 5 frames = 15.
++ */
++static int uvc_format_slot(enum usb_device_speed usb_speed, int video_format,
++    const char * format_name)
++{
++    static bool warned = false;
++    const int capacity = (int)(sizeof(uvc_frame_format) / sizeof(uvc_frame_format[0]));
++    int i;
++
++    for (i = 0; i <= last_format_index && i < capacity; i++) {
++        if (uvc_frame_format[i].defined &&
++            uvc_frame_format[i].usb_speed == usb_speed &&
++            uvc_frame_format[i].video_format == video_format &&
++            !strcmp(uvc_frame_format[i].format_name, format_name)) {
++            return i;
++        }
++    }
++
++    if (uvc_frame_format[last_format_index].defined) {
++        if (last_format_index + 1 >= capacity) {
++            if (!warned) {
++                printf("CONFIGFS: format table full at %d entries - dropping %s\n",
++                       capacity, format_name);
++                warned = true;
++            }
++            return -1;
++        }
++        last_format_index++;
++    }
++
++    uvc_frame_format[last_format_index].usb_speed = usb_speed;
++    uvc_frame_format[last_format_index].video_format = video_format;
++    uvc_frame_format[last_format_index].format_name = strdup(format_name);
++    uvc_frame_format[last_format_index].bFormatIndex = recall_format_index(usb_speed, video_format);
++    uvc_frame_format[last_format_index].defined = true;
++    return last_format_index;
++}
++
+ static void configfs_fill_formats(const char * path, const char * part)
+ {
+     int index = 0;
++    int slot;
+     int value = 0;
+     enum usb_device_speed usb_speed;
+     int video_format;
+@@ -2139,6 +2244,15 @@
+             goto free;
+         }
+ 
++        /* dwFrameInterval is a LIST - one interval per line - and nothing here
++         * consumes it: set_uvc_format_value knows dwDefaultFrameInterval, not
++         * this one. configfs_read_value() rejects anything over 10 bytes, so
++         * it reported -ENODATA once per frame per speed and put 15 lines of
++         * failure in the log for a file that was never wanted. */
++        if (!strncmp(array[index - 1], "dwFrameInterval", 15)) {
++            goto free;
++        }
++
+         value = configfs_read_value(path);
+         if (value < 0) {
+             printf("CONFIGFS: unreadable value (%d) for %s\n", value, part);
+@@ -2146,7 +2260,7 @@
+         }
+ 
+         if (!strncmp(array[index - 1], "bFormatIndex", 12)) {
+-            set_uvc_format_index(usb_speed, video_format, value);
++            remember_format_index(usb_speed, video_format, value);
+             goto free;
+         }
+ 
+@@ -2155,27 +2269,12 @@
+             goto free;
+         }
+ 
+-        if (
+-            uvc_frame_format[last_format_index].usb_speed != usb_speed ||
+-            uvc_frame_format[last_format_index].video_format != video_format ||
+-            strncmp(uvc_frame_format[last_format_index].format_name, format_name, strlen(format_name))
+-        ) {
+-            if (uvc_frame_format[last_format_index].defined) {
+-                last_format_index++;
+-                
+-                /* too much defined formats */
+-                if (last_format_index > 29) {
+-                    goto free;
+-                }
+-            }
+-
+-            uvc_frame_format[last_format_index].usb_speed = usb_speed;
+-            uvc_frame_format[last_format_index].video_format = video_format;
+-            uvc_frame_format[last_format_index].format_name = strdup(format_name);
+-            uvc_frame_format[last_format_index].defined = true;
++        slot = uvc_format_slot(usb_speed, video_format, format_name);
++        if (slot < 0) {
++            goto free;
+         }
+ 
+-        set_uvc_format_value(array[index - 1], last_format_index, value);
++        set_uvc_format_value(array[index - 1], slot, value);
+     }
+ 
+ free:
