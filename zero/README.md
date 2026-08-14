@@ -40,6 +40,14 @@ unrelated reason, configure writes `#define SETGROUPS_SIZE_TYPE unknown`, and
 the build dies much later on a type that does not exist. Nothing in that chain
 mentions the compiler.
 
+**The build gates on the kernel config before it packages an image.** A
+renamed CONFIG symbol is dropped silently by `olddefconfig`, and the first time
+that happened it cost a card that flashed cleanly and then did nothing at all —
+`CONFIG_MMC_BCM2835_SDHOST` became `CONFIG_MMC_BCM2835`, the SD driver vanished,
+and the kernel panicked before USB init. `build.sh` now refuses to package an
+image whose kernel lacks any boot- or function-critical option, and names what
+each one breaks.
+
 **Check your host before committing to a multi-hour build:**
 
 ```sh

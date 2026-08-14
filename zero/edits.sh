@@ -475,6 +475,14 @@ gpu_mem=256
 __EOF__
 		fi
 
+		# ...and gpu_mem alone is NOT enough. The stock config.txt sets
+		# gpu_mem_256/512/1024, and the firmware treats those as
+		# OVERRIDES of the generic gpu_mem on a board with that much
+		# RAM. A Zero W has 512 MB, so gpu_mem_512=100 would win and
+		# the line above would be inert — the same trap as camera.txt's
+		# video_bitrate. Raise the one that actually applies.
+		sed -e '/^gpu_mem_512=/s,=.*,=256,' -i "${BINARIES_DIR}/rpi-firmware/config.txt"
+
 		# Configure uart on 40-pin header'''
 assert old in s, "post-image.sh's picam block has changed shape"
 s = s.replace(old, new, 1)
@@ -584,6 +592,24 @@ patch_kernel_config() {
         say "kernel config already RF-silenced — left alone"
         return
     fi
+    # RENAMED SYMBOLS. olddefconfig silently drops a CONFIG_ it does not
+    # recognise, so a symbol renamed between 5.10 and 6.16 does not warn — it
+    # just vanishes and takes its driver with it. One of these is fatal:
+    #
+    #   MMC_BCM2835_SDHOST -> MMC_BCM2835
+    #     The bcm2835-sdhost driver. The Zero W's device tree drives its SD
+    #     card from a `brcm,bcm2835-sdhost` node, so without this the kernel
+    #     boots, cannot mount /dev/mmcblk0p2, and panics BEFORE USB comes up.
+    #     From outside the card is simply dead: no camera, no console, no
+    #     enumeration at all. (MMC_BCM2835_MMC, which the fragment also sets,
+    #     is the OTHER controller — the Arasan/SDIO one — and does not serve
+    #     the SD card here.)
+    #
+    # build.sh gates on the resulting config, so a future rename fails the
+    # build instead of producing another dead card.
+    say "kernel → renaming symbols that moved since 5.10"
+    sed -i 's/^CONFIG_MMC_BCM2835_SDHOST=/CONFIG_MMC_BCM2835=/' "$f"
+
     say "kernel → Wi-Fi and Bluetooth built out entirely"
     # The existing =m lines have to go, not just be followed by a disable:
     # merge_config takes the LAST value, but leaving both is unreadable.

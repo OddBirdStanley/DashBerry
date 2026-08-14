@@ -46,33 +46,130 @@ done
 [ -n "$MODE" ] || usage 1
 
 # --------------------------------------------------------------------- check
+# Before talking to the card, work out whether there is a card to talk to. A
+# silent --check is the least useful failure this tool can produce, and "the
+# Zero appears dead" covers at least four different faults that want different
+# answers. So: enumerate first, report what is actually present, and only then
+# open a port.
+present() {                         # → the args that actually exist, space separated
+    local f out=""
+    for f in "$@"; do [ -e "$f" ] && out="$out $f"; done
+    printf '%s' "${out# }"
+}
+
+usb_scan() {                        # → prints what the gadget looks like to USB
+    local d found=0 vid pid
+    for d in /sys/bus/usb/devices/*; do
+        [ -r "$d/idVendor" ] || continue
+        vid=$(cat "$d/idVendor" 2>/dev/null)
+        pid=$(cat "$d/idProduct" 2>/dev/null)
+        if [ "$vid" = "1d6b" ] && [ "$pid" = "0104" ]; then
+            found=1
+            echo "  USB device : ${vid}:${pid} $(cat "$d/product" 2>/dev/null || echo '?')"
+            echo "  interfaces : $(cat "$d/bNumInterfaces" 2>/dev/null | tr -d ' ')"
+        fi
+    done
+    return $((1 - found))
+}
+
 if [ "$MODE" = check ]; then
-    # /dev/rear-ctl is the udev name on a DashBerry Pi 4; on a laptop the card
-    # comes up as two ttyACMs and the control port is the second one. Both are
-    # tried, in that order, because the common case is a bench PC.
+    echo
+    echo "== what is plugged in"
+    GADGET=0
+    usb_scan && GADGET=1
+
+    # Globbed, not `ls | ...`: under `set -euo pipefail` a glob that matches
+    # nothing makes the pipeline fail, the assignment fail, and the script exit
+    # WITHOUT PRINTING ANYTHING — which is the exact silent-failure this whole
+    # section exists to abolish.
+    ACMS=$(present /dev/ttyACM*)
+    VIDEOS=$(present /dev/video*)
+    echo "  ttyACM     : ${ACMS:-none}"
+    echo "  video nodes: ${VIDEOS:-none}"
+    [ -e /dev/rear-ctl ] && echo "  rear-ctl   : present (this is a DashBerry Pi 4)"
+
+    if [ "$GADGET" = 0 ] && [ -z "$ACMS" ]; then
+        die "the Zero is not enumerating at all — nothing on USB, no ttyACM.
+
+  That is a BOOT or GADGET failure, not a control-port problem, and nothing
+  this tool says over the cable will help until it enumerates. In rough order
+  of likelihood:
+
+  1. /boot/config.txt. It is a FAT partition, so put the card in this PC and
+     read it — no rebuild needed. It should carry, from zero/edits.sh:
+         dtoverlay=dwc2,dr_mode=peripheral
+         dtoverlay=disable-wifi
+         dtoverlay=disable-bt
+         gpu_mem=256
+     BISECT BY EDITING IT DIRECTLY. Comment out disable-wifi and disable-bt
+     first (# in front), boot again, and see if it comes back. Those two are
+     the newest and the most likely to have disabled something they should
+     not have; everything else about the card can be tested with them off.
+  2. The kernel or rootfs never came up. The image is Linux 6.16 where the
+     card used to be 5.10, and a kernel that panics before USB init looks
+     exactly like this. You cannot see it over USB — see the serial console
+     below, which is the only instrument that answers this.
+  3. The USB gadget failed to bind. multi-gadget.sh builds a composite
+     device, and if any function is misconfigured the final bind fails and
+     NOTHING appears — camera and console together. This is the failure mode
+     the H.264/framebased work could plausibly have introduced.
+
+  THE SERIAL CONSOLE IS NOW THE FAST PATH, and it is new: dtoverlay=disable-bt
+  frees the PL011 UART onto the 40-pin header, and buildroot already runs a
+  getty there. A 3.3 V USB-TTL adapter on GPIO14 (TXD, pin 8), GPIO15 (RXD,
+  pin 10) and GND (pin 6), at 115200, shows the entire boot from firmware
+  onward. That distinguishes 1, 2 and 3 in about ten seconds, where guessing
+  from the outside cannot.
+
+  Also worth a glance: the green ACT LED. No flicker at all after power-up
+  means the firmware never got to the kernel (case 1); flicker then nothing on
+  USB means it booted and the gadget failed (case 3)."
+    fi
+
+    if [ "$GADGET" = 0 ] && [ -n "$ACMS" ]; then
+        echo
+        echo "  ! Serial is present but the UVC gadget is not."
+        echo "    multi-gadget.sh skips the camera and forces the console on when"
+        echo "    /dev/video0 is missing — so the most likely cause is that"
+        echo "    bcm2835-v4l2 did not probe the sensor on this kernel. Log in on"
+        echo "    the console below and run:  dmesg | grep -i -e bcm2835 -e video"
+    fi
+
+    # /dev/rear-ctl is the udev name on a DashBerry Pi 4. On a bench PC the
+    # card presents two ACMs and the control port is the SECOND. ttyACM0 is
+    # deliberately NOT a fallback: it is the login console, and asking it for a
+    # VERSION gets silence or a login prompt, which is exactly the confusion
+    # that makes a working card look dead.
     if [ -z "$PORT" ]; then
-        for cand in /dev/rear-ctl /dev/ttyACM1 /dev/ttyACM0; do
+        for cand in /dev/rear-ctl /dev/ttyACM1; do
             [ -e "$cand" ] && { PORT=$cand; break; }
         done
     fi
-    [ -n "$PORT" ] && [ -e "$PORT" ] || die "no control port found — plug the Zero in, or pass --port.
-  On a bench PC the card presents TWO CDC-ACM devices: the first is the login
-  console, the second is the control port. Do not confuse them — the console
-  will answer this with a login prompt and nothing will make sense."
+    if [ -z "$PORT" ]; then
+        die "no CONTROL port found (looked for /dev/rear-ctl and /dev/ttyACM1).
+  ttyACM0 is the login console and is not tried on purpose — it answers a
+  VERSION request with silence, which reads as a dead card.
+  If only ttyACM0 exists, the second ACM function never came up: log in on it
+  and check  ls /sys/kernel/config/usb_gadget/piwebcam/configs/c.1/"
+    fi
     [ -r "$PORT" ] && [ -w "$PORT" ] || die "cannot read/write $PORT (try sudo, or join the dialout group)"
 
     need stty
-    info "asking $PORT"
+    echo
+    echo "== asking $PORT"
     stty -F "$PORT" 115200 raw -echo -echoe -echok clocal -hupcl min 0 time 20
     exec 3<>"$PORT"
     while read -r _junk <&3; do :; done 2>/dev/null || true
 
     printf 'VERSION\r\n' >&3
     if ! read -r ver <&3; then
-        die "no answer on $PORT.
-  A stock showmewebcam card cannot answer this — it has no control port at
-  all, and it streams MJPEG, which the Pi 4's pipeline will not accept.
-  Build and flash a DashBerry image: zero/build.sh"
+        die "no answer from $PORT, though the port exists.
+  The gadget is up and the control function enumerated, so the Zero booted —
+  what is missing is rear-ctld answering on it. Log in on the console
+  (ttyACM0) and check:
+      systemctl status rear-ctld
+      ls -l /dev/ttyGS1
+  A stock showmewebcam card also lands here: it has no rear-ctld at all."
     fi
     ver=${ver%$'\r'}
     case $ver in

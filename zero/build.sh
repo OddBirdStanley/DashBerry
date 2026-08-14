@@ -283,6 +283,50 @@ step "image ($BOARD)"
   git -C $SMW_DIR submodule update --init --recursive"
 ( cd "$SMW_DIR" && BUILDROOT_DIR=buildroot ./build-showmewebcam.sh "$BOARD" )
 
+# --- gate: did the kernel keep the options that make the card work? --------
+# This exists because of a card that flashed fine and was completely dead. The
+# 5.10-era config fragment asked for CONFIG_MMC_BCM2835_SDHOST; that symbol was
+# renamed to CONFIG_MMC_BCM2835 somewhere between 5.10 and 6.16, and
+# olddefconfig DROPS a symbol it does not recognise without a word. The kernel
+# built, booted, could not mount its root filesystem, and panicked before USB
+# init — so the card enumerated nothing at all and looked bricked.
+#
+# Nothing about that failure pointed at the kernel config, and it cost a full
+# build to find. A renamed symbol must fail the BUILD, not the board.
+verify_kernel_config() {
+    local cfg="$SMW_DIR/output/$BOARD/build/linux-custom/.config" missing="" sym
+    [ -f "$cfg" ] || { echo "  (no kernel .config to check — skipped)"; return 0; }
+
+    # symbol:what breaks without it. =y or =m both count.
+    for sym in \
+        "CONFIG_ARCH_BCM2835:the SoC itself" \
+        "CONFIG_MMC_BCM2835:the SD card (brcm,bcm2835-sdhost) — no rootfs, no boot" \
+        "CONFIG_SQUASHFS:the rootfs format" \
+        "CONFIG_SQUASHFS_LZ4:the rootfs is squashfs4+lz4; without this it cannot be read" \
+        "CONFIG_USB_DWC2:the USB controller — no gadget at all" \
+        "CONFIG_USB_CONFIGFS:the gadget is built from configfs" \
+        "CONFIG_USB_CONFIGFS_F_UVC:the camera function" \
+        "CONFIG_USB_CONFIGFS_ACM:the console and the control port" \
+        "CONFIG_VIDEO_BCM2835:bcm2835-v4l2, the sensor driver" \
+        "CONFIG_BCM2835_VCHIQ:VideoCore messaging, which the camera rides on" \
+        "CONFIG_SERIAL_AMBA_PL011_CONSOLE:the serial console — the only way to debug a card that will not enumerate" \
+    ; do
+        grep -q "^${sym%%:*}=[ym]" "$cfg" || missing="$missing
+    ${sym%%:*}  — ${sym#*:}"
+    done
+
+    [ -z "$missing" ] || die "the kernel was built WITHOUT options this card needs:$missing
+
+  A card built like this may flash cleanly and then do nothing at all.
+  The usual cause is a symbol RENAMED since 5.10: olddefconfig drops what it
+  does not recognise, silently. Find what it became —
+      grep -rn 'config <NAME>' $SMW_DIR/output/$BOARD/build/linux-custom/**/Kconfig
+  — and add the rename to patch_kernel_config in zero/edits.sh.
+  Refusing to package this image."
+    echo "  kernel config gate: all boot- and function-critical options present"
+}
+verify_kernel_config
+
 IMG="$SMW_DIR/output/$BOARD/images/sdcard.img"
 [ -f "$IMG" ] || die "the build produced no $IMG — read the log above"
 
