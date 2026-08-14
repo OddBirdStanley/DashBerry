@@ -297,8 +297,49 @@ while [ -z "$(ls /sys/class/udc 2>/dev/null)" ] ; do
   echo "Waiting for a UDC to appear (${UDC_TRIES}s)..."
   sleep 1
 done
-echo "Binding gadget to UDC: $(ls /sys/class/udc)"
-ls /sys/class/udc > UDC''')
+
+# DashBerry: bind, and DEGRADE RATHER THAN DIE.
+#
+# A composite gadget binds all or nothing: one function the controller cannot
+# satisfy takes the whole device down, so the card enumerates NOTHING - no
+# camera and no console - and the only way to ask why is the console that just
+# vanished. That happened here with "failed to start piwebcam: -19" (-ENODEV),
+# and each guess at which function was at fault cost a full image build.
+#
+# So each configuration is tried in turn, most complete first, and whichever
+# binds is kept. The fallbacks are ordered by what they cost:
+#   1. everything
+#   2. no control port  - the Pi 4 cannot push settings, but the camera works
+#                         and the console is up. dwc2 has 8 endpoints and the
+#                         second ACM wants 3 of them, so this is the first
+#                         thing worth suspecting.
+#   3. console only     - no camera, but a way in to debug it live
+# The log says which one won, which is the diagnosis.
+bind_gadget() {
+  ls /sys/class/udc > UDC 2>/tmp/udc-bind.err
+  if [ -n "$(cat UDC 2>/dev/null)" ] ; then
+    echo "Gadget bound to $(cat UDC)  [$1]"
+    return 0
+  fi
+  echo "Bind FAILED [$1]: $(cat /tmp/udc-bind.err 2>/dev/null)"
+  echo "  (dmesg will name the function that refused and its errno)"
+  echo "" > UDC 2>/dev/null || true
+  return 1
+}
+
+if ! bind_gadget "camera + console + control port" ; then
+  echo "Retrying without the control port (acm.usb1)..."
+  rm -f configs/c.1/acm.usb1
+  if ! bind_gadget "camera + console, NO control port" ; then
+    echo "Retrying with the console only..."
+    rm -f configs/c.1/uvc.usb0
+    if ! bind_gadget "console only, NO camera" ; then
+      echo "Nothing binds at all. The controller has a UDC but refuses every"
+      echo "  configuration - see dmesg for the function and errno."
+      exit 1
+    fi
+  fi
+fi''')
 
 # (d) the control port. Linked after acm.usb0 so the interface numbering is
 # uvc(0,1) acm.usb0(2,3) acm.usb1(4,5) — the Pi 4's udev rule matches on 04.
