@@ -15,29 +15,37 @@ The real path carries everything except the speed:
 
     .../streaming/<format>/<instance>/<frame>/<attribute>
 
+confirmed on the device:
+
+    .../uvc.usb0/streaming/framebased/h/922p/wWidth
+    .../uvc.usb0/streaming/framebased/h/bFormatIndex
+
 so this matches that shape too and registers each frame for fs, hs and ss.
 multi-gadget.sh links the same header into all three class/<speed> groups, so
 every format really is offered at every speed.
 
-bFormatIndex is taken from the format level as well. It is the format's
-position in the USB descriptors - the number the host selects by - and without
-it the table is built in readdir order and the host's choice maps onto the
-wrong entry.
+bFormatIndex is taken from the format level as well - it is the format's
+position in the USB descriptors, the number the host selects by, and without it
+the table is built in readdir order and the host's choice lands on the wrong
+entry.
 
-arr[0] is checked against the actual format directory names, and that check is
-load-bearing. ftw() DOES follow the format links inside streaming/header/<h>/,
-which produces paths like header/h/h/guidFormat with the same component count
-as a real frame path. Without the check those become entries whose "frame" is
-an attribute name, and since set_uvc_format_value() applies to the most
-recently created entry, the real width and height then land on the wrong one.
-Measured before the check: 33 entries, every one "format: 2, resolution: 0x0",
-and a host that asked for H.264 was handed MJPEG.
+arr[0] is checked against the real format directory names because ftw() DOES
+follow the format links inside streaming/header/<h>/, producing paths like
+header/h/h/guidFormat with the same component count as a genuine frame path.
+Without that check they become entries whose "frame" is an attribute name, and
+set_uvc_format_value() then puts the real geometry on the wrong entry: measured
+as 33 entries, all "format: 2, resolution: 0x0", and a host asking for H.264
+being handed MJPEG.
+
+It also PRINTS every derived part. Three revisions of this function have each
+been corrected by the next log rather than by reading the code, so the mapping
+from real path to synthesised part is recorded rather than assumed.
 ---
 diff --git a/uvc-gadget.c b/uvc-gadget.c
-index b16475a..e34eadb 100644
+index b16475a..e89a00f 100644
 --- a/uvc-gadget.c
 +++ b/uvc-gadget.c
-@@ -2211,10 +2211,82 @@ static void configfs_fill_streaming_params(const char* path, const char * part)
+@@ -2211,10 +2211,88 @@ static void configfs_fill_streaming_params(const char* path, const char * part)
  static int dashberry_files_seen = 0;
  static int dashberry_files_matched = 0;
  
@@ -72,6 +80,11 @@ index b16475a..e34eadb 100644
 +        tok = strtok(NULL, "/");
 +    }
 +
++    /* Print what was actually derived. Three patches to this function have
++     * been corrected by the NEXT log rather than by reading it, so the mapping
++     * from real path to synthesised part is no longer something to deduce. */
++    printf("CONFIGFS: real n=%d part='%s'\n", n, part);
++
 +    /* arr[0] must be a real FORMAT directory. ftw() follows the format links
 +     * inside streaming/header/<h>/ too, which yields paths like
 +     *     header/h/h/guidFormat
@@ -81,8 +94,9 @@ index b16475a..e34eadb 100644
 +     * real width and height then land on the wrong one. The measured result
 +     * was 33 entries, every one of them "format: 2, resolution: 0x0", and a
 +     * host offered MJPEG when it asked for H.264. */
-+    if (strcmp(arr[0], "framebased") && strcmp(arr[0], "mjpeg") &&
-+        strcmp(arr[0], "uncompressed")) {
++    if (n < 1 ||
++        (strcmp(arr[0], "framebased") && strcmp(arr[0], "mjpeg") &&
++         strcmp(arr[0], "uncompressed"))) {
 +        free(copy);
 +        return;
 +    }
@@ -120,7 +134,7 @@ index b16475a..e34eadb 100644
      int streaming_params = find_text_pos(fpath, "/streaming_");
      (void)(tflag); /* avoid warning: unused parameter 'tflag' */
  
-@@ -2224,6 +2296,10 @@ static int configfs_path_check(const char* fpath, const struct stat * sb, int tf
+@@ -2224,6 +2302,10 @@ static int configfs_path_check(const char* fpath, const struct stat * sb, int tf
              dashberry_files_matched++;
              configfs_fill_formats(fpath, fpath + streaming + 16);
  
