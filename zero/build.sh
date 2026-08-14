@@ -315,6 +315,26 @@ verify_kernel_config() {
     ${sym%%:*}  — ${sym#*:}"
     done
 
+    # The inverse check: options whose PRESENCE breaks the card. A precomposed
+    # gadget driver built in will grab the UDC the instant dwc2 registers it,
+    # and our configfs gadget — which can only bind once userspace writes to
+    # UDC — loses every time. That is exactly how a card came back enumerating
+    # as a bare serial port with no camera.
+    local hostile="" h
+    for h in USB_ZERO USB_AUDIO USB_ETH USB_G_NCM USB_GADGETFS USB_FUNCTIONFS \
+             USB_MASS_STORAGE USB_G_SERIAL USB_G_PRINTER USB_CDC_COMPOSITE \
+             USB_G_ACM_MS USB_G_MULTI USB_G_HID USB_G_DBGP USB_G_WEBCAM; do
+        grep -q "^CONFIG_${h}=y" "$cfg" && hostile="$hostile
+    CONFIG_${h}=y"
+    done
+    [ -z "$hostile" ] || die "the kernel has precomposed gadget drivers BUILT IN:$hostile
+
+  Each of these auto-binds the first UDC that appears. This card builds its
+  gadget from configfs, which binds only when userspace writes to UDC — so a
+  built-in g_* driver wins the race and the card enumerates as whatever that
+  driver is, with no camera. Turn them off in patch_kernel_config.
+  Refusing to package this image."
+
     [ -z "$missing" ] || die "the kernel was built WITHOUT options this card needs:$missing
 
   A card built like this may flash cleanly and then do nothing at all.

@@ -46,7 +46,14 @@ remount rw || { echo "boot-report: cannot remount /boot rw" >&2; exit 1; }
     echo "  driver owning the USB node:"
     for d in /sys/bus/platform/devices/*.usb; do
         [ -e "$d" ] || continue
-        echo "    ${d##*/} -> $(basename "$(readlink -f "$d/driver" 2>/dev/null)" 2>/dev/null || echo 'NO DRIVER BOUND')"
+        # `readlink -f` SUCCEEDS on a path that does not exist, so the
+        # obvious form printed the literal word "driver" when nothing was
+        # bound. Test the symlink itself.
+        if [ -L "$d/driver" ]; then
+            echo "    ${d##*/} -> $(basename "$(readlink -f "$d/driver")")"
+        else
+            echo "    ${d##*/} -> NO DRIVER BOUND"
+        fi
     done
     # A probe that DEFERS prints nothing at all, which is exactly what the
     # first dead card looked like. This is the list that says so out loud.

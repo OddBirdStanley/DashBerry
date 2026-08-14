@@ -666,6 +666,48 @@ patch_kernel_config() {
     # This does NOT prove the ordering was the fault. If the next card still
     # binds no UDC, the boot report now carries what does prove it: which
     # driver owns the USB node, the deferred-probe list, and a forced re-probe.
+    # NO PRECOMPOSED GADGET DRIVERS. This board builds its gadget from
+    # configfs and nothing else, and every legacy "g_*" driver in the kernel
+    # auto-binds the FIRST UDC that appears — which is a race configfs cannot
+    # win, because configfs binds only when userspace writes to UDC.
+    #
+    # showmewebcam's fragment has always carried CONFIG_USB_G_SERIAL=y and
+    # CONFIG_USB_CDC_COMPOSITE=y. With CONFIG_USB_GADGET=m kconfig could only
+    # honour them as =m, so they sat harmless and unloaded. Building the
+    # gadget core in (above) let those =y requests take effect, and g_serial
+    # took the controller the moment dwc2 registered it:
+    #
+    #   dwc2 20980000.usb: EPs: 8, dedicated fifos, 4080 entries in SPRAM
+    #   g_serial gadget.0: g_serial ready
+    #   dwc2 20980000.usb: bound driver g_serial
+    #
+    # The card then enumerated as a bare serial gadget: one ttyACM, no camera,
+    # and `bound UDC: ''` on our own configfs gadget. Turning them off is not
+    # a workaround for that change — they should never have been reachable on
+    # a configfs-only device.
+    say "kernel → removing precomposed g_* gadget drivers (they steal the UDC)"
+    sed -i -E '/^CONFIG_USB_(ZERO|AUDIO|ETH|G_NCM|GADGETFS|FUNCTIONFS|MASS_STORAGE|G_SERIAL|G_PRINTER|CDC_COMPOSITE|G_ACM_MS|G_MULTI|G_HID|G_DBGP|G_WEBCAM|G_UVC)=/d' "$f"
+    cat >> "$f" <<'EOG'
+
+# DashBerry: no precomposed gadget drivers. The gadget is built from configfs,
+# and any g_* driver would auto-bind the first UDC to appear, beating us to it.
+# CONFIG_USB_ZERO is not set
+# CONFIG_USB_AUDIO is not set
+# CONFIG_USB_ETH is not set
+# CONFIG_USB_G_NCM is not set
+# CONFIG_USB_GADGETFS is not set
+# CONFIG_USB_FUNCTIONFS is not set
+# CONFIG_USB_MASS_STORAGE is not set
+# CONFIG_USB_G_SERIAL is not set
+# CONFIG_USB_G_PRINTER is not set
+# CONFIG_USB_CDC_COMPOSITE is not set
+# CONFIG_USB_G_ACM_MS is not set
+# CONFIG_USB_G_MULTI is not set
+# CONFIG_USB_G_HID is not set
+# CONFIG_USB_G_DBGP is not set
+# CONFIG_USB_G_WEBCAM is not set
+EOG
+
     say "kernel → USB gadget stack built in (was modular + modules-load)"
     sed -i -E 's/^CONFIG_USB_(DWC2|GADGET|CONFIGFS|LIBCOMPOSITE)=m$/CONFIG_USB_\1=y/' "$f"
     for k in CONFIG_USB_DWC2 CONFIG_USB_GADGET CONFIG_USB_CONFIGFS CONFIG_USB_LIBCOMPOSITE; do
