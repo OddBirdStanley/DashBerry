@@ -514,13 +514,23 @@ install_overlay() {
 #     configfs-gadget.piwebcam", /dev/video1 present — and the host saw
 #     nothing at all, not even a failed enumeration attempt.
 #
-#     OTG IS THE DEFAULT, because it is the only mode observed to attach on
-#     this hardware. A stock 5.10 card's log shows dwc2 doing FULL dual-role
-#     init - "DWC OTG Controller", "new USB bus registered", "hub 1-0:1.0" -
-#     and only then "new device is high-speed / new address 4", which is the
-#     gadget reporting that a host enumerated it. dr_mode=peripheral skips
-#     that entire path, and on 6.16 it binds, asserts a pull-up, and never
-#     attaches - with or without the PHY driver.
+#     OTG IS THE DEFAULT because it is the only mode OBSERVED to attach here.
+#     A stock 5.10 card's log shows dwc2 doing full dual-role init - "DWC OTG
+#     Controller", "new USB bus registered", "hub 1-0:1.0" - and only then
+#     "new device is high-speed / new address 4", the gadget reporting that a
+#     host enumerated it.
+#
+#     THAT IS NOT EVIDENCE THAT PERIPHERAL MODE IS BROKEN, and an earlier
+#     version of this comment claimed it was. Diffed against 5.10.11: the
+#     pullup's op_state gate, udc_start's dwc2_lowlevel_hw_enable() call for
+#     PERIPHERAL, and the op_state assignment are all identical; dwc2 never
+#     calls usb_udc_vbus_handler() in either version; udc->vbus is initialised
+#     true in both. There is no 5.10->6.16 change here to blame.
+#
+#     What is true: every peripheral test before the PHY fix ran with no PHY,
+#     where no mode could attach, and exactly ONE test has had PHY+peripheral.
+#     OTG+PHY - what stock proves works - has not been tried. Use otg because
+#     it is the known-good shape, not because peripheral is condemned.
 #
 #     THE CAR STILL NEEDS ID TO FLOAT. In OTG the role comes from the ID pin,
 #     so a converter that grounds it makes the Zero a HOST and the camera
