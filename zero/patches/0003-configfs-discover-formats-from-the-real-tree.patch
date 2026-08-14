@@ -2,47 +2,42 @@ From: DashBerry <zero/README.md>
 Subject: [PATCH] configfs: discover formats from the real tree, not the symlinks
 
 uvc-gadget finds its formats by ftw()-ing configfs and matching paths that
-contain "streaming/class/". Those paths exist only through symlinks:
-
-    streaming/class/<speed>/<header>  ->  streaming/header/<header>
-    streaming/header/<header>/<inst>  ->  streaming/<format>/<inst>
-
-and ftw() does not descend into them on configfs. Measured on the device:
+contain "streaming/class/". Those paths exist only through symlinks, and ftw()
+does not descend into the class/<speed> ones. Measured on the device:
 
     ftw returned 0 (errno 0: none); files seen 122, under streaming/class 0
 
 122 files walked, not one under streaming/class - while find -follow reaches
-them and cat reads through them fine. So no format is ever recorded and the
-only symptom is "configfs settings for uvc gadget not found".
+them and cat reads through them. So no format was ever recorded and the only
+symptom was "configfs settings for uvc gadget not found".
 
 The real path carries everything except the speed:
 
     .../streaming/<format>/<instance>/<frame>/<attribute>
 
 so this matches that shape too and registers each frame for fs, hs and ss.
-That is not an assumption: multi-gadget.sh links the same header into all three
-class/<speed> groups, so every format really is offered at every speed.
+multi-gadget.sh links the same header into all three class/<speed> groups, so
+every format really is offered at every speed.
 
-bFormatIndex is taken from the FORMAT level as well, and it has to be. It is
-the format's position in the USB descriptors - the number the host selects by -
-and without it the table is built in readdir order, so the daemon maps the
-host's choice onto the wrong entry. The symptom is exact and was seen:
+bFormatIndex is taken from the format level as well. It is the format's
+position in the USB descriptors - the number the host selects by - and without
+it the table is built in readdir order and the host's choice maps onto the
+wrong entry.
 
-    Tried to capture in H264, but device returned format MJPG
-
-No other format-level attribute is taken: guidFormat, bmaControls and the
-aspect ratios are not integers and would only produce parse noise.
-
-NOT EXPLAINED: the same binary at the same SHA is said to work on a stock
-5.10 card with the same tree shape. If ftw() behaves differently there this
-change is harmless - the class/ branch still runs first and this only adds
-paths it would otherwise ignore.
+arr[0] is checked against the actual format directory names, and that check is
+load-bearing. ftw() DOES follow the format links inside streaming/header/<h>/,
+which produces paths like header/h/h/guidFormat with the same component count
+as a real frame path. Without the check those become entries whose "frame" is
+an attribute name, and since set_uvc_format_value() applies to the most
+recently created entry, the real width and height then land on the wrong one.
+Measured before the check: 33 entries, every one "format: 2, resolution: 0x0",
+and a host that asked for H.264 was handed MJPEG.
 ---
 diff --git a/uvc-gadget.c b/uvc-gadget.c
-index b16475a..cc1144a 100644
+index b16475a..e34eadb 100644
 --- a/uvc-gadget.c
 +++ b/uvc-gadget.c
-@@ -2211,10 +2211,67 @@ static void configfs_fill_streaming_params(const char* path, const char * part)
+@@ -2211,10 +2211,82 @@ static void configfs_fill_streaming_params(const char* path, const char * part)
  static int dashberry_files_seen = 0;
  static int dashberry_files_matched = 0;
  
@@ -75,6 +70,21 @@ index b16475a..cc1144a 100644
 +    while (tok != NULL && n < 8) {
 +        arr[n++] = tok;
 +        tok = strtok(NULL, "/");
++    }
++
++    /* arr[0] must be a real FORMAT directory. ftw() follows the format links
++     * inside streaming/header/<h>/ too, which yields paths like
++     *     header/h/h/guidFormat
++     * with the same component count as a genuine frame path. Feeding those in
++     * invents entries whose "frame" is an attribute name, and because
++     * set_uvc_format_value() applies to whatever entry was created last, the
++     * real width and height then land on the wrong one. The measured result
++     * was 33 entries, every one of them "format: 2, resolution: 0x0", and a
++     * host offered MJPEG when it asked for H.264. */
++    if (strcmp(arr[0], "framebased") && strcmp(arr[0], "mjpeg") &&
++        strcmp(arr[0], "uncompressed")) {
++        free(copy);
++        return;
 +    }
 +
 +    if (n == 4) {
@@ -110,7 +120,7 @@ index b16475a..cc1144a 100644
      int streaming_params = find_text_pos(fpath, "/streaming_");
      (void)(tflag); /* avoid warning: unused parameter 'tflag' */
  
-@@ -2224,6 +2281,10 @@ static int configfs_path_check(const char* fpath, const struct stat * sb, int tf
+@@ -2224,6 +2296,10 @@ static int configfs_path_check(const char* fpath, const struct stat * sb, int tf
              dashberry_files_matched++;
              configfs_fill_formats(fpath, fpath + streaming + 16);
  
