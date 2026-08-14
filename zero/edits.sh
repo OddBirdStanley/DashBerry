@@ -256,6 +256,33 @@ s = s.replace(
     echo "Warning: bmControls not writable — host will see the narrow UVC control set"
   fi''')
 
+# (g) THE SUPERSPEED CLASS LINKS. This is what stopped the camera binding.
+#
+# 6.16's uvc_function_bind() builds descriptors for ALL FOUR speeds
+# unconditionally - FULL, HIGH, SUPER and SUPER_PLUS. uvc_copy_descriptors()
+# for SUPER needs uvc->desc.ss_control and ss_streaming, which come from the
+# configfs symlinks control/class/ss and streaming/class/ss. Upstream
+# multi-gadget.sh only ever creates fs and hs, so on this kernel the SUPER copy
+# returns ERR_PTR(-ENODEV) and the whole composite bind fails:
+#
+#     configfs-gadget.piwebcam gadget.0: uvc: uvc_function_bind()
+#     udc 20980000.usb: failed to start piwebcam: -19
+#
+# and NOTHING else is logged, because that return is the one error path in
+# uvc_copy_descriptors() with no message attached.
+#
+# It worked on 5.10 because f_uvc.c copied the SS descriptors only
+# `if (gadget_is_superspeed(c->cdev->gadget))`, and dwc2 on a Zero is
+# high-speed, so the missing links were never read. The links cost nothing on
+# a high-speed device: they are descriptors the host will never ask for.
+s = s.replace(
+    """  ln -s functions/uvc.usb0/control/header/h         functions/uvc.usb0/control/class/fs""",
+    """  ln -s functions/uvc.usb0/control/header/h         functions/uvc.usb0/control/class/fs
+  # DashBerry: 6.16 builds SuperSpeed descriptors even for a high-speed
+  # gadget, and returns a silent -ENODEV if these are missing. See edits.sh.
+  ln -s functions/uvc.usb0/streaming/header/h       functions/uvc.usb0/streaming/class/ss
+  ln -s functions/uvc.usb0/control/header/h         functions/uvc.usb0/control/class/ss""")
+
 # (c) the streaming header links: only link what exists, and include
 # framebased/h so the host is actually told about it.
 s = s.replace(
