@@ -1,0 +1,69 @@
+#!/bin/sh
+# uvc-trace — keep a copy of what uvc-gadget said on the FAT /boot partition,
+# updated as it is said, so the log survives a gadget that takes the console
+# down with it.
+#
+# WHY THIS EXISTS
+# ---------------
+# Every way into this card runs down the USB cable: the console is ttyGS0, the
+# control port is ttyGS1, the video is the same gadget again. uvc-gadget
+# answers the UVC class requests on ep0, so when it stops answering, ep0
+# stalls for EVERY function — the login console dies at the same instant as
+# the camera, and the journal that would say why is in tmpfs and dies with the
+# next power cycle. Measured 2026-08-14: a failed H.264 capture left ttyACM0
+# hung, and there was no way to read a single line of the daemon's output.
+#
+# boot-report covers the boot; this covers what happens AFTER it, which is
+# where the interesting failure now lives. A UART on GPIO 14/15 is the better
+# instrument and needs no cooperation from the failing device — but it needs
+# an adapter, and this needs nothing that reflashing the card does not already
+# involve: run the test, pull the power, put the SD in a PC, read the file.
+#
+# WEAR AND CORRUPTION
+# -------------------
+# /boot is FAT and normally mounted ro. Writing to it at all is a deliberate
+# risk (boot-report says the same): a power cut with the partition rw can
+# corrupt it. Two things keep that small. It writes ONLY when the journal has
+# actually changed, and it holds /boot rw for the milliseconds that takes —
+# not continuously. And after a wedge the daemon stops saying anything, so the
+# last snapshot is written seconds BEFORE the power is pulled, with the
+# partition back to ro and idle by the time it goes.
+#
+# Off unless asked for, like every other debug path on this image.
+set -u
+
+MARKER=/boot/enable-uvc-trace
+TRACE=/boot/uvc-trace.txt
+INTERVAL=${UVC_TRACE_INTERVAL:-5}
+
+[ -e "$MARKER" ] || exit 0
+
+remount() { mount -o "remount,$1" /boot 2>/dev/null; }
+
+previous=""
+
+while :; do
+    current=$(
+        echo "=== uvc-webcam ==="
+        journalctl -u uvc-webcam --no-pager -o short-iso 2>&1
+        echo
+        echo "=== usb / gadget / dwc2 (kernel) ==="
+        dmesg 2>/dev/null | grep -iE 'dwc2|gadget|uvc|configfs|udc' | tail -60
+    )
+
+    if [ "$current" != "$previous" ]; then
+        if remount rw; then
+            {
+                echo "# uvc-trace — updated $(date -u +%Y-%m-%dT%H:%M:%SZ), uptime $(cut -d' ' -f1 /proc/uptime)s"
+                echo "# The clock is meaningless without an RTC; use it for ORDERING only."
+                echo
+                printf '%s\n' "$current"
+            } > "$TRACE" 2>/dev/null
+            sync
+            remount ro
+            previous=$current
+        fi
+    fi
+
+    sleep "$INTERVAL"
+done

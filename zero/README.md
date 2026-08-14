@@ -334,3 +334,42 @@ cam/rear-modetest.sh                     # shoot a mode through the real chain
 
 `--check` is what the old "Checking a card" checklist became. On the Pi 4 the
 same conversation is `rear-ctl check`.
+
+## 8. Reading a card that has wedged
+
+Section 6 notes that the console dies with the camera. That is worth stating
+more precisely, because it decides which of these you need: `uvc-gadget`
+answers the UVC class requests on **ep0**, so when it stops answering, ep0
+stalls for *every* function on the gadget. The camera, the login console and
+the control port all go at the same instant — and the journal that would say
+why lives in tmpfs and dies with the next power cycle.
+
+Note that the card still **enumerates** perfectly in that state. `f_uvc`
+answers standard requests out of the kernel, straight from configfs, so the
+descriptors are correct whether or not `uvc-gadget` parsed anything at all.
+The descriptors and the daemon's format table are two independent readings of
+the same tree. "It enumerates" is not evidence that the daemon is healthy.
+
+Three ways to read one, cheapest first.
+
+**The SD card.** Create `/boot/enable-uvc-trace`, boot, provoke the failure,
+pull the power, put the card in a PC and read `/boot/uvc-trace.txt`. It holds
+`uvc-webcam`'s journal and the gadget-related kernel lines, re-snapshotted
+whenever they change — so the last write lands seconds before the wedge and
+nothing else is needed. Post-mortem, and up to `UVC_TRACE_INTERVAL` (5 s)
+stale. Off unless the marker is there: it writes to a FAT partition that a
+dashcam can lose power at any moment, which is the same bargain
+`/boot/enable-boot-report` makes.
+
+**Mini-HDMI.** `cmdline.txt` carries `console=tty1` and `quiet` is gone, so a
+monitor shows the boot with no image change. It shows kernel messages only —
+`uvc-gadget`'s own output goes to the journal — so this diagnoses the driver
+and gadget layers, not the daemon.
+
+**The UART.** `enable_uart=1`, `console=ttyAMA0,115200` and
+`dtoverlay=disable-bt` are all set, so the PL011 is on GPIO 14/15 and there is
+a getty on it. This is the only one that owes nothing to `dwc2` or
+`libcomposite`, and the only one that is **live** — `journalctl -fu
+uvc-webcam` before provoking the failure shows the last line before the wedge.
+Wiring: USB-TTL GND to pin 6, its RX to pin 8 (Zero TXD), its TX to pin 10
+(Zero RXD), 115200 8N1.

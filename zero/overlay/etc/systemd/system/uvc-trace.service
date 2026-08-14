@@ -1,0 +1,19 @@
+[Unit]
+Description=Mirror uvc-gadget's log to /boot so a wedged gadget can still be read
+# uvc-webcam is what it watches; starting after it keeps the first snapshot
+# from being a file full of "unit not found".
+After=uvc-webcam.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/uvc-trace
+# It exits 0 immediately unless /boot/enable-uvc-trace is present, so on a
+# production card this unit costs one process start and nothing else.
+Restart=no
+# A debug path must never be able to hold up the camera it is debugging.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=uvc-trace
+
+[Install]
+WantedBy=basic.target
