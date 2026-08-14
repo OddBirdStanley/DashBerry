@@ -557,6 +557,28 @@ s = s.replace("video_bitrate=25000000\n",
     "# streamed MJPEG; it is a LIVE 25 Mbps setting now that it encodes H.264,\n"
     "# and bitrate belongs to the Pi 4 (dashberry.conf REAR_BITRATE, pushed by\n"
     "# rear-ctl on every start of rear-rec).\n")
+
+# repeat_sequence_header: ADDED by DashBerry, and it is a correctness
+# requirement rather than a preference — which is why it lands here, on the
+# card, and not in the Pi 4's config beside the settings it owns.
+#
+# It makes the encoder emit SPS/PPS ahead of every IDR. At its v4l2 default of
+# 0 they are sent ONCE, at the start of the encode session, and any host that
+# joins after that — or that misses the frame carrying them — never gets the
+# parameter sets. h264parse cannot form an access unit without them, so it
+# produces nothing at all and the recording is a 0-byte file with "No valid
+# frames found before end of stream". The raw stream is fine; it is simply
+# unparseable.
+#
+# That was the failure, and it is also why results looked INTERMITTENT: whether
+# a capture worked depended on whether it happened to catch the one-time
+# parameter sets.
+#
+# rear-ctl pushes the same value on every start of rear-rec, which is now
+# belt-and-braces rather than the only thing setting it. A card must be usable
+# by any host that opens it — a laptop, ffplay, a browser — with nothing
+# pushed.
+s = s.rstrip("\n") + "\nrepeat_sequence_header=1\n"
 open(p, 'w').write(s)
 PY
 }
