@@ -323,6 +323,7 @@ verify_kernel_config() {
         "CONFIG_SQUASHFS:the rootfs format" \
         "CONFIG_SQUASHFS_LZ4:the rootfs is squashfs4+lz4; without this it cannot be read" \
         "CONFIG_USB_DWC2:the USB controller — no gadget at all" \
+        "CONFIG_NOP_USB_XCEIV:the usb-nop-xceiv PHY the DT points at — without it dwc2 runs with no PHY and never drives the port" \
         "CONFIG_USB_CONFIGFS:the gadget is built from configfs" \
         "CONFIG_USB_CONFIGFS_F_UVC:the camera function" \
         "CONFIG_USB_CONFIGFS_ACM:the console and the control port" \

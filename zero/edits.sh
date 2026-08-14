@@ -802,6 +802,43 @@ patch_kernel_config() {
     # and `bound UDC: ''` on our own configfs gadget. Turning them off is not
     # a workaround for that change — they should never have been reachable on
     # a configfs-only device.
+    # THE USB PHY. The device tree's USB node carries
+    #   phys = <&usbphy>;   with  usbphy { compatible = "usb-nop-xceiv"; }
+    # and CONFIG_NOP_USB_XCEIV was never in showmewebcam's fragment - it did
+    # not need to be, because nothing consumed that phandle on 5.10.
+    #
+    # On 6.16 dwc2_lowlevel_hw_init() looks the PHY up, and with no driver
+    # registered for usb-nop-xceiv the lookup returns -EPROBE_DEFER. dwc2's
+    # probe is then retried until the deferred-probe timeout gives up, which is
+    # the unexplained ~9 second gap between "Module 'dwc2' is built in" and the
+    # first dwc2 message. It finally proceeds with no PHY at all - so every
+    # software layer succeeds and the port is never physically driven:
+    #
+    #   Gadget bound to 20980000.usb  [camera + console + control port]
+    #   Pull-up asserted via /sys/class/udc/20980000.usb/soft_connect
+    #   20980000.usb state: not attached
+    #
+    # and nothing whatsoever on the host - not a failed enumeration, no
+    # descriptor error, no port event. That is what an un-powered PHY looks
+    # like, and it is why chasing dr_mode was wrong: peripheral and otg both
+    # fail identically because neither ever reaches the wire.
+    #
+    # raspberrypi/linux's own bcmrpi_defconfig sets CONFIG_NOP_USB_XCEIV=y.
+    # This is not a workaround; it is the driver the device tree asks for.
+    say "kernel → +NOP_USB_XCEIV (the DT's usb-nop-xceiv phy, never built)"
+    sed -i -E '/^(# )?CONFIG_(NOP_USB_XCEIV|USB_PHY|GENERIC_PHY)( is not set|=.*)$/d' "$f"
+    cat >> "$f" <<'EOP'
+
+# DashBerry: the USB PHY the device tree points at. bcm2708-rpi-zero-w.dtb has
+# phys = <&usbphy> on the USB node, and usbphy is compatible = "usb-nop-xceiv".
+# Without this driver dwc2's phy lookup returns -EPROBE_DEFER until the
+# deferred-probe timeout, then runs with no PHY: the gadget binds, the pull-up
+# "succeeds", and the port is never driven. RPi's own bcmrpi_defconfig has it.
+CONFIG_GENERIC_PHY=y
+CONFIG_USB_PHY=y
+CONFIG_NOP_USB_XCEIV=y
+EOP
+
     say "kernel → removing precomposed g_* gadget drivers (they steal the UDC)"
     sed -i -E '/^CONFIG_USB_(ZERO|AUDIO|ETH|G_NCM|GADGETFS|FUNCTIONFS|MASS_STORAGE|G_SERIAL|G_PRINTER|CDC_COMPOSITE|G_ACM_MS|G_MULTI|G_HID|G_DBGP|G_WEBCAM|G_UVC)=/d' "$f"
     cat >> "$f" <<'EOG'
