@@ -763,8 +763,66 @@ PY4
     done
 }
 
+# ---------------------------------------------------------------------------
+# 13. RPI FIRMWARE — optional, and the prime suspect when the kernel dies
+# before it says anything.
+#
+# buildroot 2021.02 pins raspberrypi/firmware at d016a6eb, dated 2020-12-18.
+# That start.elf is now being asked to load a 2026 kernel and a 6.16 device
+# tree. The firmware/kernel interface is mostly stable, but Raspberry Pi ship
+# the two together and do not support mixing eras this far apart — and the
+# failure mode when it goes wrong is exactly the one seen here: the firmware
+# reads the card, jumps to the kernel, and nothing further happens. No error
+# code on the LED (so the firmware did not fail to FIND anything), no console,
+# no USB.
+#
+# NOT the default, for two reasons:
+#   - it is a hypothesis until the kernel is confirmed at fault, and the
+#     tarball is a large download;
+#   - newer firmware is where the LEGACY CAMERA STACK was progressively
+#     retired, and bcm2835-v4l2 (this whole image's camera path) depends on
+#     start_x.elf and the MMAL firmware behind it. Fixing boot this way could
+#     cost the camera. If it does, the answer is to find the newest firmware
+#     that still carries working legacy-camera support, not to abandon it.
+#
+#   RPI_FIRMWARE_REF=1.20260521 zero/build.sh
+#
+# Hashes: buildroot verifies the tarball, and we cannot know the hash of a
+# revision we have not downloaded. `none` is buildroot's OWN documented value
+# for "explicitly no hash" (support/download/check-hash), so this uses that
+# rather than deleting the line, which would be a hard error. Pass
+# RPI_FIRMWARE_SHA256=... to pin one properly once known.
+# ---------------------------------------------------------------------------
+patch_firmware() {
+    [ -n "${RPI_FIRMWARE_REF:-}" ] || return 0
+    local mk="$SMW/buildroot/package/rpi-firmware/rpi-firmware.mk"
+    local hf="$SMW/buildroot/package/rpi-firmware/rpi-firmware.hash"
+    anchor "$mk" "RPI_FIRMWARE_VERSION = " "the firmware pin"
+    local old
+    old=$(sed -n 's/^RPI_FIRMWARE_VERSION = \(.*\)/\1/p' "$mk")
+    [ "$old" = "$RPI_FIRMWARE_REF" ] && { say "firmware already at $old"; return 0; }
+
+    say "firmware → $RPI_FIRMWARE_REF (was $old, dated 2020-12-18)"
+    sed -i "s|^RPI_FIRMWARE_VERSION = .*|RPI_FIRMWARE_VERSION = $RPI_FIRMWARE_REF|" "$mk"
+
+    sed -i "/rpi-firmware-${old}\.tar\.gz/d" "$hf"
+    if [ -n "${RPI_FIRMWARE_SHA256:-}" ]; then
+        say "  hash pinned from RPI_FIRMWARE_SHA256"
+        printf 'sha256  %s  rpi-firmware-%s.tar.gz\n' \
+            "$RPI_FIRMWARE_SHA256" "$RPI_FIRMWARE_REF" >> "$hf"
+    else
+        say "  no hash known for this revision — recording buildroot's explicit 'none'"
+        say "  (pass RPI_FIRMWARE_SHA256=... to verify it properly)"
+        printf 'none  rpi-firmware-%s.tar.gz\n' "$RPI_FIRMWARE_REF" >> "$hf"
+    fi
+
+    # The buildroot submodule is patched here, so build.sh's submodule reset
+    # is what keeps this from stacking across runs.
+}
+
 echo "edits.sh: patching ${SMW}"
 patch_download_sites
+patch_firmware
 patch_busybox
 patch_kernel_config
 repin_kernel
