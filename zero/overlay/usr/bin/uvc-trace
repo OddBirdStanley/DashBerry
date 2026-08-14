@@ -44,11 +44,30 @@ previous=""
 
 while :; do
     current=$(
+        # Is the daemon still THERE? Without this the log cannot tell "it died"
+        # from "nothing was asked of it" — and those want opposite fixes. A
+        # journal that simply stops looks identical either way.
+        echo "=== state ==="
+        echo "uvc-webcam:  $(systemctl is-active uvc-webcam 2>&1) / $(systemctl is-failed uvc-webcam 2>&1)"
+        systemctl show uvc-webcam \
+            -p MainPID -p NRestarts -p ExecMainStatus -p ExecMainCode -p Result 2>&1 |
+            sed 's/^/  /'
+        echo "  UDC state:   $(cat /sys/class/udc/*/state 2>/dev/null | tr '\n' ' ')"
+        echo "  UDC owner:   $(cat /sys/kernel/config/usb_gadget/*/UDC 2>/dev/null | tr '\n' ' ')"
+        echo
         echo "=== uvc-webcam ==="
         journalctl -u uvc-webcam --no-pager -o short-iso 2>&1
         echo
         echo "=== usb / gadget / dwc2 (kernel) ==="
-        dmesg 2>/dev/null | grep -iE 'dwc2|gadget|uvc|configfs|udc' | tail -60
+        # dwc2's per-request tracing (CONFIG_USB_DWC2_DEBUG) emits ~10 lines
+        # for EVERY transfer, so an unfiltered tail is 60 lines of one
+        # millisecond and every message worth reading has already scrolled
+        # past. That option is off by default now; this keeps the filter so a
+        # card built with ZERO_DWC2_DEBUG=1 still produces a readable file.
+        dmesg 2>/dev/null |
+            grep -iE 'dwc2|gadget|uvc|configfs|udc' |
+            grep -vE 'start_req|_epint|_irq:|complete:|ureq->|req->length|ep0 state:|adjusting size|DxEPCTL|DXEPCTL' |
+            tail -80
     )
 
     if [ "$current" != "$previous" ]; then

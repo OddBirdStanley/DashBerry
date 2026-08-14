@@ -900,9 +900,32 @@ patch_kernel_config() {
     #
     # It is verbose and belongs off once the port enumerates; the cost while
     # bringing up is a longer log, and the log is the only instrument here.
-    say "kernel → +USB_DWC2_DEBUG (dwc2's own pull-up tracing)"
-    sed -i -E '/^(# )?CONFIG_USB_DWC2_(DEBUG|VERBOSE)( is not set|=.*)$/d' "$f"
-    printf 'CONFIG_USB_DWC2_DEBUG=y\n' >> "$f"
+    #
+    # OFF BY DEFAULT SINCE 2026-08-14, AND NOT MERELY FOR TIDINESS. The port
+    # enumerates now, so it has done its job — but the option it drags in with
+    # it is CONFIG_USB_DWC2_DEBUG_PERIODIC, which defaults to y and means
+    # "log PERIODIC transfers too". Periodic is ISOCHRONOUS, and isochronous is
+    # how UVC moves video: a high-speed gadget is handed a packet every
+    # microframe, 8000 a second, whether or not there is a full frame's worth
+    # to put in it. Each one turns into several dev_dbg() lines, into the
+    # journal, on a 1 GHz single-core ARM11.
+    #
+    # That is a printk storm the moment streaming starts, and it fits what was
+    # measured: enumeration is a few hundred control transfers and survives,
+    # while every capture attempt wedges the whole gadget — the console with
+    # it, because a CPU buried in printk is not servicing ep0 either. It also
+    # explains the result that killed the bandwidth theory. 1280x720 failed
+    # exactly like 1640x922, and it would: the PACKET RATE is 8000/s for both,
+    # only the payload differs.
+    #
+    # ZERO_DWC2_DEBUG=1 puts it back for the next bring-up problem.
+    say "kernel → USB_DWC2_DEBUG ${ZERO_DWC2_DEBUG:+ON (ZERO_DWC2_DEBUG=1)}${ZERO_DWC2_DEBUG:-off — it logs every isochronous packet}"
+    sed -i -E '/^(# )?CONFIG_USB_DWC2_(DEBUG|VERBOSE|DEBUG_PERIODIC)( is not set|=.*)$/d' "$f"
+    if [ "${ZERO_DWC2_DEBUG:-0}" = 1 ]; then
+        printf 'CONFIG_USB_DWC2_DEBUG=y\n' >> "$f"
+    else
+        printf '# CONFIG_USB_DWC2_DEBUG is not set\n' >> "$f"
+    fi
 
     say "kernel → +NOP_USB_XCEIV (the DT's usb-nop-xceiv phy, never built)"
     sed -i -E '/^(# )?CONFIG_(NOP_USB_XCEIV|USB_PHY|GENERIC_PHY)( is not set|=.*)$/d' "$f"
