@@ -1,0 +1,56 @@
+From: DashBerry <zero/README.md>
+Subject: [PATCH] usb: gadget: uvc: treat dwc2's -ENODATA as a missed isoc slot
+
+f_uvc knows exactly one error code for "the isochronous slot was missed":
+-EXDEV. It drops the incomplete frame and carries on. Every other status
+falls through to the default case, which calls uvcg_queue_cancel() and ends
+the stream.
+
+dwc2 never returns -EXDEV. The string does not appear anywhere in
+drivers/usb/dwc2/gadget.c. When the target (micro)frame has already elapsed it
+completes the request with -ENODATA:
+
+    dwc2_gadget_start_isoc_ddma()                 gadget.c:1202
+    dwc2_gadget_handle_nptxfempty()               gadget.c:2869
+    dwc2_gadget_handle_out_ep_incomplete()        gadget.c:2926
+    dwc2_gadget_handle_in_ep_incomplete()         gadget.c:3019
+
+So on dwc2 the FIRST missed slot cancels the video queue, and at bInterval 1 -
+the f_uvc default, one packet every 125 us microframe - a missed slot is a
+matter of when, not if.
+
+Measured on a Pi Zero W (rpi-6.16.y, dwc2 peripheral, UVC H.264 1640x922):
+both STREAM ON calls succeed, then the log fills with
+
+    configfs-gadget.piwebcam gadget.0: uvc: VS request completed with status -61.
+
+repeated without end, no frame ever reaches the host, and uvc-gadget
+eventually gives up and exits. -61 is -ENODATA.
+
+Missing an isochronous slot is normal - it is what isochronous means - and the
+frame is simply incomplete. Handle the two codes identically.
+---
+--- a/drivers/usb/gadget/function/uvc_video.c
++++ b/drivers/usb/gadget/function/uvc_video.c
+@@ -359,6 +359,21 @@
+ 		break;
+ 
+ 	case -EXDEV:
++	case -ENODATA:
++		/*
++		 * -EXDEV is this driver's name for "the isochronous slot was
++		 * missed". dwc2 does not use it: when the target (micro)frame
++		 * has already elapsed it completes the request with -ENODATA
++		 * instead (dwc2_gadget_start_isoc_ddma() and
++		 * dwc2_gadget_handle_*_frame_incomplete() in dwc2/gadget.c;
++		 * -EXDEV appears nowhere in that driver). So on dwc2 every
++		 * missed slot fell through to default: and cancelled the
++		 * queue, which ends the stream on the first one - and at
++		 * bInterval 1, a missed slot is a matter of when, not if.
++		 *
++		 * Treat the two the same. Missing a slot is normal for
++		 * isochronous transfer and the frame is simply incomplete.
++		 */
+ 		uvcg_dbg(&video->uvc->func, "VS request missed xfer.\n");
+ 		if (req->length != 0)
+ 			queue->flags |= UVC_QUEUE_DROP_INCOMPLETE;

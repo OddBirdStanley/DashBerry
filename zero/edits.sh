@@ -117,6 +117,24 @@ repin_kernel() {
         ls "$SMW/patches/linux-custom" 2>/dev/null | sed 's/^/      /' || true
         sed -i '/^BR2_LINUX_KERNEL_PATCH=/d' "$CFG"
     fi
+
+    # ...and put the option back, pointing at OUR kernel patches, which are a
+    # different thing from showmewebcam's obsolete one above.
+    #
+    # zero/patches/linux-custom/0001 makes f_uvc survive a missed isochronous
+    # slot on dwc2. Without it the camera streams nothing at all: f_uvc treats
+    # any status but -EXDEV as fatal and cancels the video queue, dwc2 reports
+    # a missed slot as -ENODATA, and at bInterval 1 that happens almost at
+    # once. See the patch header for the measurement.
+    rm -rf "$SMW/patches/linux-dashberry"
+    mkdir -p "$SMW/patches/linux-dashberry"
+    cp "$HERE"/patches/linux-custom/*.patch "$SMW/patches/linux-dashberry/"
+    say "kernel → patches/linux-dashberry/:"
+    ls "$SMW/patches/linux-dashberry" | sed 's/^/      /'
+    sed -i '/^BR2_LINUX_KERNEL_PATCH=/d' "$CFG"
+    printf '%s\n' \
+        'BR2_LINUX_KERNEL_PATCH="$(BR2_EXTERNAL_PICAM_PATH)/patches/linux-dashberry"' \
+        >> "$CFG"
 }
 
 # ---------------------------------------------------------------------------

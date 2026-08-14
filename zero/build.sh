@@ -304,6 +304,27 @@ if [ -f "$SMW_DIR/output/$BOARD/.config" ]; then
         make -C "$SMW_DIR/output/$BOARD" "$pkg-dirclean" >/dev/null 2>&1 \
             || die "could not dirclean $pkg — a stale build of it would ship silently"
     done
+
+    # The kernel is the same trap and a far more expensive one. Buildroot
+    # applies BR2_LINUX_KERNEL_PATCH at EXTRACT time, so a patch added to an
+    # already-extracted tree is simply never applied — and the card boots a
+    # kernel that looks right and is not.
+    #
+    # But a linux-dirclean is a full rebuild, so it is done only when the patch
+    # set has actually changed, keyed on a hash of the directory.
+    KPATCH_DIR="$HERE/patches/linux-custom"
+    KPATCH_STAMP="$SMW_DIR/.dashberry-kernel-patch-hash"
+    if [ -d "$KPATCH_DIR" ]; then
+        KPATCH_HASH=$(cat "$KPATCH_DIR"/*.patch 2>/dev/null | sha256sum | cut -d' ' -f1)
+        if [ "$KPATCH_HASH" != "$(cat "$KPATCH_STAMP" 2>/dev/null || true)" ]; then
+            echo "  linux-dirclean (kernel patch set changed — this is a full rebuild)"
+            make -C "$SMW_DIR/output/$BOARD" linux-dirclean >/dev/null 2>&1 \
+                || die "could not dirclean linux — the kernel patch would not be applied"
+            printf '%s\n' "$KPATCH_HASH" > "$KPATCH_STAMP"
+        else
+            echo "  linux: kernel patch set unchanged, keeping the built tree"
+        fi
+    fi
 fi
 
 ( cd "$SMW_DIR" && BUILDROOT_DIR=buildroot ./build-showmewebcam.sh "$BOARD" )
@@ -397,6 +418,27 @@ verify_patched_files() {
     echo "  patched-file gate: what we patched is what shipped"
 }
 verify_patched_files
+
+# --- gate: did our kernel patches actually get applied? --------------------
+# Same failure as a stale package, but worse to find: the kernel is extracted
+# once and reused, so an unapplied patch is invisible. The card boots, the
+# camera enumerates, and only STREAMING is broken — a whole bench session to
+# discover, which is exactly how it was discovered.
+verify_kernel_patched() {
+    local src="$SMW_DIR/output/$BOARD/build/linux-custom/drivers/usb/gadget/function/uvc_video.c"
+    [ -f "$src" ] || { echo "  (no kernel source tree to check — skipped)"; return 0; }
+    grep -q 'case -ENODATA:' "$src" || die "the built kernel does NOT carry our uvc_video.c patch.
+    wanted: 'case -ENODATA:' in drivers/usb/gadget/function/uvc_video.c
+
+  Buildroot applies BR2_LINUX_KERNEL_PATCH when it EXTRACTS the kernel, so a
+  patch added to an already-extracted tree is never applied. The card would
+  boot, enumerate, and stream nothing: f_uvc cancels the video queue on the
+  first missed isochronous slot and dwc2 reports those as -ENODATA.
+  Run: make -C $SMW_DIR/output/$BOARD linux-dirclean
+  Refusing to package this image."
+    echo "  kernel-patch gate: uvc_video.c carries the -ENODATA case"
+}
+verify_kernel_patched
 
 # --- gate: is the boot config the one we asked for? ------------------------
 # Same failure as the stale package, one directory over: post-image.sh only
