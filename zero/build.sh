@@ -281,6 +281,25 @@ step "image ($BOARD)"
 [ -x "$SMW_DIR/build-showmewebcam.sh" ] || die "no build-showmewebcam.sh in $SMW_DIR — upstream's entry point moved"
 [ -f "$SMW_DIR/buildroot/Makefile" ] || die "the buildroot submodule is empty — run:
   git -C $SMW_DIR submodule update --init --recursive"
+# Buildroot decides a package is done by a STAMP FILE, not by whether its
+# sources changed. `git clean -e output` deliberately keeps output/ so rebuilds
+# are incremental — which also keeps piwebcam's .stamp_target_installed, so
+# every edit edits.sh makes to package/piwebcam/ AFTER the first successful
+# build is silently ignored. That is not theoretical: a UDC wait loop added to
+# multi-gadget.sh sat in the source through two builds and never reached the
+# card, and the resulting card looked like a fresh bug each time.
+#
+# So: force-invalidate every package whose files we patch. Cheap — piwebcam is
+# a few hundred KB and builds in seconds.
+if [ -f "$SMW_DIR/output/$BOARD/.config" ]; then
+    step "invalidate patched packages"
+    for pkg in piwebcam; do
+        echo "  $pkg-dirclean (its sources are patched by edits.sh)"
+        make -C "$SMW_DIR/output/$BOARD" "$pkg-dirclean" >/dev/null 2>&1 \
+            || die "could not dirclean $pkg — a stale build of it would ship silently"
+    done
+fi
+
 ( cd "$SMW_DIR" && BUILDROOT_DIR=buildroot ./build-showmewebcam.sh "$BOARD" )
 
 # --- gate: did the kernel keep the options that make the card work? --------
@@ -346,6 +365,31 @@ verify_kernel_config() {
     echo "  kernel config gate: all boot- and function-critical options present"
 }
 verify_kernel_config
+
+# --- gate: did our patched files actually reach the rootfs? ----------------
+# The stamp problem above is invisible by design: the build succeeds, the image
+# is valid, and only the board shows the difference. This compares what we
+# patched against what was installed, so a stale package fails the build.
+verify_patched_files() {
+    local t="$SMW_DIR/output/$BOARD/target" stale="" src dst
+    for pair in \
+        "package/piwebcam/multi-gadget.sh:/opt/uvc-webcam/multi-gadget.sh" \
+        "package/piwebcam/start-webcam.sh:/opt/uvc-webcam/start-webcam.sh" \
+    ; do
+        src="$SMW_DIR/${pair%%:*}"; dst="$t${pair#*:}"
+        [ -f "$src" ] && [ -f "$dst" ] || continue
+        cmp -s "$src" "$dst" || stale="$stale
+    ${pair#*:}  differs from ${pair%%:*}"
+    done
+    [ -z "$stale" ] || die "files we patched did NOT reach the built rootfs:$stale
+
+  Buildroot considered the package already installed and skipped it. The image
+  would look fine and behave like the unpatched one. Add the package to the
+  dirclean list above.
+  Refusing to package this image."
+    echo "  patched-file gate: what we patched is what shipped"
+}
+verify_patched_files
 
 IMG="$SMW_DIR/output/$BOARD/images/sdcard.img"
 [ -f "$IMG" ] || die "the build produced no $IMG — read the log above"
