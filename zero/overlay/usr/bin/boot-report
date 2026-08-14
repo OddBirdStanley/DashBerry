@@ -83,6 +83,17 @@ remount rw || { echo "boot-report: cannot remount /boot rw" >&2; exit 1; }
     echo "  (no UDC at all means dwc2 did not bind: check dr_mode and the cable)"
     echo
 
+    echo "== configfs tree as uvc-gadget walks it"
+    # uvc-gadget discovers formats by ftw()-ing this tree and parsing paths of
+    # the form <speed>/<header>/<format>/<frame>/<attr> under streaming/class/.
+    # It reported "configfs settings for uvc gadget not found", so print what
+    # is actually there rather than guessing at the shape.
+    find "$G/functions/uvc.usb0/streaming/class" "$G/functions/uvc.usb0/control/class" \
+         -maxdepth 4 2>/dev/null | sed "s|$G/functions/uvc.usb0/|  |" | head -40
+    echo "  --- what uvc-gadget said ---"
+    journalctl -b --no-pager -u uvc-webcam 2>/dev/null | tail -15 | sed 's/^/  /'
+    echo
+
     echo "== camera"
     echo "  video nodes: $(ls /dev/video* 2>/dev/null | tr '\n' ' ')"
     echo "  /dev/video0 is the SENSOR (bcm2835-v4l2); /dev/video1 is the gadget."
