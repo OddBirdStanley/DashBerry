@@ -390,6 +390,11 @@ bind_gadget() {
 if [ -f /boot/no-camera ] ; then
   echo "/boot/no-camera present: binding WITHOUT the camera."
   echo "  This is the debugging shape - console and control port only."
+  echo "  NOTE uvc-webcam will exit immediately in this mode: with the UVC"
+  echo "  function left out of the config there is no /dev/video1 for it to"
+  echo "  open. That is expected, not a new fault - but it means the daemon"
+  echo "  cannot be debugged from this console. Read /boot/boot-report.txt off"
+  echo "  the card instead; it carries the daemon's full log."
   echo "  Delete /boot/no-camera to go back to a camera card."
   rm -f configs/c.1/uvc.usb0
   bind_gadget "console + control port, camera deliberately omitted"

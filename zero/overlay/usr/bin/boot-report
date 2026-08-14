@@ -110,8 +110,15 @@ remount rw || { echo "boot-report: cannot remount /boot rw" >&2; exit 1; }
     echo "  gadget deactivated and nothing enumerates - see usr/bin/uvc-activate."
     echo "  uvc-gadget running: $(pidof uvc-gadget >/dev/null 2>&1 && echo yes || echo NO)"
     echo "  uvc-activate running: $(pidof -x uvc-activate >/dev/null 2>&1 && echo yes || echo no)"
-    echo "  --- what uvc-gadget said ---"
-    journalctl -b --no-pager -u uvc-webcam 2>/dev/null | tail -15 | sed 's/^/  /'
+    echo "  --- what uvc-gadget said (FULL) ---"
+    # NOT a tail. When discovery fails the card does not enumerate, so there is
+    # no console to read this on — and /boot/no-camera, which would give you a
+    # console, removes the UVC function from the config so /dev/video1 never
+    # appears and the daemon exits before saying anything. That is a catch-22
+    # with only one way out: this file, read off the SD card in any PC. It is
+    # the only channel that works while the camera is broken, so it carries the
+    # whole log.
+    journalctl -b --no-pager -u uvc-webcam 2>/dev/null | sed 's/^/  /' 
     echo
 
     echo "== camera"
