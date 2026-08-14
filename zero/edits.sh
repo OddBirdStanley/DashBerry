@@ -509,6 +509,26 @@ install_overlay() {
     mkdir -p "$OVERLAY/etc/systemd/system/basic.target.wants"
     ln -sf ../rear-ctld.service   "$OVERLAY/etc/systemd/system/basic.target.wants/rear-ctld.service"
     ln -sf ../boot-report.service "$OVERLAY/etc/systemd/system/basic.target.wants/boot-report.service"
+
+    # A shell that is NOT on the gadget.
+    #
+    # Every way into this card runs down the USB cable: the console is ttyGS0,
+    # the control port is ttyGS1, the video is the same gadget again. So the
+    # one failure we most need to observe — the gadget wedging — is the one
+    # that takes away the means of observing it. Measured on 2026-08-14: a
+    # failed capture left ttyACM0 hung, and with it went any chance of reading
+    # the log that would say why.
+    #
+    # The UART is independent of dwc2 and of libcomposite. The kernel already
+    # talks to it (console=ttyAMA0,115200 in cmdline.txt) and disable-bt has
+    # already moved the PL011 onto GPIO 14/15, so the pins are live on any
+    # card built here — there was simply no getty to log into. This adds one.
+    #
+    # Wiring: USB-TTL GND to pin 6, its RX to pin 8 (Zero TXD), its TX to
+    # pin 10 (Zero RXD), 115200 8N1. Nothing is connected in normal service.
+    mkdir -p "$OVERLAY/etc/systemd/system/getty.target.wants"
+    ln -sf /usr/lib/systemd/system/serial-getty@.service \
+        "$OVERLAY/etc/systemd/system/getty.target.wants/serial-getty@ttyAMA0.service"
 }
 
 # ---------------------------------------------------------------------------
