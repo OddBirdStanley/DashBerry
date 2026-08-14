@@ -489,6 +489,39 @@ PY
 # auto_exposure_bias=12 stays: it is the shipped default and the Pi 4 pushes
 # the same value, so an un-pushed card still looks like the one it replaced.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# 4a. start-webcam.sh — stop running the video queue at its minimum depth.
+#
+# uvc-gadget's -n is the V4L2 buffer count. It is not passed, so it runs at the
+# built-in default of 2 — the minimum the option will even accept (it rejects
+# anything below 2). Two buffers means one frame in flight and one being
+# drained, and any jitter in either the encoder or the isochronous drain
+# starves the pipeline outright.
+#
+# Note -b is NOT buffers. It is "blink the LED X times on startup", and the
+# shipped command line's "-b 3" reads exactly like a buffer count.
+#
+# Frame size is what makes this bite: 1640x922 is 1.64x the pixels of 1280x720
+# and 1920x1080 is 2.25x, so a large frame occupies a buffer for proportionally
+# longer while the isoc endpoint drains it at a fixed 8000 packets/s. Measured
+# 2026-08-14: 720p30 completed a full 23 s trial while wide30, 1080p15 and
+# 1080p30 all died within seconds.
+#
+# THIS IS NOT CONFIRMED AS THE CAUSE of that failure — the Zero-side log has
+# not been read for those runs yet, and uvc-gadget also exits outright on a
+# 1-second select() timeout, which would look identical from the host. It is
+# changed because running a video queue at its documented minimum is
+# indefensible on its own terms, and 8 buffers of 1.5 MB is ~12 MB on a board
+# with ~256 MB free.
+# ---------------------------------------------------------------------------
+patch_start_webcam() {
+    local f="$PIWEBCAM/start-webcam.sh"
+    anchor "$f" '-b 3 -u /dev/video1 -v /dev/video0' "the uvc-gadget command line"
+    say "start-webcam.sh → -n ${ZERO_UVC_NBUFS:-8} video buffers (was the default 2)"
+    sed -i "s|-b 3 -u /dev/video1|-b 3 -n ${ZERO_UVC_NBUFS:-8} -u /dev/video1|" "$f"
+    grep -q -- "-n ${ZERO_UVC_NBUFS:-8}" "$f" || die "start-webcam.sh edit did not take — read it."
+}
+
 patch_camera_txt() {
     local f="$PIWEBCAM/camera.txt"
     anchor "$f" "video_bitrate=25000000" "the shipped camera settings"
@@ -1205,6 +1238,7 @@ repin_kernel
 patch_dts_name
 patch_uvc_gadget
 patch_multi_gadget
+patch_start_webcam
 patch_camera_txt
 install_overlay
 patch_post_image
