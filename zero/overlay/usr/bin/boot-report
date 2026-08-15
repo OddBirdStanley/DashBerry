@@ -19,8 +19,9 @@
 # GATED BY A MARKER FILE, deliberately, mirroring showmewebcam's own
 # enable-serial-debug: this remounts /boot read-write, and a dashcam is
 # power-cut without warning thousands of times. A FAT write in progress when
-# the 12 V dies can corrupt the boot partition. Delete /boot/enable-boot-report
-# for a card that lives in the car; keep it on the bench.
+# the 12 V dies can corrupt the boot partition. So this is OFF BY DEFAULT: the
+# image ships the marker as enable-boot-report.DISABLED and it has to be
+# renamed to arm it. Rename it back before the card goes in the car.
 set -u
 
 MARKER=/boot/enable-boot-report

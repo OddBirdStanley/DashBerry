@@ -1381,12 +1381,22 @@ patch_dts_name() {
 #   carries console=tty1, so a mini-HDMI cable shows the boot — including a
 #   panic — with no adapter to buy. `quiet` was blanking exactly that.
 #
-#   /boot/boot-report.txt, written on every boot by boot-report.service:
-#   gadget state (crucially whether the UDC bound), camera nodes, service
-#   status, and the tail of the kernel log. /boot is FAT, so ANY PC can read
-#   it with just the SD card. Gated by /boot/enable-boot-report in the same
-#   spirit as enable-serial-debug, because writing there means remounting it
-#   read-write and a dashcam is power-cut without warning.
+#   /boot/boot-report.txt, written by boot-report.service: gadget state
+#   (crucially whether the UDC bound), camera nodes, service status, and the
+#   tail of the kernel log. /boot is FAT, so ANY PC can read it with just the
+#   SD card.
+#
+#   OFF BY DEFAULT. The marker ships as enable-boot-report.DISABLED and has to
+#   be renamed to arm it, which matches enable-uvc-trace (never shipped at all)
+#   and matches what the marker's own text already told people to do for a car
+#   card. Writing the report means remounting /boot read-write, and a dashcam
+#   is power-cut without warning, so the default has to be the safe one.
+#
+#   It ships PRESENT-BUT-INERT rather than not at all because of who reads it:
+#   this exists for a card that boots and does not enumerate, where the console,
+#   the control port and the camera are all gone together and an SD reader is
+#   the only instrument left. A file on the FAT partition explaining itself is
+#   worth more to that person than a line in a README they cannot reach.
 # ---------------------------------------------------------------------------
 patch_boot_debug() {
     local f="$SMW/board/post-image.sh"
@@ -1395,7 +1405,7 @@ patch_boot_debug() {
         say "boot diagnostics already wired — left alone"
     else
         say "cmdline → dropping 'quiet' (HDMI console is a debug channel)"
-        say "boot → shipping the enable-boot-report marker"
+        say "boot → shipping the boot-report marker, DISABLED"
         python3 - "$f" <<'PY4'
 import sys
 p = sys.argv[1]
@@ -1411,16 +1421,24 @@ new = (
  "\t\t# matter most.\n"
  "\t\tsed -e 's/ quiet//g' -i \"${BINARIES_DIR}/rpi-firmware/cmdline.txt\"\n"
  "\n"
- "\t\t# DashBerry: marker for the boot report, same spirit as\n"
- "\t\t# enable-serial-debug below. See usr/bin/boot-report.\n"
- "\t\tcat << __EOF__ >> \"${BINARIES_DIR}/enable-boot-report\"\n"
- "# Present = the Zero writes /boot/boot-report.txt every boot: gadget state,\n"
- "# camera nodes, service status, tail of the kernel log. It exists so a card\n"
- "# that boots but does not ENUMERATE can be diagnosed with only an SD card\n"
- "# reader - when the gadget fails, console, control port and camera go too.\n"
+ "\t\t# DashBerry: marker for the boot report, shipped DISABLED —\n"
+ "\t\t# it has to be renamed to arm it. Writing the report remounts\n"
+ "\t\t# /boot rw, which a power-cut dashcam must not do by default.\n"
+ "\t\t# See usr/bin/boot-report.\n"
+ "\t\tcat << __EOF__ >> \"${BINARIES_DIR}/enable-boot-report.disabled\"\n"
+ "# THIS FILE DOES NOTHING AS NAMED. Rename it to exactly\n"
  "#\n"
- "# DELETE THIS FILE for a card going into the car: the report remounts /boot\n"
- "# read-write, and a dashcam loses power without warning.\n"
+ "#     enable-boot-report\n"
+ "#\n"
+ "# (drop the .disabled) and reboot the Zero. It then writes\n"
+ "# /boot/boot-report.txt on every boot: gadget state, camera nodes, service\n"
+ "# status, tail of the kernel log. That exists so a card which boots but does\n"
+ "# not ENUMERATE can be diagnosed with only an SD card reader - when the\n"
+ "# gadget fails, the console, the control port and the camera all go with it.\n"
+ "#\n"
+ "# PUT IT BACK before the card goes in the car. Writing the report remounts\n"
+ "# /boot read-write, and a dashcam loses power without warning; a FAT\n"
+ "# partition caught rw can be corrupted by that.\n"
  "__EOF__\n"
  "\n"
  "\t\t# Add default enable-serial-debug file")
@@ -1436,8 +1454,8 @@ PY4
     for g in "$SMW"/board/genimage-*.cfg; do
         grep -q 'enable-serial-debug' "$g" || continue
         grep -q 'enable-boot-report' "$g" && continue
-        say "genimage → +enable-boot-report ($(basename "$g"))"
-        sed -i 's|"enable-serial-debug",|"enable-serial-debug",\n      "enable-boot-report",|' "$g"
+        say "genimage → +enable-boot-report.disabled ($(basename "$g"))"
+        sed -i 's|"enable-serial-debug",|"enable-serial-debug",\n      "enable-boot-report.disabled",|' "$g"
     done
 }
 

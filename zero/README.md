@@ -551,6 +551,17 @@ stale. Off unless the marker is there: it writes to a FAT partition that a
 dashcam can lose power at any moment, which is the same bargain
 `/boot/enable-boot-report` makes.
 
+**The boot report.** Same instrument for the boot rather than what follows it.
+The image ships the marker **disabled** — rename
+`/boot/enable-boot-report.disabled` to `/boot/enable-boot-report`, boot, and
+`/boot/boot-report.txt` holds the gadget state (crucially whether the UDC
+bound), the camera nodes, service status and the tail of the kernel log. It is
+shipped present-but-inert rather than absent because the card it exists for is
+one you cannot talk to at all: an SD reader is the only instrument left, and a
+file on the FAT partition that explains itself beats a README you cannot
+reach. **Rename it back before the card goes in the car** — both markers
+remount `/boot` read-write, and neither default should be the unsafe one.
+
 **Mini-HDMI.** `cmdline.txt` carries `console=tty1` and `quiet` is gone, so a
 monitor shows the boot with no image change. It shows kernel messages only —
 `uvc-gadget`'s own output goes to the journal — so this diagnoses the driver
