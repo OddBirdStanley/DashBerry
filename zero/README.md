@@ -222,6 +222,24 @@ with motion in frame:
 6 is too far: 9 slots per frame is a 2.2 Mbps ceiling and the frames do not fit,
 which is what made it look worse than 1 when it was tried early on.
 
+**`linux-custom/0003` widens the deadline that the last three losses fall out
+of.** f_uvc interrupts every `min(uvc_num_requests/4, UVCG_REQ_MAX_INT_COUNT)`
+requests and that completion is what re-arms the submit kthread, so the cap —
+16, and independent of `bInterval` — is a wall-clock deadline:
+
+| bInterval | `INT_COUNT` | batch | period | deadline |
+| --- | --- | --- | --- | --- |
+| 1 | 16 | 16 | 125 µs | 2.0 ms |
+| 3 | 16 | 16 | 500 µs | 8.0 ms |
+| 3 | **32** | 32 | 500 µs | **16.0 ms** |
+
+Miss it and dwc2 finds nothing queued when the target frame elapses. The submit
+path is already `SCHED_FIFO` and the pump workqueue already `WQ_HIGHPRI`, so a
+longer deadline is the only thing left to give it. The patch changes no request
+count and no service interval, so unlike `uvc-overspeed` it cannot disturb
+dwc2's clock. **Not yet measured** — 3 events in 690 frames is a thin baseline,
+so shoot a long run before and after.
+
 The pin is a GitHub **tarball**, not a git ref, and `edits.sh` resolves the
 branch to a SHA before substituting it — a card you cannot rebuild byte for
 byte is not a card you can debug. `KERNEL_SHA=` pins one directly.

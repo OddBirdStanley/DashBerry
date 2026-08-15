@@ -165,6 +165,28 @@ repin_kernel() {
     # not specific to the camera — it corrupts every vchiq bulk transfer from
     # a kernel buffer larger than one page. See the patch header.
     #
+    # zero/patches/linux-custom/0003 raises UVCG_REQ_MAX_INT_COUNT from 16 to
+    # 32. f_uvc raises a completion interrupt every min(uvc_num_requests/4, 16)
+    # requests, and uvc_video_complete() is what re-arms the submit kthread —
+    # so that cap is a wall-clock DEADLINE which does not scale with bInterval:
+    #
+    #     bInterval   INT_COUNT   batch   period    deadline
+    #         1          16        16     125 us     2.0 ms
+    #         3          16        16     500 us     8.0 ms
+    #         3          32        32     500 us    16.0 ms
+    #
+    # Miss it and dwc2 has nothing queued when the target frame elapses, drops
+    # the next request -ENODATA, and the frame is truncated. That is the whole
+    # remaining failure mode — a latency tail, not a systematic error, and the
+    # submit path is already SCHED_FIFO with the pump workqueue already
+    # WQ_HIGHPRI, so a longer deadline is the only thing left to give it.
+    #
+    # It changes no request COUNT and no service interval, so it cannot disturb
+    # dwc2's target-frame clock — the failure that killed both uvc-overspeed
+    # above 1 and the pre-6.13 fixed request sizing. Costs ~33 KB and some
+    # mid-frame latency; ureq->last_buf still forces an interrupt at the end of
+    # every buffer, so buffer turnaround is unchanged. NOT YET MEASURED.
+    #
     rm -rf "$SMW/patches/linux-dashberry"
     mkdir -p "$SMW/patches/linux-dashberry"
     cp "$HERE"/patches/linux-custom/*.patch "$SMW/patches/linux-dashberry/"
