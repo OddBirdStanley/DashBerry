@@ -61,7 +61,14 @@ ask() {                            # $* = command → reply on stdout, nonzero o
     # "ATAT...". udev tells it to skip these ports and the daemon stays silent
     # at them, but a port can already be mid-probe when we open it, so the
     # reader drops what it recognises as not-an-answer instead of failing.
-    # A bare "OK"/"ERROR" is a modem reply; ours are always "OK <something>".
+    # The test is EXACT-MATCH on a bare "OK"/"ERROR", and it must stay exact.
+    # A bare OK/ERROR on its own line is a modem reply. Ours never look like
+    # that: SET and APPLY answer "OK <something>", VERSION answers
+    # "DASHBERRY-ZERO ...", errors are "ERR ...", and GET answers a BARE VALUE
+    # ("8000000", "high"). That last one is why this cannot be loosened into a
+    # prefix match on "OK" — it would still work, right up until a control
+    # whose value starts with those letters, and it would break every
+    # read-back silently. Match the whole word or not at all.
     _tries=0
     while [ "$_tries" -lt 6 ]; do
         _tries=$((_tries + 1))

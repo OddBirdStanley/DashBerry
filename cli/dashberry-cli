@@ -589,7 +589,8 @@ def display_shift_secs(args, start0):
 # the window (sub-second exact) alternating with generated black
 # "No Signal" filler — and GPS trouble labeled "GPS Error"/"GPS No
 # Signal". Always a re-encode; near-transparent x264 settings (CRF 18)
-# keep the loss on 8/4 Mbps dashcam source visually negligible.
+# keep the loss on 8 Mbps dashcam source visually negligible (both cameras;
+# the rear rose from 4 on 2026-08-12).
 #
 # Each camera reaches ffmpeg as ONE input: an ffconcat list walked by the
 # concat DEMUXER, which opens one segment at a time. It used to be one -i

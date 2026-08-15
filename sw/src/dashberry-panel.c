@@ -2001,8 +2001,8 @@ static void jw_key(int key, bool press, int64_t now)
  * shaped by that being worth a real cost:
  *
  *   - Entry STOPS BOTH RECORDERS. That is what makes it destructive rather
- *     than merely modal, and it is what most debug scripts want anyway
- *     (front-check and quality-probe both need the cameras). It also means
+ *     than merely modal, and it is what most debug scripts want anyway —
+ *     anything that opens a camera needs the recorders off it first. It also means
  *     health goes ERR within STALE_SECS by construction, which is why the
  *     PAGE 0 transition has to be suppressed while this screen is up — see
  *     the health block in main().

@@ -265,7 +265,8 @@ done
 # rebuilt before anyone can even ask it a question.
 #
 # That rule has already cost this project a wrong conclusion. On 2026-08-05
-# cam/dashberry-rear-probe.sh probed four alternative encoders for the rear
+# a rear-encoder probe script (cam/dashberry-rear-probe.sh, since deleted)
+# probed four alternative encoders for the rear
 # frame-rate collapse; three of them (x264enc from plugins-ugly,
 # avenc_h264_v4l2m2m from libav, and ffmpeg itself) were on no card, so the
 # script took its "not installed — skipped" branch for each and openh264enc
@@ -276,16 +277,18 @@ done
 #
 # What each buys: ffmpeg/ffprobe (segment forensics in the field — durations,
 # counted frames, a readable/unreadable verdict on a crash tail — and every
-# quality measurement in cam/dashberry-quality-probe.sh), v4l-utils
+# quality measurement the old cam/dashberry-quality-probe.sh made, back when
+# it existed), v4l-utils
 # (v4l2-ctl is the only way to ask the Zero what formats it actually
-# offers), gstreamer1.0-libav + gstreamer1.0-plugins-ugly (the alternative
-# encoders, so an encoder question can be answered on the card that has the
-# problem rather than only on a bench card that does not).
+# offers), gstreamer1.0-libav + gstreamer1.0-plugins-ugly (alternative
+# encoders and demuxers, so a pipeline question can be answered on the card
+# that has the problem rather than only on a bench card that does not).
 #
 # Cost, accepted: ~100 MB of image that production does not execute in
-# normal operation. It also settles a live question by pre-emption — if
-# quality-probe names avenc_h264_v4l2m2m as the rear encoder, libav is
-# already there and no card needs rebuilding for it. dashberry-cli is still
+# normal operation. The rear-encoder question these once pre-empted is CLOSED
+# — the Zero encodes and this box only remuxes (rear-rec), so nothing here
+# will ever be "the rear encoder". They stay for diagnosis, which is the
+# argument that carried ffmpeg and v4l-utils too. dashberry-cli is still
 # PC-side and still not installed: the runtime footprint rule bars an
 # INTERPRETER on the image, which these are not.
 apt-get install -y --no-install-recommends \

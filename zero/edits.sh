@@ -272,7 +272,7 @@ patch_uvc_gadget() {
 # ---------------------------------------------------------------------------
 # 3. multi-gadget.sh — advertise H.264, and add the control port.
 #
-# Four changes, and only the first is the obvious one:
+# Seven changes, and only the first is the obvious one:
 #   a) the video_formats.txt parser greps ^(mjpeg|uncompressed), so an h264
 #      line is silently DROPPED — the gadget comes up advertising nothing new
 #      and the failure surfaces on the Pi 4 as a caps mismatch.
@@ -287,6 +287,11 @@ patch_uvc_gadget() {
 #      LAST so its interface number is stable for the Pi 4's udev rule.
 #   e) the descriptor bitfields that showmewebcam's dropped kernel patch used
 #      to hardcode are set here instead, from configfs. Same values, no patch.
+#   f) the isochronous endpoint is sized from /boot — bInterval and maxpacket,
+#      defaults 3 and 1024. bInterval 3 is the one knob that safely cuts the
+#      request rate; see further down for why, and why maxpacket stays.
+#   g) the pull-up is asserted explicitly, by writing "connect" to the UDC's
+#      soft_connect after the bind. Binding is not attaching.
 # ---------------------------------------------------------------------------
 patch_multi_gadget() {
     local f="$PIWEBCAM/multi-gadget.sh"
@@ -465,13 +470,16 @@ bind_gadget() {
   ls /sys/class/udc > UDC 2>/tmp/udc-bind.err
   if [ -n "$(cat UDC 2>/dev/null)" ] ; then
     echo "Gadget bound to $(cat UDC)  [$1]"
-    # DashBerry: BINDING IS NOT ATTACHING. In dr_mode=peripheral - which the
-    # car needs, because its converter grounds ID and an OTG port would become
-    # a HOST - dwc2 runs no OTG session state machine, so
-    # usb_udc_vbus_handler() never reports VBUS, udc->vbus stays false, and
-    # usb_udc_connect_control() DISCONNECTS instead of connecting. The result
-    # is a gadget that binds, registers its video node, and is never on the
-    # bus: the host sees nothing at all, not even a failed enumeration.
+    # DashBerry: BINDING IS NOT ATTACHING. In dr_mode=peripheral dwc2 runs no
+    # OTG session state machine, so usb_udc_vbus_handler() never reports VBUS,
+    # udc->vbus stays false, and usb_udc_connect_control() DISCONNECTS instead
+    # of connecting. The result is a gadget that binds, registers its video
+    # node, and is never on the bus: the host sees nothing at all, not even a
+    # failed enumeration. That is why this image ships OTG and NOT peripheral.
+    #
+    # This runs unconditionally rather than only under peripheral, because it
+    # costs one write and it is the difference between a silent brick and a
+    # camera if ZERO_DR_MODE is ever changed back.
     #
     # soft_connect calls usb_gadget_connect_locked() directly, and that path
     # checks only ->pullup, ->started and ->allow_connect - never vbus - all of
@@ -839,12 +847,14 @@ install_overlay() {
 }
 
 # ---------------------------------------------------------------------------
-# 6. /boot/config.txt — the two deviations that live there.
+# 6. /boot/config.txt — the deviations that live there.
 #
 # This card carried THREE deviations from the official image before H.264 ever
 # came up: advertised resolutions (video_formats.txt, handled in the overlay),
-# USB PERIPHERAL MODE, and memory allocation. Both of the latter land in
-# config.txt, and neither can go in the rootfs overlay: /boot is a separate FAT
+# the USB role, and memory allocation. The latter two land in config.txt, and
+# radio silence (disable-wifi/disable-bt) landed here later, so it is four
+# lines now rather than two. None can go in the rootfs overlay: /boot is a
+# separate FAT
 # partition built by genimage from ${BINARIES_DIR}/rpi-firmware/config.txt, and
 # fstab mounts it over anything the overlay put at /boot. post-image.sh's
 # --configure-picam block is where that file is assembled, so both append
@@ -880,8 +890,12 @@ install_overlay() {
 #
 #     What is true: every peripheral test before the PHY fix ran with no PHY,
 #     where no mode could attach, and exactly ONE test has had PHY+peripheral.
-#     OTG+PHY - what stock proves works - has not been tried. Use otg because
-#     it is the known-good shape, not because peripheral is condemned.
+#     OTG+PHY has since been tried and WORKS - image dashberry-zero-7729166 on
+#     rpi-6.18.y enumerates and streams 690 frames at 1640x922@30 with 0
+#     decoder errors (2026-08-15). So otg is the known-good shape by
+#     measurement now, not by inheritance from stock. Peripheral is still not
+#     condemned; it is simply not needed, and the soft_connect pull-up below
+#     removes the one advantage it would have had.
 #
 #     THE CAR STILL NEEDS ID TO FLOAT. In OTG the role comes from the ID pin,
 #     so a converter that grounds it makes the Zero a HOST and the camera
@@ -1058,8 +1072,9 @@ patch_download_sites() {
 # busybox 1.33.2's `tc` applet reads TCA_CBQ_*, struct tc_cbq_lssopt and
 # friends out of <linux/pkt_sched.h>. Linux removed the CBQ queueing
 # discipline and deleted those uapi definitions with it, so against the
-# rpi-6.16.y headers this image now builds on, networking/tc.c does not
-# compile at all.
+# 6.x headers this image now builds on (first hit on rpi-6.16.y, and still
+# true on the current rpi-6.18.y pin), networking/tc.c does not compile at
+# all.
 #
 # There is nothing to repair: the kernel does not implement CBQ any more, so
 # the applet would have nothing to configure even if it built. It is disabled
@@ -1069,7 +1084,7 @@ patch_download_sites() {
 # default in later releases for the same reason.
 #
 # Expect more of this shape as the target build proceeds: this is target
-# source written against 5.10 uapi meeting 6.16 uapi, which is a different
+# source written against 5.10 uapi meeting 6.x uapi, which is a different
 # problem from the host-tooling drift build.sh works around.
 # ---------------------------------------------------------------------------
 patch_busybox() {
@@ -1431,7 +1446,7 @@ PY4
 # before it says anything.
 #
 # buildroot 2021.02 pins raspberrypi/firmware at d016a6eb, dated 2020-12-18.
-# That start.elf is now being asked to load a 2026 kernel and a 6.16 device
+# That start.elf is now being asked to load a 2026 kernel and a 6.18 device
 # tree. The firmware/kernel interface is mostly stable, but Raspberry Pi ship
 # the two together and do not support mixing eras this far apart — and the
 # failure mode when it goes wrong is exactly the one seen here: the firmware

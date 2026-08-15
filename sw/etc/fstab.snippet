@@ -29,13 +29,14 @@
 # same transaction — so the file on the card is always a PREFIX of what was
 # written: losses only ever at the tail, never in the middle.
 #
-# Measured before the change (cam/front_bad_last.ts, 2026-08-08): 7 holes in
+# Measured before the change (2026-08-08, on a captured bad tail no longer
+# kept in cam/): 7 holes in
 # the last 17.0 s of a 48.9 s final segment, 14,721 zeroed bytes = 0.11% of
 # the file, costing 210 frames — 7.0 s of video. Every hole ended exactly on
 # a 4096-byte boundary and every one landed inside that second's IDR (see
 # usr/local/bin/front-rec on why the two 1 Hz clocks phase-lock), and losing
-# an IDR costs its whole GOP. rear_bad_final.ts: 3 holes, 3.0 s of a 3.9 s
-# segment. The MPEG-TS container is what kept these files playable at all —
+# an IDR costs its whole GOP. The rear's bad tail from the same session: 3
+# holes, 3.0 s of a 3.9 s segment. The MPEG-TS container is what kept these files playable at all —
 # the reader resyncs on the next 188-byte packet. The same holes in
 # fragmented MP4 destroyed a whole GOP each AND, once one landed on the
 # header, hid the entire file (crash tail, 2026-08-07).

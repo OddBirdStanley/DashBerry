@@ -1,5 +1,5 @@
 [Unit]
-Description=DashBerry status panel daemon (OLED, ssd1307fb resolved by name)
+Description=DashBerry status panel daemon (OLED, ssd130* resolved by name)
 PartOf=dashberry.target
 # Ordering only (no Requires): the panel is the error reporter — it must run
 # and show ERR states even when /data or the session oneshot failed.

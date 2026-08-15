@@ -85,26 +85,51 @@ against its ~62. Moving the encode there deletes ~1.2 cores of Pi 4 work —
 both the decode and the encode thread — and drops USB traffic from tens of
 Mbps of MJPEG to ~1 MB/s.
 
-**This is the fourth deliberate deviation from the official image**, and the
-build carries all four — the three the card already had were hand-edits that a
+**H.264 is the newest deliberate deviation from the official image**, and the
+build carries every one of them — the earlier ones were hand-edits that a
 reflash silently lost, which is the whole reason `ZERO_SETUP.md` existed:
 
 | Deviation | Where it lives now |
 |---|---|
 | Advertised resolutions | `overlay/etc/video_formats.txt` |
-| **USB peripheral mode** | `dtoverlay=dwc2,dr_mode=peripheral`, appended by `edits.sh` to `post-image.sh`'s boot-config block |
+| **USB role** | a **bare** `dtoverlay=dwc2` (OTG), appended by `edits.sh` to `post-image.sh`'s boot-config block, plus an explicit `soft_connect` pull-up in `multi-gadget.sh` |
 | Memory allocation | `gpu_mem=256`, same block |
 | H.264 encode | the kernel repin + the gadget changes below |
 | **Radio silence** | Wi-Fi and Bluetooth built out of the kernel, disabled in the device tree, no firmware shipped — see below |
 
-**`dr_mode=peripheral` is not cosmetic.** Upstream appends a bare
-`dtoverlay=dwc2`, which leaves the controller in **OTG**, where the port's role
-is decided by the ID pin in the cable. A micro-USB converter or right-angle
-adapter that grounds ID tells the Zero to be a *host* — and it then never
-enumerates as a camera at all, with nothing on either end saying why. The BOM
-has two such adapters in the rear cable run. This board is only ever a
-peripheral, so saying so is both correct and deterministic: the role stops
-depending on which adapter is in the run that day.
+**The USB role is OTG, and `dr_mode=peripheral` was tried and reverted.**
+Forcing peripheral looks like the obviously right answer — this board is only
+ever a device — but on this kernel the cure is worse than the disease. In
+forced-peripheral mode dwc2 does not run the OTG session state machine, so
+`usb_udc_vbus_handler()` never reports VBUS present, `udc->vbus` stays false,
+and `usb_udc_connect_control()` disconnects instead of connecting. From inside
+the card everything looks right — driver bound, `/dev/video1` present — and
+the host sees nothing at all, not even a failed enumeration attempt. OTG is
+the default because it is the only mode **observed to attach here**, which a
+stock 5.10 card's log confirms. `ZERO_DR_MODE` still exists if you want to
+retry it; `build.sh` fails the build if the default ever ships as anything but
+a bare `dtoverlay=dwc2`.
+
+> That is **not** evidence that peripheral mode is broken, and an earlier
+> version of this section claimed it was. Diffed against 5.10.11, the pullup
+> `op_state` gate, `udc_start`'s `dwc2_lowlevel_hw_enable()` call and the
+> `op_state` assignment are identical, and every peripheral test before the
+> PHY fix ran with no PHY, where no mode could attach. OTG is the known-good
+> shape, not the proven-only one.
+
+**The ID pin still has to float, and that is a CABLE problem.** In OTG the
+role comes from ID, so a converter that grounds it makes the Zero a *host* and
+the camera disappears with nothing on either end saying why. A plain
+USB-A-to-micro-B cable is correct and leaves ID floating; only an OTG-style
+adapter (micro-B male to A female) grounds it, and masking pin 4 defeats one
+that does.
+
+**The pull-up is asserted explicitly instead of relying on a session
+interrupt.** `multi-gadget.sh` writes `connect` to
+`/sys/class/udc/<udc>/soft_connect` after binding, which calls
+`usb_gadget_connect_locked()` directly — and that path checks only `->pullup`,
+`->started` and `->allow_connect`, never `udc->vbus`. So the gadget attaches
+without waiting on something dwc2 may never deliver.
 
 ## 2. What the image contains
 
@@ -288,13 +313,18 @@ Userspace changes, all in `edits.sh` except the first:
   15 fps default, cut it into 534 requests of 91 bytes, and lost the whole
   remainder of the frame to the first missed slot. It is the fix for the
   corruption in `INVESTIGATE-REAR-CORRUPTION.md`.
-- **`multi-gadget.sh`** needs four changes, and only the first is obvious:
+- **`multi-gadget.sh`** needs seven changes, and only the first is obvious:
   its parser greps `^(mjpeg|uncompressed)`, so an `h264` line is silently
   dropped; `config_frame` writes `dwMaxVideoFrameBufferSize`, which the
   frame-based format does not have (it carries `dwBytesPerLine` instead); the
   streaming header hardcodes symlinks to `mjpeg/m` and `uncompressed/u`, so a
-  `framebased/h` format would exist in configfs and never be advertised; and
-  the control port needs a second ACM function.
+  `framebased/h` format would exist in configfs and never be advertised; the
+  control port needs a second ACM function, linked **last** so its interface
+  number stays stable for the Pi 4's udev rule; the descriptor bitfields
+  showmewebcam's dropped kernel patch used to hardcode are written from
+  configfs instead; the isochronous endpoint's `bInterval` and `maxpacket` are
+  read from `/boot`; and the pull-up is asserted explicitly via
+  `soft_connect`, because binding is not attaching.
 - **`post-image.sh`** appends `gpu_mem=256`. It cannot go in the rootfs
   overlay — `/boot` is a separate FAT partition assembled by genimage, and
   fstab mounts it over anything the overlay put there.

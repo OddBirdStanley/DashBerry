@@ -97,15 +97,18 @@ if [ "$MODE" = check ]; then
 
   1. /boot/config.txt. It is a FAT partition, so put the card in this PC and
      read it — no rebuild needed. It should carry, from zero/edits.sh:
-         dtoverlay=dwc2,dr_mode=peripheral
+         dtoverlay=dwc2
          dtoverlay=disable-wifi
          dtoverlay=disable-bt
          gpu_mem=256
+     NOTE the dwc2 line is BARE — no dr_mode. OTG is the default and
+     build.sh fails the build if it ships as anything else, so a
+     dr_mode=peripheral here means an old card, not a healthy one.
      BISECT BY EDITING IT DIRECTLY. Comment out disable-wifi and disable-bt
      first (# in front), boot again, and see if it comes back. Those two are
      the newest and the most likely to have disabled something they should
      not have; everything else about the card can be tested with them off.
-  2. The kernel or rootfs never came up. The image is Linux 6.16 where the
+  2. The kernel or rootfs never came up. The image is Linux 6.18 where the
      card used to be 5.10, and a kernel that panics before USB init looks
      exactly like this. You cannot see it over USB — see the serial console
      below, which is the only instrument that answers this.
