@@ -168,6 +168,29 @@ are clean, which is why stock showmewebcam never showed it. See
 > `KERNEL_BRANCH=rpi-6.12.y` plus a backport of `7b5a5895` — 6.12 is RPi's
 > protected long-term branch, the line `bcm2835-v4l2` is known good on, and its
 > f_uvc predates the whole request rework and so cannot exhibit any of it.
+>
+> **On the 6.12 fallback, drop `patches/linux-custom/0002`.** 6.12 already has
+> the correct byte-stride page walk, in `vchiq_arm.c` rather than `vchiq_core.c`,
+> so the patch will not apply and the build will stop. On 6.16 and 6.17 it does
+> apply (the line sits at `vchiq_core.c:1593` there rather than 1590, which
+> `patch` absorbs as an offset).
+
+### Tuning knobs on the card
+
+Three files on the boot partition, read at start-up, so a sweep costs a card
+edit rather than an image rebuild:
+
+| file | default | what it does |
+| --- | --- | --- |
+| `/boot/uvc-nbufs` | 8 | `-n` to uvc-gadget, the V4L2 buffer count. Upstream default is 2, the minimum the option accepts. |
+| `/boot/uvc-interval` | 1 | the isochronous endpoint's `bInterval`. Raising it does **not** buy recovery room — `nreq` shrinks and the slot period grows by the same factor, so wall-clock drain time is unchanged and byte capacity falls. |
+| `/boot/uvc-overspeed` | 2 | divisor applied to the frame interval reported to `f_uvc`, which is what does buy recovery room. See `patches/0010`. |
+
+`uvc-overspeed` is the one to sweep. At 1 the gadget plans 267 requests for a
+33.33 ms frame period — 33.375 ms of wire, no slack, and a missed isochronous
+slot truncates the frame outright. At 2 it plans 134, drains in 16.8 ms and
+leaves 16.5 ms idle, still offering 135 KB per frame against a measured worst
+frame of 24 KB. **The default of 2 is arithmetic, not a measurement.**
 
 The pin is a GitHub **tarball**, not a git ref, and `edits.sh` resolves the
 branch to a SHA before substituting it — a card you cannot rebuild byte for
