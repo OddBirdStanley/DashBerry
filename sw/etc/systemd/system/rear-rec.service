@@ -1,5 +1,5 @@
 [Unit]
-Description=Rear camera recorder (UVC MJPEG -> hw transcode -> H.264 segments)
+Description=Rear camera recorder (UVC H.264 from the Zero -> MPEG-TS segments)
 PartOf=dashberry.target
 RequiresMountsFor=/data
 # Session dir/name comes from session-init; never start without it.
@@ -7,6 +7,12 @@ Requires=session.service
 After=session.service
 
 [Service]
+# The Zero is stateless across replug, so its settings are pushed HERE, not
+# once at boot: this re-runs on every restart of this unit, and this unit
+# restarts whenever the camera drops. It also verifies by read-back and exits
+# nonzero on a mismatch or a non-DashBerry card, which holds rear-rec back
+# rather than recording a drive at the wrong settings. See rear-ctl.
+ExecStartPre=/usr/local/bin/rear-ctl push
 ExecStart=/usr/local/bin/rear-rec
 # Restart=always is the late/re-enumeration strategy: if the Zero isn't up yet
 # (or drops mid-run), the unit exits and retries until the camera is back.

@@ -62,7 +62,7 @@ GAP_MIN = 1.0           # timeline holes shorter than this are scheduling
                         # jitter (mtime granularity), absorbed not rendered
 FILLER_TILE = 30.0      # seconds of pre-rendered "No Signal" filler; a hole
                         # of any length is covered by repeating this one tile
-CAM_FALLBACK_WH = {"front": (1920, 1080), "rear": (1280, 720)}
+CAM_FALLBACK_WH = {"front": (1920, 1080), "rear": (1640, 922)}
 
 
 # --------------------------------------------------------------- helpers --

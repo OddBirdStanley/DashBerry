@@ -1,0 +1,53 @@
+From: DashBerry <zero/README.md>
+Subject: [PATCH] uvc: GET MAX must pair a format with one of ITS OWN frames
+
+uvc_fill_streaming_control() computes the format range and the frame range
+independently, across the whole table:
+
+    format_last = uvc_get_frame_format_index(-1, FORMAT_INDEX_MAX);
+    frame_last  = uvc_get_frame_format_index(-1, FRAME_INDEX_MAX);
+
+then answers GET MAX with that pair. The highest format index beside the
+highest frame index of ANY format is not necessarily a combination the device
+offers.
+
+On this card it never is. Measured from the daemon's own table:
+
+    format 1 (H.264) frames 1..3   1640x922, 1920x1080, 1280x720
+    format 2 (MJPEG) frames 1..2   1640x922, 1280x720
+
+so GET MAX asks for format 2 frame 3, which does not exist — and every host
+enumeration performs a GET MAX. Before the previous patch, that request landed
+on an uninitialised pointer in the very next statement, which is the most
+likely way the daemon was dying part-way through enumeration and taking ep0,
+the console and the control port with it.
+
+Taking each frame range within the format it will be paired with is what the
+pairing meant in the first place. GET MIN was correct only by accident here
+(format 1 does hold frame 1) and is fixed the same way.
+---
+--- a/uvc-gadget.c
++++ b/uvc-gadget.c
+@@ -1405,8 +1405,20 @@
+     format_first = uvc_get_frame_format_index(-1, FORMAT_INDEX_MIN);
+     format_last = uvc_get_frame_format_index(-1, FORMAT_INDEX_MAX);
+ 
+-    frame_first = uvc_get_frame_format_index(-1, FRAME_INDEX_MIN);
+-    frame_last = uvc_get_frame_format_index(-1, FRAME_INDEX_MAX);
++    /* DashBerry: take the frame range WITHIN the format it will be paired
++     * with, not across the whole table.
++     *
++     * GET MAX answers (format_last, frame_last), and computed independently
++     * that is the highest format index beside the highest frame index of ANY
++     * format — a pair that need not exist. Measured on this card: H.264 is
++     * format 1 with frames 1..3, MJPEG is format 2 with frames 1..2, so GET
++     * MAX asked for format 2 frame 3. No such entry, and EVERY host
++     * enumeration performs a GET MAX.
++     *
++     * Before the previous patch, that landed on an uninitialised pointer.
++     */
++    frame_first = uvc_get_frame_format_index(format_first, FRAME_INDEX_MIN);
++    frame_last = uvc_get_frame_format_index(format_last, FRAME_INDEX_MAX);
+ 
+     if (action == STREAM_CONTROL_MIN) {
+         iformat = format_first;

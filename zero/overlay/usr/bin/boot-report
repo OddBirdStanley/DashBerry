@@ -1,0 +1,148 @@
+#!/bin/sh
+# boot-report — write what happened at boot to the FAT /boot partition, so a
+# card that comes up but does not ENUMERATE can still be diagnosed with
+# nothing but an SD card reader.
+#
+# WHY
+# ---
+# Every debug channel this board has runs over the USB gadget: the console is
+# a CDC-ACM function, the control port is another, the camera is a third. When
+# the gadget fails to bind, all three vanish at once and the card looks dead
+# from outside — which is exactly the case you most need to see inside.
+# The only other channels are a UART adapter on the 40-pin header and HDMI,
+# both of which need hardware and physical access.
+#
+# /boot is FAT and is the one thing any PC can read. So on every boot we write
+# the answer there: whether the gadget bound, what the camera did, what the
+# kernel said.
+#
+# GATED BY A MARKER FILE, deliberately, mirroring showmewebcam's own
+# enable-serial-debug: this remounts /boot read-write, and a dashcam is
+# power-cut without warning thousands of times. A FAT write in progress when
+# the 12 V dies can corrupt the boot partition. Delete /boot/enable-boot-report
+# for a card that lives in the car; keep it on the bench.
+set -u
+
+MARKER=/boot/enable-boot-report
+REPORT=/boot/boot-report.txt
+
+[ -f "$MARKER" ] || exit 0
+
+# Let the gadget and the camera finish trying before reporting on them.
+sleep 8
+
+remount() { mount -o "remount,$1" /boot 2>/dev/null; }
+
+remount rw || { echo "boot-report: cannot remount /boot rw" >&2; exit 1; }
+
+{
+    echo "DashBerry Zero boot report"
+    echo "  version : $(cat /etc/dashberry-zero-version 2>/dev/null || echo '?')"
+    echo "  kernel  : $(uname -r)"
+    echo "  date    : $(date 2>/dev/null || echo 'no clock')"
+    echo
+
+    echo "== WHY IS THERE NO UDC   (the question that matters)"
+    echo "  driver owning the USB node:"
+    for d in /sys/bus/platform/devices/*.usb; do
+        [ -e "$d" ] || continue
+        # `readlink -f` SUCCEEDS on a path that does not exist, so the
+        # obvious form printed the literal word "driver" when nothing was
+        # bound. Test the symlink itself.
+        if [ -L "$d/driver" ]; then
+            echo "    ${d##*/} -> $(basename "$(readlink -f "$d/driver")")"
+        else
+            echo "    ${d##*/} -> NO DRIVER BOUND"
+        fi
+    done
+    # A probe that DEFERS prints nothing at all, which is exactly what the
+    # first dead card looked like. This is the list that says so out loud.
+    mount -t debugfs none /sys/kernel/debug 2>/dev/null
+    echo "  deferred probes:"
+    sed 's/^/    /' /sys/kernel/debug/devices_deferred 2>/dev/null || echo "    (debugfs unavailable)"
+    echo "  loaded modules: $(lsmod 2>/dev/null | tail -n +2 | cut -d' ' -f1 | tr '\n' ' ')"
+    echo "  dwc2/udc/gadget kernel messages:"
+    dmesg 2>/dev/null | grep -iE "dwc2|dwc_otg|udc|gadget|usb" | tail -40 | sed 's/^/    /'
+    echo
+
+    echo "== USB gadget"
+    G=/sys/kernel/config/usb_gadget/piwebcam
+    if [ -d "$G" ]; then
+        echo "  configfs   : present"
+        echo "  functions  : $(ls "$G/functions" 2>/dev/null | tr '\n' ' ')"
+        echo "  linked     : $(ls "$G/configs/c.1" 2>/dev/null | tr '\n' ' ')"
+        echo "  bound UDC  : '$(cat "$G/UDC" 2>/dev/null)'   <- EMPTY MEANS THE BIND FAILED"
+        echo "  formats    : $(ls "$G/functions/uvc.usb0/streaming" 2>/dev/null | tr '\n' ' ')"
+        for f in "$G"/functions/uvc.usb0/streaming/framebased/*; do
+            [ -d "$f" ] && echo "  framebased : ${f##*/} -> $(ls "$f" 2>/dev/null | tr '\n' ' ')"
+        done
+    else
+        echo "  configfs   : ABSENT — multi-gadget.sh never ran, or configfs is not mounted"
+    fi
+    echo "  UDCs seen  : $(ls /sys/class/udc 2>/dev/null | tr '\n' ' ')"
+    # Bound is not attached. `state` is the UDC's own view: "not attached"
+    # means the pull-up was never asserted and the host cannot see us however
+    # correct the gadget is; "configured" means a host enumerated it.
+    for u in /sys/class/udc/*; do
+        [ -d "$u" ] || continue
+        # soft_connect is write-only, so it always reads empty - state is the
+        # one that matters. "not attached" = the bus never reset us.
+        echo "  ${u##*/} state: $(cat "$u/state" 2>/dev/null)"
+        echo "    is_otg=$(cat "$u/is_otg" 2>/dev/null) is_a_peripheral=$(cat "$u/is_a_peripheral" 2>/dev/null) speed=$(cat "$u/current_speed" 2>/dev/null) driver=$(cat "$u/function" 2>/dev/null)"
+    done
+    echo "  (no UDC at all means dwc2 did not bind: check dr_mode and the cable)"
+    echo
+
+    echo "== configfs tree as uvc-gadget walks it"
+    # uvc-gadget discovers formats by ftw()-ing this tree and parsing paths of
+    # the form <speed>/<header>/<format>/<frame>/<attr> under streaming/class/.
+    # It reported "configfs settings for uvc gadget not found", so print what
+    # is actually there rather than guessing at the shape.
+    # -L: FOLLOW the symlinks. Without it find stops at class/<speed>/h and
+    # shows nothing of what uvc-gadget actually walks, which is the format and
+    # frame tree behind it. (ftw() does follow them - verified.)
+    find -L "$G/functions/uvc.usb0/streaming/class" "$G/functions/uvc.usb0/control/class" \
+         -maxdepth 6 2>/dev/null | sed "s|$G/functions/uvc.usb0/|  |" | head -60
+    echo "  --- what the streaming header links to ---"
+    ls -l "$G/functions/uvc.usb0/streaming/header/h" 2>/dev/null | sed 's/^/  /'
+    echo "  --- gadget deactivation state (bind_deactivated) ---"
+    echo "  f_uvc sets bind_deactivated, so while uvc-gadget is not running the"
+    echo "  UVC function holds the WHOLE gadget deactivated: no camera, no"
+    echo "  console, no control port. That is why a daemon failure costs the"
+    echo "  entire device and not just the video."
+    echo "  uvc-gadget running: $(pidof uvc-gadget >/dev/null 2>&1 && echo yes || echo NO)"
+    echo "  --- what uvc-gadget said (FULL) ---"
+    # NOT a tail. When discovery fails the card does not enumerate, so there is
+    # no console to read this on — and /boot/no-camera, which would give you a
+    # console, removes the UVC function from the config so /dev/video1 never
+    # appears and the daemon exits before saying anything. That is a catch-22
+    # with only one way out: this file, read off the SD card in any PC. It is
+    # the only channel that works while the camera is broken, so it carries the
+    # whole log.
+    journalctl -b --no-pager -u uvc-webcam 2>/dev/null | sed 's/^/  /' 
+    echo
+
+    echo "== camera"
+    echo "  video nodes: $(ls /dev/video* 2>/dev/null | tr '\n' ' ')"
+    echo "  /dev/video0 is the SENSOR (bcm2835-v4l2); /dev/video1 is the gadget."
+    echo "  start-webcam.sh needs BOTH before it will start uvc-gadget."
+    echo
+
+    echo "== services"
+    for s in usb-gadget-config uvc-webcam rear-ctld; do
+        echo "  $s: $(systemctl is-active "$s" 2>/dev/null) / $(systemctl is-failed "$s" 2>/dev/null)"
+    done
+    echo
+
+    echo "== journal (gadget, camera, control port)"
+    journalctl -b --no-pager 2>/dev/null | grep -iE "gadget|uvc|dwc2|bcm2835|video|rear-ctld" | tail -60
+    echo
+
+    echo "== kernel messages, in full"
+    # NOT a tail: the first dead card's decisive lines were the last two, and
+    # a truncated log hid whether anything followed them.
+    dmesg 2>/dev/null
+} > "$REPORT" 2>&1
+
+sync
+remount ro

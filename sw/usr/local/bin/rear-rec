@@ -1,8 +1,8 @@
 #!/bin/sh
-# rear-rec — rear UVC (showmewebcam) MJPEG → software decode → software
-# H.264 (openh264) → 60 s MPEG-TS segments. Exits (→ systemd Restart) if the camera is
-# absent; the Zero normally beats the Pi 4 to readiness since both power on
-# ignition. Writes into the per-boot session directory minted by
+# rear-rec — rear UVC (DashBerry Zero) H.264 → 60 s MPEG-TS segments. The Zero
+# encodes; this box only parses and muxes. Exits (→ systemd Restart) if the
+# camera is absent; the Zero normally beats the Pi 4 to readiness since both
+# power on ignition. Writes into the per-boot session directory minted by
 # session-init: a restart REUSES the same session dir.
 set -eu
 . /etc/dashberry.conf
@@ -41,78 +41,59 @@ open_segment_syncer &
 SYNCER_PID=$!
 trap 'kill "$SYNCER_PID" 2>/dev/null || true' EXIT INT TERM
 
-# jpegdec (SOFTWARE, ~1/3 core at 720p30) — deliberately NOT v4l2jpegdec.
-# The hardware decoder (bcm2835-codec, kernel 6.18) returns an empty
-# V4L2_BUF_FLAG_LAST capture buffer after its FIRST frame ("Empty last
-# buffer, signalling eos" under GST_DEBUG); gst 1.26 treats that as a
-# drain, flushes, and must renegotiate downstream before restarting
-# capture. fakesink tolerates the renegotiation, so isolation tests pass —
-# but any real chain (encoder→parse→mux→sink, already caps-locked) never
-# completes it, and the decoder's capture task dies SILENTLY while its
-# sink keeps eating v4l2src frames: no error, no backpressure, no files.
+# THE ENCODE LIVES ON THE ZERO (2026-08-13). This pipeline used to be
+# v4l2src ! jpegdec ! videoflip ! gamma ! queue ! openh264enc ! h264parse !
+# splitmuxsink — a software MJPEG decode and a software baseline H.264 encode,
+# both on this box, alongside front-rec.
 #
-# openh264enc (SOFTWARE, ~1 core at 720p30) — deliberately NOT
-# v4l2h264enc, and for a second, INDEPENDENT gst-v4l2 element bug on this
-# same kernel 6.18 + gst 1.26 pairing (bench 2026-08-05,
-# cam/dashberry-rear-probe.sh): the hardware encoder is healthy as
-# hardware — 325 fps fed by a non-live videotestsrc — but the
-# v4l2h264enc ELEMENT collapses to ~5 fps the moment any LIVE source
-# feeds it. Supply-independent: queues before/after, output-io-mode
-# overrides, and front-rec on/off all change nothing, so the wait is
-# internal to the element. openh264enc sustained the camera's full rate —
-# 29.3 fps measured through this exact chain while front-rec recorded —
-# and that is why this chain is what it is.
+# It could not hold 30 fps at ANY mode. INVESTIGATE-REAR-ENCODE.md settled why:
+# openh264enc runs one slice, one slice is one thread, and one thread on this
+# box does ~65,000 macroblocks/s on a rolling scene. Measured, off the recorded
+# files rather than the container's nominal rate:
 #
-# CORRECTION 2026-08-07: the CAUSE is NOT established. The three
-# alternatives once listed here as rejected (x264enc, avenc_h264_v4l2m2m,
-# ffmpeg h264_v4l2m2m direct) were never installed on any card —
-# plugins-ugly, libav and ffmpeg are absent from firstinstall's package
-# list — so the probe skipped all three and openh264enc won unopposed. A
-# skipped test is not a negative one, so "internal to the element" above
-# is an inference the evidence does not support: the kernel driver has
-# never been tested independently of gst. See IMPL.md and
-# cam/dashberry-quality-probe.sh.
+#   1280x720 @ 8 Mbps   18.15 fps   65,340 MB/s
+#   1640x922 @ 4 Mbps   10.77 fps   64,364 MB/s
 #
-# The costs, accepted: baseline profile only (~10-20% less
-# bitrate-efficient than a high-profile hw encode) and ~1 CPU core.
+# Within 1.5% of each other across a 2x bitrate change, so the bitrate was
+# never the knob and REAR_BITRATE was never the fix. 720p30 needs 108,000 MB/s
+# and 1640x922@30 needs 179,220: every mode this project ever considered,
+# 720p30 included, wanted more than one core. The 40% aggregate CPU that made
+# this look like headroom was one PINNED core plus front-rec with three cores
+# idle, and iowait sat at ~2%, so the card was never implicated either.
+# (The 29.3 fps IMPL.md used to record for 720p was a bench figure off a static
+# scene, where the encoder skips most macroblocks. It did not transfer.)
 #
-# THE "~25 Mbps MJPEG FLOOR" IS RETRACTED (2026-08-12). This comment used
-# to argue the encoder could not be the rear's problem because the Zero's
-# MJPEG was a ~25 Mbps quality floor beneath it. That number was read out
-# of showmewebcam's shipped /boot/camera.txt, which sets
-# video_bitrate=25000000 — V4L2_CID_MPEG_VIDEO_BITRATE, an H.264 control
-# in bcm2835-v4l2's Codec Controls class. The gadget streams MJPEG. The
-# setting governs a codec path nothing here touches, so it was never a
-# floor under anything. The knob that DOES govern the source's quality is
-# compression_quality (JPEG Compression Controls); see ZERO_SETUP.md.
+# So the encode moved to the source. The Zero's VideoCore does 1080p30 in
+# hardware, the DashBerry Zero image streams H.264 over the same UVC gadget,
+# and this chain becomes a remux: no decode, no encode, no flip, no gamma.
+# That deletes BOTH busy threads (~1.2 cores), not just the encoder one, and
+# cuts USB traffic from tens of Mbps of MJPEG to ~1 MB/s.
 #
-# What survives the retraction: a 2026-08-05 rear bench DID measure the
-# source at roughly 100 KB/frame, flat across every advertised resolution
-# — about 25 Mbps at 30 fps. Flat bytes across resolutions is the
-# signature of a bitrate-targeted encoder, so the figure is probably real
-# and the coincidence with video_bitrate=25000000 is unexplained rather
-# than debunked. Treat it as unconfirmed: that result is NOT recorded
-# anywhere in this tree, and the achieved-fps figure from the same bench
-# section was later retracted as a parse artifact. Re-measure with
-# rootscripts/rear-source before leaning on it again — it was taken at
-# 720p30, which is what the rear records again as of 2026-08-13, so the
-# resolution caveat that stood here while the rear ran 1080p is gone.
+# What moved with it, and where it went (zero/README.md, and rear-ctl):
+#   INVERT_REAR   -> sensor hflip/vflip in the Zero's ISP. Free, and it
+#                    replaces a full-frame videoflip copy of every frame.
+#   REAR_GAMMA    -> GONE. Its job (rear reads dark at night, front does not)
+#                    is now source-side exposure bias, REAR_EXPOSURE_BIAS.
+#                    Better placed: gamma lifted shadow NOISE into the encode
+#                    and then paid bitrate for it.
+#   REAR_BITRATE  -> the Zero's V4L2_CID_MPEG_VIDEO_BITRATE, and the profile
+#   REAR_GOP         is HIGH now rather than openh264's baseline-only.
 #
-# THE ~1 CORE FIGURE WAS MEASURED AT 720p30 and again APPLIES DIRECTLY:
-# the rear was moved to 1920x1080@30 on 2026-08-12 — 2.25x the pixel rate
-# through both the software jpegdec and this software encoder — and
-# REVERTED to 1280x720@30 on 2026-08-13. Whether the Pi 4 sustained the
-# 1080p rate alongside front-rec was never settled by a dual-stream
-# thermal soak; the revert removes the question rather than answering it,
-# so nothing here should be read as evidence about 1080p either way. If a
-# soak ever shows strain at this rate, complexity=low and multi-thread=N
-# are the headroom knobs. The queue ahead of the encoder decouples
-# capture+decode from encode so the software encoder pipelines across
-# cores — part of the benched configuration, not an optimization.
-# The old level=(string)4 caps filter was v4l2h264enc-specific (without
-# it THAT element auto-negotiated baseline@level-1) and leaves with it.
-# gpu_mem=256 (boot/config-snippet.txt) stays: front's ISP+encode still
-# wants it — rear simply no longer adds a firmware codec context.
+# All four are still THIS box's to choose. rear-ctl pushes them over the
+# Zero's control port before this unit is allowed to start (ExecStartPre), and
+# faults if a read-back disagrees — the Zero is stateless across replug, so a
+# push at boot alone would be worthless.
+#
+# h264parse config-interval=-1 puts SPS/PPS in front of every IDR, so a
+# segment read on its own decodes from its first frame. The Zero also sets
+# repeat_sequence_header, which does the same job at the source; this is the
+# cheap belt beside that braces, and it costs a few bytes per GOP.
+#
+# Segment cuts now land on SOURCE keyframes: nothing here re-encodes, so
+# splitmuxsink can only cut where the Zero put an IDR. REAR_GOP (27 = 0.9 s,
+# detuned off ext4's 1 Hz commit tick — see front-rec) is pushed to the Zero's
+# I-frame period for exactly this reason, and it makes a 60 s segment land
+# within 0.9 s of 60 s rather than exactly on it.
 #
 # muxer= / sink= (not muxer-properties, which splitmuxsink silently ignores
 # unless async-finalize=true): MPEG-TS for power-cut survivability — no index
@@ -122,77 +103,13 @@ trap 'kill "$SYNCER_PID" 2>/dev/null || true' EXIT INT TERM
 # The -m watcher fsyncs each closed segment (and its directory entry); the
 # open-segment syncer above covers the one segment it cannot reach.
 #
-# gop-size = REAR_GOP (27), not REAR_FPS: at 1 keyframe/s the IDR cadence
-# phase-locks to ext4's 1 Hz commit tick and every zeroed page lands on an
-# IDR. Full rationale, and the honest size of the win, in front-rec.
-#
-# INVERT_REAR (dashberry-install --invert-rear): the axes this camera's
-# mounting has to be corrected on — v if it is mounted upside down, h if its
-# image arrives mirrored (plates and signs read backwards), "v,h" for both,
-# empty for neither. Unlike the front (where the ISP flips for free), this
-# one costs a videoflip element between the decoder and the encoder — a
-# reversal on already-decoded I420, cheap next to the software jpegdec that
-# is already in the chain, and nothing in the UVC gadget is asked to change —
-# correcting geometry on this side is simply the cheaper place for it. (It was
-# also once a project RULE that the Zero stays untouched; that rule was retired
-# 2026-08-11 — see IMPL.md "Explicitly not built".)
-#
-# Both axes at once is rotate-180 (vertical ∘ horizontal), NOT two elements,
-# so the two-axis mount costs exactly what a one-axis mount does. Horizontal
-# reverses within each row rather than reordering whole rows, so it is the
-# less cache-friendly of the two — still small beside the software decode,
-# but it is the one to name if a soak ever shows strain. Rear footage lands
-# upright and un-mirrored, so every downstream consumer stays ignorant.
-V=0 H=0
-for axis in $(printf '%s' "${INVERT_REAR:-}" | tr ',' ' ' | tr '[:upper:]' '[:lower:]'); do
-    case $axis in
-    v) V=1 ;;
-    h) H=1 ;;
-    *) echo "rear-rec: ignoring unknown INVERT_REAR axis '$axis'" >&2 ;;
-    esac
-done
-case "$V$H" in
-    11) FLIP='videoflip method=rotate-180 !' ;;
-    10) FLIP='videoflip method=vertical-flip !' ;;
-    01) FLIP='videoflip method=horizontal-flip !' ;;
-    *)  FLIP= ;;
-esac
-
-# REAR_GAMMA: the rear picture is too dark at night; the front (IMX708, HDR)
-# is not. The fix lands here rather than at the source because at 30 fps the
-# sensor's exposure is already capped at 33 ms — whatever its AE has left is
-# gain, which buys the same noise this does without being switchable.
-#
-# It landed here for a SECOND reason that no longer holds: the Zero's
-# showmewebcam image and camera tuning used to be untouchable by project rule.
-# That rule was retired 2026-08-11 (IMPL.md, "Explicitly not built"), so a
-# source-side tuning change is now a legitimate competitor to this element —
-# and a better-placed one, since this lifts shadow noise into a 4 Mbps
-# baseline encode. Measure first: cam/rootscripts/rear-source.
-#
-# Gamma, not a brightness offset or contrast stretch, and that choice IS the
-# day/night balance: a gamma curve is pinned at both black and white, so it
-# moves near-black pixels a great deal and near-white ones almost not at all.
-# A night scene lives at the end that moves; a daylit one lives at the end
-# that doesn't. So a single static value serves both, with no metering, no
-# feedback loop, and no risk of clipping a bright sky — which a fixed
-# brightness offset (shifts everything, blows the highlights) or the camera's
-# own gain (amplifies before the encoder sees it) could not offer.
-#
-# 1.0 leaves the element out of the chain entirely rather than passing a
-# no-op filter — an untuned card runs exactly the pipeline it ran before.
-# Cost is a per-pixel LUT on the Y plane only, small next to the software
-# jpegdec already in the chain, but it is not free: see sw/README.md.
-case "${REAR_GAMMA:-1.0}" in
-    1|1.0|1.00) GAMMA= ;;
-    *)          GAMMA="gamma gamma=$REAR_GAMMA !" ;;
-esac
+# The queue is the one element kept from the old chain: it decouples the USB
+# read from the disk write, so a filesink stall cannot push back into the
+# gadget and drop frames at the source.
 stdbuf -oL gst-launch-1.0 -e -m v4l2src device="$REAR_CAM_DEV" \
-    ! "image/jpeg,width=$REAR_W,height=$REAR_H,framerate=$REAR_FPS/1" \
-    ! jpegdec \
-    ! $FLIP $GAMMA queue max-size-buffers=8 \
-    ! openh264enc bitrate="$REAR_BITRATE" gop-size="${REAR_GOP:-27}" \
-    ! h264parse \
+    ! "video/x-h264,width=$REAR_W,height=$REAR_H,framerate=$REAR_FPS/1,stream-format=byte-stream,alignment=au" \
+    ! h264parse config-interval=-1 \
+    ! queue max-size-buffers=8 \
     ! splitmuxsink location="$OUT/%05d.ts" \
         start-index="$START_INDEX" \
         max-size-time="$SEGMENT_NS" \

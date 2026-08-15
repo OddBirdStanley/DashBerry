@@ -1,0 +1,86 @@
+uvc: double the isochronous refill deadline
+
+f_uvc raises a completion interrupt every
+
+	min(DIV_ROUND_UP(video->uvc_num_requests, 4), UVCG_REQ_MAX_INT_COUNT)
+
+requests (uvc_video.c:310), and uvc_video_complete() is what re-arms
+uvcg_video_hw_submit() to queue the next batch.  UVCG_REQ_MAX_INT_COUNT
+is 16 and does not depend on bInterval, so that cap is a wall-clock
+deadline for the submit kthread that scales with the service interval:
+
+	bInterval 1   16 x 125 us   =  2 ms
+	bInterval 3   16 x 500 us   =  8 ms
+
+Miss the deadline and dwc2 has nothing queued when the target frame
+elapses, so it completes the next request -ENODATA, f_uvc raises
+UVC_QUEUE_DROP_INCOMPLETE, and the frame ends where it stands.  On a
+1 GHz single-core ARM11 sharing that core with the vchiq bulk transfers
+carrying the encoded frames off VideoCore, that is the whole remaining
+failure mode: not a systematic error but a latency tail.
+
+Measured 2026-08-15 at bInterval 3, 720p30 H.264: 3 truncated frames in
+690, ~6.5e-5 of requests.  The submit path already runs as SCHED_FIFO
+(uvc_video.c:830) and the pump workqueue is already WQ_HIGHPRI, so there
+is no priority left to claim - only a longer deadline.
+
+Raising the cap to 32 doubles it:
+
+	uvc_num_requests = nreq + UVCG_REQ_MAX_ZERO_COUNT = 67 + 64 = 131
+	min(DIV_ROUND_UP(131, 4), 32) = min(33, 32) = 32
+	32 x 500 us = 16 ms
+
+and doubles the idle-window depth too, since UVCG_REQ_MAX_ZERO_COUNT is
+defined as twice this: up to 65 zero-length requests queued ahead of the
+hardware instead of 33, i.e. 32.5 ms rather than 16.5 ms of slack in the
+gap between one frame draining and the next arriving.
+
+The cost the comment above that condition names is "a trade-off between
+latency and interrupt load", and both halves land the right way here.
+Interrupt load is the scarce resource on this board, and the latency is
+paid only mid-frame: the same condition short-circuits on ureq->last_buf,
+so the final request of every buffer still raises an interrupt and buffer
+turnaround to the daemon is unchanged.
+
+Memory cost is 32 more requests of req_size (1024 on dwc2 high speed)
+plus their scatterlists - about 33 KB.
+
+Upstream picked 16 by admission rather than measurement.  From
+dc97c956a470, which introduced the zero-length requests:
+
+	To properly solve the amount of zero length requests that needs to
+	be held in the hardware ... needs to be measured and depends on the
+	runtime of the first enqueue run after the interrupt triggered. For
+	now we just use twice the amount of requests between an interrupt.
+
+This changes no request COUNT and no service interval, so it cannot
+disturb dwc2's target-frame clock - the failure mode that killed both
+/boot/uvc-overspeed above 1 and the pre-6.13 fixed request sizing.  It
+only changes how often the driver is given a chance to keep that clock
+wound.
+
+NOT YET MEASURED.  3 events in 690 frames is a thin baseline to judge an
+improvement against; shoot a long run before and after.
+
+Signed-off-by: DashBerry <dashberry@localhost>
+
+diff --git a/drivers/usb/gadget/function/uvc.h b/drivers/usb/gadget/function/uvc.h
+--- a/drivers/usb/gadget/function/uvc.h
++++ b/drivers/usb/gadget/function/uvc.h
+@@ -71,7 +71,15 @@
+
+ #define UVCG_REQUEST_HEADER_LEN			12
+
+-#define UVCG_REQ_MAX_INT_COUNT			16
++/*
++ * DashBerry: 32, not upstream's 16. This is the cap on how many requests may
++ * pass between completion interrupts, and since it does not scale with
++ * bInterval it is a wall-clock deadline for the submit kthread: 16 x 500 us =
++ * 8 ms at bInterval 3. Missing it costs a frame. 32 makes it 16 ms, and
++ * doubles the zero-length queue depth below with it. Paid only mid-frame -
++ * ureq->last_buf still forces an interrupt at the end of every buffer.
++ */
++#define UVCG_REQ_MAX_INT_COUNT			32
+ #define UVCG_REQ_MAX_ZERO_COUNT			(2 * UVCG_REQ_MAX_INT_COUNT)
+
+ #define UVCG_STREAMING_MIN_BUFFERS		2

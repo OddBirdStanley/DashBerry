@@ -1,0 +1,88 @@
+#!/bin/sh
+# uvc-trace — keep a copy of what uvc-gadget said on the FAT /boot partition,
+# updated as it is said, so the log survives a gadget that takes the console
+# down with it.
+#
+# WHY THIS EXISTS
+# ---------------
+# Every way into this card runs down the USB cable: the console is ttyGS0, the
+# control port is ttyGS1, the video is the same gadget again. uvc-gadget
+# answers the UVC class requests on ep0, so when it stops answering, ep0
+# stalls for EVERY function — the login console dies at the same instant as
+# the camera, and the journal that would say why is in tmpfs and dies with the
+# next power cycle. Measured 2026-08-14: a failed H.264 capture left ttyACM0
+# hung, and there was no way to read a single line of the daemon's output.
+#
+# boot-report covers the boot; this covers what happens AFTER it, which is
+# where the interesting failure now lives. A UART on GPIO 14/15 is the better
+# instrument and needs no cooperation from the failing device — but it needs
+# an adapter, and this needs nothing that reflashing the card does not already
+# involve: run the test, pull the power, put the SD in a PC, read the file.
+#
+# WEAR AND CORRUPTION
+# -------------------
+# /boot is FAT and normally mounted ro. Writing to it at all is a deliberate
+# risk (boot-report says the same): a power cut with the partition rw can
+# corrupt it. Two things keep that small. It writes ONLY when the journal has
+# actually changed, and it holds /boot rw for the milliseconds that takes —
+# not continuously. And after a wedge the daemon stops saying anything, so the
+# last snapshot is written seconds BEFORE the power is pulled, with the
+# partition back to ro and idle by the time it goes.
+#
+# Off unless asked for, like every other debug path on this image.
+set -u
+
+MARKER=/boot/enable-uvc-trace
+TRACE=/boot/uvc-trace.txt
+INTERVAL=${UVC_TRACE_INTERVAL:-5}
+
+[ -e "$MARKER" ] || exit 0
+
+remount() { mount -o "remount,$1" /boot 2>/dev/null; }
+
+previous=""
+
+while :; do
+    current=$(
+        # Is the daemon still THERE? Without this the log cannot tell "it died"
+        # from "nothing was asked of it" — and those want opposite fixes. A
+        # journal that simply stops looks identical either way.
+        echo "=== state ==="
+        echo "uvc-webcam:  $(systemctl is-active uvc-webcam 2>&1) / $(systemctl is-failed uvc-webcam 2>&1)"
+        systemctl show uvc-webcam \
+            -p MainPID -p NRestarts -p ExecMainStatus -p ExecMainCode -p Result 2>&1 |
+            sed 's/^/  /'
+        echo "  UDC state:   $(cat /sys/class/udc/*/state 2>/dev/null | tr '\n' ' ')"
+        echo "  UDC owner:   $(cat /sys/kernel/config/usb_gadget/*/UDC 2>/dev/null | tr '\n' ' ')"
+        echo
+        echo "=== uvc-webcam ==="
+        journalctl -u uvc-webcam --no-pager -o short-iso 2>&1
+        echo
+        echo "=== usb / gadget / dwc2 (kernel) ==="
+        # dwc2's per-request tracing (CONFIG_USB_DWC2_DEBUG) emits ~10 lines
+        # for EVERY transfer, so an unfiltered tail is 60 lines of one
+        # millisecond and every message worth reading has already scrolled
+        # past. That option is off by default now; this keeps the filter so a
+        # card built with ZERO_DWC2_DEBUG=1 still produces a readable file.
+        dmesg 2>/dev/null |
+            grep -iE 'dwc2|gadget|uvc|configfs|udc' |
+            grep -vE 'start_req|_epint|_irq:|complete:|ureq->|req->length|ep0 state:|adjusting size|DxEPCTL|DXEPCTL' |
+            tail -80
+    )
+
+    if [ "$current" != "$previous" ]; then
+        if remount rw; then
+            {
+                echo "# uvc-trace — updated $(date -u +%Y-%m-%dT%H:%M:%SZ), uptime $(cut -d' ' -f1 /proc/uptime)s"
+                echo "# The clock is meaningless without an RTC; use it for ORDERING only."
+                echo
+                printf '%s\n' "$current"
+            } > "$TRACE" 2>/dev/null
+            sync
+            remount ro
+            previous=$current
+        fi
+    fi
+
+    sleep "$INTERVAL"
+done

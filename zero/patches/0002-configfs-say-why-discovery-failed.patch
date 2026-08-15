@@ -1,0 +1,103 @@
+From: DashBerry <zero/README.md>
+Subject: [PATCH] configfs: say why discovery failed, and never lose the log
+
+uvc-gadget reports one message when it cannot find its settings:
+
+    ERROR: configfs settings for uvc gadget not found!
+
+which covers ftw() failing, the walk matching nothing, and every candidate
+being rejected - three different bugs. The parser's two most likely bails print
+nothing at all. This prints ftw()'s return and errno, files seen versus files
+matched, the reason for each bail, and the path derived for every candidate.
+
+It also line-buffers stdout. That is not cosmetic: stdout is a pipe into the
+journal and therefore block buffered, so when the process died on a SIGSEGV the
+whole buffered log died with it - a crash with NO output at all, not even the
+"Initial path" line printed before any work is done. Line buffering means
+whatever it managed to say survives the crash.
+
+Diagnostic only; no behaviour change.
+---
+diff --git a/uvc-gadget.c b/uvc-gadget.c
+index f147304..a51acdb 100644
+--- a/uvc-gadget.c
++++ b/uvc-gadget.c
+@@ -2141,6 +2141,7 @@ static void configfs_fill_formats(const char * path, const char * part)
+ 
+         value = configfs_read_value(path);
+         if (value < 0) {
++            printf("CONFIGFS: unreadable value (%d) for %s\n", value, part);
+             goto free;
+         }
+ 
+@@ -2150,6 +2151,7 @@ static void configfs_fill_formats(const char * path, const char * part)
+         }
+ 
+         if (index != 5) {
++            printf("CONFIGFS: ignoring %s (%d path components, want 5)\n", part, index);
+             goto free;
+         }
+ 
+@@ -2202,6 +2204,13 @@ static void configfs_fill_streaming_params(const char* path, const char * part)
+     }
+ }
+ 
++/* DashBerry: discovery is silent when it fails - every bail below either says
++ * nothing or is indistinguishable from "nothing matched". These counters and
++ * prints exist because the failure mode is "configfs settings not found" with
++ * no indication of whether the walk saw anything at all. */
++static int dashberry_files_seen = 0;
++static int dashberry_files_matched = 0;
++
+ static int configfs_path_check(const char* fpath, const struct stat * sb, int tflag)
+ {
+     int uvc = find_text_pos(fpath, "/uvc");
+@@ -2210,7 +2219,9 @@ static int configfs_path_check(const char* fpath, const struct stat * sb, int tf
+     (void)(tflag); /* avoid warning: unused parameter 'tflag' */
+ 
+     if (!S_ISDIR(sb->st_mode)) {
++        dashberry_files_seen++;
+         if (streaming && uvc) {
++            dashberry_files_matched++;
+             configfs_fill_formats(fpath, fpath + streaming + 16);
+ 
+         } else if (streaming_params) {
+@@ -2224,15 +2235,23 @@ static int configfs_path_check(const char* fpath, const struct stat * sb, int tf
+ static int configfs_get_uvc_settings()
+ {
+     int i;
++    int ret;
+     const char * configfs_path = "/sys/kernel/config/usb_gadget";
+ 
+     printf("CONFIGFS: Initial path: %s\n", configfs_path);
+ 
+-    if(ftw(configfs_path, configfs_path_check, 20) == -1) {
++    errno = 0;
++    ret = ftw(configfs_path, configfs_path_check, 20);
++    printf("CONFIGFS: ftw returned %d (errno %d: %s); files seen %d, under streaming/class %d\n",
++           ret, errno, errno ? strerror(errno) : "none",
++           dashberry_files_seen, dashberry_files_matched);
++    if (ret == -1) {
++        printf("CONFIGFS: the walk itself failed - not a parsing problem.\n");
+         return -1;
+     }
+ 
+     if (!uvc_frame_format[0].defined) {
++        printf("CONFIGFS: walk completed but no format was recorded.\n");
+         return -1;
+     }
+ 
+@@ -2298,6 +2317,13 @@ int main(int argc, char * argv[])
+     sigaction(SIGTERM, &action, NULL);
+     sigaction(SIGINT, &action, NULL);
+ 
++    /* Line-buffer stdout. It is a pipe into the journal, so it is block
++     * buffered by default - and when this process died on a SIGSEGV the entire
++     * buffered log went with it, including the "CONFIGFS: Initial path" line
++     * that is printed before any of the work. The result was a crash with no
++     * output whatsoever and no way to tell where it happened. */
++    setvbuf(stdout, NULL, _IOLBF, 0);
++
+     ret = configfs_get_uvc_settings();
+     if (ret < 0) {
+         printf("ERROR: configfs settings for uvc gadget not found!\n");

@@ -1,0 +1,157 @@
+#!/bin/sh
+# rear-ctld — the DashBerry Zero's control port daemon.
+#
+# Speaks a line protocol on the gadget's SECOND CDC-ACM function (/dev/ttyGS1)
+# so the Pi 4 can set and read back every v4l2 control on the capture device,
+# over the same cable that carries the video.
+#
+# WHY A SECOND ACM AND NOT THE UVC CONTROL PATH
+# ---------------------------------------------
+# uvc-gadget forwards a FIXED map of UVC processing-unit controls to the
+# capture device — seven of them as measured from the host on 2026-08-13:
+# brightness, contrast, saturation, sharpness, blue_balance, red_balance
+# (mapped but unwired: it reports min=0 max=0), power_line_frequency and
+# auto_exposure. That map is not this camera's capability, and UVC has NO
+# standard control for flip and none for encoder bitrate, so the things the
+# Pi 4 actually needs to say cannot ride that path at all. A UVC Extension
+# Unit could carry them, and is the mechanism designed for it, but it is real
+# work at both ends for a channel this cable already has.
+#
+# The FIRST ACM function stays the login console (see the image README): it is
+# the only way into a read-only rootfs on a device that lives in a locked car,
+# and a control protocol must not fight a getty for the port.
+#
+# WHY v4l2-ctl AND NOT IOCTLS
+# ---------------------------
+# It is already on the image, it already knows every control's name, type and
+# menu labels, and it means this daemon has no build step and no chance of
+# disagreeing with what a human sees when they run the same command on the
+# console. The Pi 4 verifies by read-back anyway, so the cost of the extra
+# process is paid once per setting per drive.
+set -u
+
+DEV=${REAR_CTLD_VIDEO:-/dev/video0}
+PORT=${REAR_CTLD_PORT:-/dev/ttyGS1}
+VERSION_FILE=/etc/dashberry-zero-version
+
+log() { echo "rear-ctld: $*" >&2; }
+
+# Resolve a menu control's LABEL to its index, so the Pi 4 can say
+# "h264_profile high" instead of "h264_profile 4" and its config stays
+# readable. Non-menu controls fall through unchanged.
+menu_index() {                     # $1 = control, $2 = label → index, or $2
+    v4l2-ctl -d "$DEV" --list-ctrls-menus 2>/dev/null | awk -v c="$1" -v want="$2" '
+        $1 == c            { inblock = ($0 ~ /\(menu\)/); next }
+        /^[a-z_0-9]+ 0x/   { inblock = 0 }
+        inblock && $1 ~ /^[0-9]+:$/ {
+            idx = $1; sub(":", "", idx)
+            label = $2; for (i = 3; i <= NF; i++) label = label " " $i
+            if (tolower(label) == tolower(want)) { print idx; found = 1; exit }
+        }
+        END { if (!found) print want }
+    '
+}
+
+# The inverse, so GET answers in the same vocabulary SET was given and a
+# read-back comparison is like for like.
+menu_label() {                     # $1 = control, $2 = index → label, or $2
+    v4l2-ctl -d "$DEV" --list-ctrls-menus 2>/dev/null | awk -v c="$1" -v want="$2" '
+        $1 == c            { inblock = ($0 ~ /\(menu\)/); next }
+        /^[a-z_0-9]+ 0x/   { inblock = 0 }
+        inblock && $1 ~ /^[0-9]+:$/ {
+            idx = $1; sub(":", "", idx)
+            if (idx == want) {
+                label = $2; for (i = 3; i <= NF; i++) label = label " " $i
+                print tolower(label); found = 1; exit
+            }
+        }
+        END { if (!found) print want }
+    '
+}
+
+is_menu() {                        # $1 = control
+    v4l2-ctl -d "$DEV" --list-ctrls-menus 2>/dev/null |
+        grep -qE "^${1}[[:space:]]+0x[0-9a-f]+[[:space:]]+\(menu\)"
+}
+
+handle() {                         # $1.. = one command line → one reply line
+    cmd=$1; shift
+    case $cmd in
+    VERSION)
+        if [ -r "$VERSION_FILE" ]; then
+            echo "DASHBERRY-ZERO $(cat "$VERSION_FILE") $(uname -r)"
+        else
+            echo "ERR no $VERSION_FILE — this image was not built by zero/build.sh"
+        fi
+        ;;
+    LIST)
+        # Multi-line by design: the client reads until the port goes quiet.
+        # This is the human-facing command (dashberry-zero --check), so it
+        # answers with the REAL control surface, not the seven UVC forwards.
+        v4l2-ctl -d "$DEV" --list-ctrls-menus 2>&1
+        v4l2-ctl -d "$DEV" --list-formats-ext 2>&1
+        ;;
+    GET)
+        name=${1:-}
+        [ -n "$name" ] || { echo "ERR GET needs a control name"; return; }
+        val=$(v4l2-ctl -d "$DEV" -C "$name" 2>/dev/null | sed -n 's/^[^:]*: *//p')
+        if [ -z "$val" ]; then
+            echo "ERR $name not readable on $DEV"
+        elif is_menu "$name"; then
+            menu_label "$name" "$val"
+        else
+            echo "$val"
+        fi
+        ;;
+    SET)
+        name=${1:-}; val=${2:-}
+        [ -n "$name" ] && [ -n "$val" ] || { echo "ERR SET needs a name and a value"; return; }
+        if is_menu "$name"; then
+            val=$(menu_index "$name" "$val")
+        fi
+        if err=$(v4l2-ctl -d "$DEV" -c "$name=$val" 2>&1); then
+            echo "OK $name=$val"
+        else
+            echo "ERR $name: $err"
+        fi
+        ;;
+    APPLY)
+        # Nothing to commit — v4l2-ctl applies on the ioctl. This exists so
+        # the Pi 4 has one round trip that means "I am done, and you are
+        # about to be streamed from", and so a future image with a deferred
+        # commit can honour it without changing the client.
+        echo "OK $DEV ready"
+        ;;
+    "")
+        ;;
+    AT*|at*|At*|aT*)
+        # ModemManager, on the host, probing whether this is a modem. Answer
+        # nothing at all: a reply of any kind — even an error — reads as a
+        # response and invites more probing, whereas silence makes it time out
+        # and mark the port as not-a-modem. The Pi 4 also tells it to skip
+        # these ports outright (99-dashberry.rules), but a bench PC will not
+        # have that rule, and a card should not depend on the host being
+        # configured.
+        ;;
+    *)
+        echo "ERR unknown command \"$cmd\" — VERSION LIST GET SET APPLY"
+        ;;
+    esac
+}
+
+[ -e "$PORT" ] || { log "$PORT absent — is the second ACM function configured?"; exit 1; }
+stty -F "$PORT" 115200 raw -echo clocal -hupcl 2>/dev/null || true
+log "listening on $PORT for $DEV"
+
+# The host may open and close the port many times across a drive (rear-rec
+# restarts on every camera replug, and each restart pushes again), so EOF is
+# not a reason to exit — reopen and keep serving.
+while :; do
+    while IFS= read -r line; do
+        line=$(printf '%s' "$line" | tr -d '\r')
+        # shellcheck disable=SC2086 -- deliberate word splitting: the protocol
+        # is whitespace separated and every field is a bare token.
+        handle $line
+    done < "$PORT" > "$PORT"
+    sleep 1
+done

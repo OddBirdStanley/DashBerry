@@ -1,0 +1,67 @@
+From: DashBerry <zero/README.md>
+Subject: [PATCH] uvc: report per-stream totals, so both ends can be compared
+
+Recordings now come out heavily damaged: "bytestream -5" and "concealing N DC,
+AC, MV errors" on nearly every frame, which is the decoder running out of data
+part-way through. Payload is being lost.
+
+The host's side of that is already measurable — uvcvideo keeps per-stream
+counters under /sys/kernel/debug/usb/uvcvideo/<stream>/stats, and one run
+reported 71 frames, 27351 packets, 0 empty, 11 errors, 229 invalid. Errors are
+transmission failures and invalid means the UVC payload header was rejected;
+229 against 11 says the packets are ARRIVING and being thrown out, which is a
+different fault from a bad cable.
+
+The gadget's side was not measurable. The dropped-frame counter printed at 1
+and every 100, so any run losing fewer than a hundred frames reported exactly
+"1" — which is what the last trace said while the host was discarding most of
+what it received. Two numbers that cannot be compared are not evidence.
+
+So: print totals at STREAM OFF — frames handed to UVC, frames dropped
+incomplete, frames taken from the sensor — and tighten the running counter to
+every 25.
+
+What it distinguishes:
+  - gadget reports ~0 losses, host reports many  -> the payload is lost or
+    mangled after it leaves the gadget
+  - both report the same losses                  -> it is happening gadget-side
+--- a/uvc-gadget.c
++++ b/uvc-gadget.c
+@@ -1266,7 +1266,7 @@
+      */
+     if (ubuf.flags & V4L2_BUF_FLAG_ERROR) {
+         uvc_dropped_frames++;
+-        if (uvc_dropped_frames == 1 || uvc_dropped_frames % 100 == 0) {
++        if (uvc_dropped_frames == 1 || uvc_dropped_frames % 25 == 0) {
+             printf("UVC: %u incomplete frame(s) dropped so far "
+                    "(missed isochronous slots — the stream continues)\n",
+                    uvc_dropped_frames);
+@@ -1329,6 +1329,28 @@
+ 
+ static void uvc_handle_streamoff_event()
+ {
++    /* DashBerry: the totals for the stream that just ended, on one line.
++     *
++     * These are the gadget's half of a comparison that cannot be made any
++     * other way. The host counts what it received — uvcvideo keeps frames,
++     * packets, empty, errors and invalid under
++     * /sys/kernel/debug/usb/uvcvideo/<stream>/stats — and until this printed
++     * a total there was nothing to hold it against. A host reporting damaged
++     * frames while the gadget reports none means the payload is being lost or
++     * mangled AFTER it leaves here; both ends reporting the same losses means
++     * it is happening on this side.
++     *
++     * The two counts that come from struct v4l2_device are unsigned long long
++     * and MUST be printed with %llu. With %u this line was varargs-mismatched:
++     * on 32-bit ARM EABI a 64-bit argument is 8-byte aligned and occupies two
++     * slots, so three %u conversions read padding and half-words instead of
++     * the three counters. That is why the frame counts printed 0 beside a
++     * credible drop count, and why INVESTIGATE-REAR-CORRUPTION.md said the
++     * other two "must not be trusted".
++     */
++    printf("TOTALS: %llu frames to UVC, %u incomplete (dropped), %llu frames from sensor\n",
++           uvc_dev.qbuf_count, uvc_dropped_frames, v4l2_dev.dqbuf_count);
++
+     if (settings.source_device == DEVICE_TYPE_V4L2) {
+         v4l2_video_stream(STREAM_OFF);
+         v4l2_uninit_device();

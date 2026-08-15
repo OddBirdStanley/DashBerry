@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# dashberry-zero — flash and inspect the rear camera's Zero card.
+#
+# The Zero is the rear camera: a Pi Zero W + IMX219 running a DashBerry-built
+# showmewebcam that streams H.264 over UVC. It used to be a hand-modified card
+# whose changes lived only in ZERO_SETUP.md, and the failure that document
+# existed to prevent — a reflash silently reverting the rear camera, with no
+# symptom but a worse picture — is the reason this tool exists instead.
+#
+#   dashberry-zero --flash /dev/sdX [--image IMG]   write a built image
+#   dashberry-zero --check [--port DEV]             ask a plugged-in card what
+#                                                   it is and what it can do
+#
+# --check is the replacement for ZERO_SETUP.md's "Checking a card" section: it
+# answers by machine every question that document asked a human to answer by
+# hand, and it needs nothing but the USB cable.
+set -euo pipefail
+
+ME=${0##*/}
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+usage() {
+    sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+die()  { echo "$ME: $*" >&2; exit 1; }
+info() { echo "==> $*"; }
+need() { command -v "$1" >/dev/null || die "missing tool: $1"; }
+
+MODE=
+DEV=
+IMG=
+PORT=
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --flash) MODE=flash; shift; DEV=${1:-}; [ -n "$DEV" ] || die "--flash needs a device" ;;
+        --check) MODE=check ;;
+        --image) shift; IMG=${1:-}; [ -n "$IMG" ] || die "--image needs a path" ;;
+        --port)  shift; PORT=${1:-}; [ -n "$PORT" ] || die "--port needs a device" ;;
+        -h|--help) usage ;;
+        *) die "unknown option: $1 (try --help)" ;;
+    esac
+    shift
+done
+[ -n "$MODE" ] || usage 1
+
+# --------------------------------------------------------------------- check
+# Before talking to the card, work out whether there is a card to talk to. A
+# silent --check is the least useful failure this tool can produce, and "the
+# Zero appears dead" covers at least four different faults that want different
+# answers. So: enumerate first, report what is actually present, and only then
+# open a port.
+present() {                         # → the args that actually exist, space separated
+    local f out=""
+    for f in "$@"; do [ -e "$f" ] && out="$out $f"; done
+    printf '%s' "${out# }"
+}
+
+usb_scan() {                        # → prints what the gadget looks like to USB
+    local d found=0 vid pid
+    for d in /sys/bus/usb/devices/*; do
+        [ -r "$d/idVendor" ] || continue
+        vid=$(cat "$d/idVendor" 2>/dev/null)
+        pid=$(cat "$d/idProduct" 2>/dev/null)
+        if [ "$vid" = "1d6b" ] && [ "$pid" = "0104" ]; then
+            found=1
+            echo "  USB device : ${vid}:${pid} $(cat "$d/product" 2>/dev/null || echo '?')"
+            echo "  interfaces : $(cat "$d/bNumInterfaces" 2>/dev/null | tr -d ' ')"
+        fi
+    done
+    return $((1 - found))
+}
+
+if [ "$MODE" = check ]; then
+    echo
+    echo "== what is plugged in"
+    GADGET=0
+    usb_scan && GADGET=1
+
+    # Globbed, not `ls | ...`: under `set -euo pipefail` a glob that matches
+    # nothing makes the pipeline fail, the assignment fail, and the script exit
+    # WITHOUT PRINTING ANYTHING — which is the exact silent-failure this whole
+    # section exists to abolish.
+    ACMS=$(present /dev/ttyACM*)
+    VIDEOS=$(present /dev/video*)
+    echo "  ttyACM     : ${ACMS:-none}"
+    echo "  video nodes: ${VIDEOS:-none}"
+    [ -e /dev/rear-ctl ] && echo "  rear-ctl   : present (this is a DashBerry Pi 4)"
+
+    if [ "$GADGET" = 0 ] && [ -z "$ACMS" ]; then
+        die "the Zero is not enumerating at all — nothing on USB, no ttyACM.
+
+  That is a BOOT or GADGET failure, not a control-port problem, and nothing
+  this tool says over the cable will help until it enumerates. In rough order
+  of likelihood:
+
+  1. /boot/config.txt. It is a FAT partition, so put the card in this PC and
+     read it — no rebuild needed. It should carry, from zero/edits.sh:
+         dtoverlay=dwc2,dr_mode=peripheral
+         dtoverlay=disable-wifi
+         dtoverlay=disable-bt
+         gpu_mem=256
+     BISECT BY EDITING IT DIRECTLY. Comment out disable-wifi and disable-bt
+     first (# in front), boot again, and see if it comes back. Those two are
+     the newest and the most likely to have disabled something they should
+     not have; everything else about the card can be tested with them off.
+  2. The kernel or rootfs never came up. The image is Linux 6.16 where the
+     card used to be 5.10, and a kernel that panics before USB init looks
+     exactly like this. You cannot see it over USB — see the serial console
+     below, which is the only instrument that answers this.
+  3. The USB gadget failed to bind. multi-gadget.sh builds a composite
+     device, and if any function is misconfigured the final bind fails and
+     NOTHING appears — camera and console together. This is the failure mode
+     the H.264/framebased work could plausibly have introduced.
+
+  THE SERIAL CONSOLE IS NOW THE FAST PATH, and it is new: dtoverlay=disable-bt
+  frees the PL011 UART onto the 40-pin header, and buildroot already runs a
+  getty there. A 3.3 V USB-TTL adapter on GPIO14 (TXD, pin 8), GPIO15 (RXD,
+  pin 10) and GND (pin 6), at 115200, shows the entire boot from firmware
+  onward. That distinguishes 1, 2 and 3 in about ten seconds, where guessing
+  from the outside cannot.
+
+  Also worth a glance: the green ACT LED. No flicker at all after power-up
+  means the firmware never got to the kernel (case 1); flicker then nothing on
+  USB means it booted and the gadget failed (case 3)."
+    fi
+
+    if [ "$GADGET" = 0 ] && [ -n "$ACMS" ]; then
+        echo
+        echo "  ! Serial is present but the UVC gadget is not."
+        echo "    multi-gadget.sh skips the camera and forces the console on when"
+        echo "    /dev/video0 is missing — so the most likely cause is that"
+        echo "    bcm2835-v4l2 did not probe the sensor on this kernel. Log in on"
+        echo "    the console below and run:  dmesg | grep -i -e bcm2835 -e video"
+    fi
+
+    # /dev/rear-ctl is the udev name on a DashBerry Pi 4. On a bench PC the
+    # card presents two ACMs and the control port is the SECOND. ttyACM0 is
+    # deliberately NOT a fallback: it is the login console, and asking it for a
+    # VERSION gets silence or a login prompt, which is exactly the confusion
+    # that makes a working card look dead.
+    if [ -z "$PORT" ]; then
+        for cand in /dev/rear-ctl /dev/ttyACM1; do
+            [ -e "$cand" ] && { PORT=$cand; break; }
+        done
+    fi
+    if [ -z "$PORT" ]; then
+        die "no CONTROL port found (looked for /dev/rear-ctl and /dev/ttyACM1).
+  ttyACM0 is the login console and is not tried on purpose — it answers a
+  VERSION request with silence, which reads as a dead card.
+  If only ttyACM0 exists, the second ACM function never came up: log in on it
+  and check  ls /sys/kernel/config/usb_gadget/piwebcam/configs/c.1/"
+    fi
+    [ -r "$PORT" ] && [ -w "$PORT" ] || die "cannot read/write $PORT (try sudo, or join the dialout group)"
+
+    need stty
+    echo
+    echo "== asking $PORT"
+    stty -F "$PORT" 115200 raw -echo -echoe -echok clocal -hupcl min 0 time 20
+    exec 3<>"$PORT"
+    while read -r _junk <&3; do :; done 2>/dev/null || true
+
+    printf 'VERSION\r\n' >&3
+        # Skip host-side noise rather than treating it as the answer.
+        # ModemManager probes new CDC-ACM ports by writing AT commands at
+        # them, and those bytes come back interleaved with ours — the symptom
+        # was a VERSION reply reading "ATAT...". udev tells it to skip these
+        # ports and the daemon stays silent at them, but a port can already be
+        # mid-probe when we open it, so the reader drops what it recognises as
+        # not-an-answer instead of failing on it.
+    ver=""
+    tries=0
+    while [ "$tries" -lt 6 ]; do
+        tries=$((tries + 1))
+        read -r ver <&3 || { ver=""; break; }
+        ver=${ver%$'\r'}
+        case $ver in
+            ''|AT*|at*|At*|aT*|OK|ERROR) continue ;;
+            *) break ;;
+        esac
+    done
+    if [ -z "$ver" ]; then
+        die "no answer from $PORT, though the port exists.
+  The gadget is up and the control function enumerated, so the Zero booted —
+  what is missing is rear-ctld answering on it. Log in on the console
+  (ttyACM0) and check:
+      systemctl status rear-ctld
+      ls -l /dev/ttyGS1
+  A stock showmewebcam card also lands here: it has no rear-ctld at all."
+    fi
+    case $ver in
+        DASHBERRY-ZERO\ *) echo "  $ver" ;;
+        *) die "unexpected answer on $PORT: \"$ver\" — is this the login console rather than the control port?" ;;
+    esac
+
+    echo
+    printf 'LIST\r\n' >&3
+    while read -r line <&3; do printf '  %s\n' "${line%$'\r'}"; done
+    exec 3>&-
+    echo
+    echo "What to look for:"
+    echo "  * H.264 in --list-formats-ext, at the mode dashberry.conf records"
+    echo "    (REAR_W x REAR_H). An unadvertised mode fails v4l2src's caps"
+    echo "    request outright and the rear records NOTHING."
+    echo "  * horizontal_flip / vertical_flip present — INVERT_REAR has no"
+    echo "    other home now that the Pi 4 does not decode."
+    echo "  * video_bitrate, h264_i_frame_period, h264_profile, auto_exposure_bias:"
+    echo "    the four rear-ctl pushes on every start of rear-rec."
+    exit 0
+fi
+
+# --------------------------------------------------------------------- flash
+[ "$(id -u)" = 0 ] || die "--flash needs root"
+for t in dd lsblk blockdev findmnt wipefs sync; do need "$t"; done
+
+if [ -z "$IMG" ]; then
+    IMG=$(ls -t "$HERE"/../zero/out/dashberry-zero-*.img.xz 2>/dev/null | head -n 1 || true)
+    [ -n "$IMG" ] || die "no image given and none built — run zero/build.sh, or pass --image"
+    info "using the newest built image: $IMG"
+fi
+[ -f "$IMG" ] || die "image not found: $IMG"
+case $IMG in
+    *.img)    DECOMP=cat ;;
+    *.img.xz) DECOMP=xz; need xz ;;
+    *) die "unrecognized image format (want .img or .img.xz): $IMG" ;;
+esac
+
+# Same three refusals as dashberry-install, for the same reason: this writes
+# to a raw block device and the only thing standing between a typo and
+# someone's laptop is this block.
+[ -b "$DEV" ] || die "$DEV is not a block device"
+devname=$(basename "$(readlink -f "$DEV")")
+[ -e "/sys/block/$devname" ] || die "$DEV looks like a partition, use the whole disk"
+rootsrc=$(findmnt -no SOURCE / 2>/dev/null || true)
+rootdisk=$(lsblk -no PKNAME "$rootsrc" 2>/dev/null | head -n1 || true)
+[ "$rootdisk" != "$devname" ] || die "refusing: $DEV holds the running system"
+lsblk -no MOUNTPOINT "$DEV" 2>/dev/null | grep -q . && die "$DEV has mounted partitions"
+
+MANIFEST=${IMG%.img.xz}.manifest; MANIFEST=${MANIFEST%.img}.manifest
+echo
+echo "  DashBerry Zero — REAR CAMERA CARD"
+echo "    image : ${IMG##*/}"
+[ -f "$MANIFEST" ] && sed 's/^/    /' "$MANIFEST"
+echo "    device: $DEV ($(lsblk -dno MODEL,SIZE "$DEV" | tr -s ' '))"
+echo
+echo "    ALL DATA ON $DEV WILL BE ERASED."
+echo
+printf 'Type the device path (%s) to continue: ' "$DEV"
+read -r answer
+[ "$answer" = "$DEV" ] || die "aborted"
+
+info "wiping old signatures"
+while read -r part; do [ -b "$part" ] && wipefs -a -q "$part"; done \
+    < <(lsblk -nro TYPE,PATH "$DEV" | awk '$1 == "part" {print $2}')
+wipefs -a -q "$DEV"
+
+info "writing"
+case $DECOMP in
+    cat) dd if="$IMG" of="$DEV" bs=4M conv=fsync status=progress ;;
+    xz)  xz -dc "$IMG" | dd of="$DEV" bs=4M conv=fsync status=progress ;;
+esac
+sync
+blockdev --rereadpt "$DEV" 2>/dev/null || true
+
+echo
+info "done"
+echo "Next:"
+echo "  1. Put the card in the Zero and plug the Zero into a PC."
+echo "  2. sudo $ME --check      — it should answer DASHBERRY-ZERO."
+echo "  3. Shoot the modes and LOOK at them before choosing one:"
+echo "       cam/rear-modetest.sh"
+echo "  4. Only then put it in the car."

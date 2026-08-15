@@ -1,0 +1,131 @@
+From: DashBerry <zero/README.md>
+Subject: [PATCH] configfs: discover formats through the streaming header
+
+uvc-gadget matches only configfs paths containing "streaming/class/". Those
+exist solely as symlinks, and glibc's ftw() does not descend into them:
+
+    ftw returned 0 (errno 0: none); files seen 122, under streaming/class 0
+
+so no format was ever recorded and the only symptom was "configfs settings for
+uvc gadget not found".
+
+ftw() DOES follow the format links inside streaming/header/<h>/, and it records
+every directory it visits by (dev, ino) to break symlink loops - so having
+entered streaming/framebased/h through the header, it skips the real directory
+later as already seen. Measured by printing every candidate: 67 paths began
+"header/", 3 "color_matching/", and ZERO began "framebased/" or "mjpeg/". The
+real paths are never generated.
+
+What the header yields is one component away from what the parser wants:
+
+    header/<hdr>/<format>/<frame>/<attribute>    from ftw
+    <speed>/<hdr>/<format>/<frame>/<attribute>   what configfs_fill_formats parses
+
+so the leading "header" is replaced with a speed and the entry registered for
+fs, hs and ss. multi-gadget.sh links this one header into all three
+class/<speed> groups, so every format really is offered at every speed.
+
+bFormatIndex is taken as well: it is the format's position in the USB
+descriptors, the number the host selects by, and without it the table is built
+in readdir order and a host asking for H.264 is handed MJPEG - which was the
+observed failure.
+
+This replaces an earlier attempt that matched the real format directories. That
+approach was correct in principle and matched nothing in practice, because
+those paths do not occur.
+---
+diff --git a/uvc-gadget.c b/uvc-gadget.c
+index b16475a..65c265d 100644
+--- a/uvc-gadget.c
++++ b/uvc-gadget.c
+@@ -2211,10 +2211,78 @@ static void configfs_fill_streaming_params(const char* path, const char * part)
+ static int dashberry_files_seen = 0;
+ static int dashberry_files_matched = 0;
+ 
++/* DashBerry: discover formats through the STREAMING HEADER, not the class/
++ * symlinks.
++ *
++ * uvc-gadget matches only paths containing "streaming/class/", which exist
++ * solely as symlinks. glibc's ftw() will not descend into them, so nothing was
++ * ever found: measured on the device, 122 files walked and 0 under
++ * streaming/class, and the only symptom was "configfs settings for uvc gadget
++ * not found".
++ *
++ * ftw() does follow the format links INSIDE streaming/header/<h>/, and it
++ * records each directory it visits by (dev, ino) to break symlink loops - so
++ * having entered streaming/framebased/h through the header, it then skips the
++ * real directory as already seen. Measured: of 71 candidate paths, 67 began
++ * "header/", 0 began "framebased/" or "mjpeg/". The real paths are never
++ * generated at all.
++ *
++ * What the header yields is one component away from what the parser wants:
++ *
++ *     header/<hdr>/<format>/<frame>/<attribute>     from ftw
++ *     <speed>/<hdr>/<format>/<frame>/<attribute>    what configfs_fill_formats parses
++ *
++ * so the header component is replaced with a speed and the entry registered
++ * for each of fs, hs and ss. That is not a guess: multi-gadget.sh links this
++ * one header into all three class/<speed> groups, so every format really is
++ * offered at every speed.
++ *
++ * bFormatIndex is taken too - it is the format's position in the USB
++ * descriptors, the number the host selects by. Without it the table is built
++ * in readdir order and the host asking for H.264 is handed MJPEG, which was
++ * the observed failure.
++ */
++static void configfs_fill_formats_header(const char * path, const char * part)
++{
++    static const char * const speeds[] = { "fs", "hs", "ss" };
++    char synth[256];
++    char * copy = strdup(part);
++    char * tok = strtok(copy, "/");
++    char * arr[8];
++    int n = 0;
++    unsigned int i;
++
++    while (tok != NULL && n < 8) {
++        arr[n++] = tok;
++        tok = strtok(NULL, "/");
++    }
++
++    if (n < 1 || strcmp(arr[0], "header")) {
++        free(copy);
++        return;
++    }
++
++    for (i = 0; i < sizeof(speeds) / sizeof(speeds[0]); i++) {
++        if (n == 5) {
++            /* frame geometry */
++            snprintf(synth, sizeof(synth), "%s/%s/%s/%s/%s",
++                     speeds[i], arr[1], arr[2], arr[3], arr[4]);
++            configfs_fill_formats(path, synth);
++        } else if (n == 4 && !strcmp(arr[3], "bFormatIndex")) {
++            snprintf(synth, sizeof(synth), "%s/%s/%s/%s",
++                     speeds[i], arr[1], arr[2], arr[3]);
++            configfs_fill_formats(path, synth);
++        }
++    }
++
++    free(copy);
++}
++
+ static int configfs_path_check(const char* fpath, const struct stat * sb, int tflag)
+ {
+     int uvc = find_text_pos(fpath, "/uvc");
+     int streaming = find_text_pos(fpath, "streaming/class/");
++    int streaming_hdr = find_text_pos(fpath, "/streaming/header/");
+     int streaming_params = find_text_pos(fpath, "/streaming_");
+     (void)(tflag); /* avoid warning: unused parameter 'tflag' */
+ 
+@@ -2224,6 +2292,11 @@ static int configfs_path_check(const char* fpath, const struct stat * sb, int tf
+             dashberry_files_matched++;
+             configfs_fill_formats(fpath, fpath + streaming + 16);
+ 
++        } else if (streaming_hdr && uvc) {
++            dashberry_files_matched++;
++            /* +11 keeps "header/" on the front, which the helper checks. */
++            configfs_fill_formats_header(fpath, fpath + streaming_hdr + 11);
++
+         } else if (streaming_params) {
+             configfs_fill_streaming_params(fpath, fpath + streaming_params + 11);
+ 

@@ -989,18 +989,23 @@ static int cpu_temp_c(void)
  * the only one readable at a glance, and it is the one that answers "is
  * there headroom left".
  *
- * This line was added because the rear moved to 1920x1080@30 (2026-08-12):
- * 2.25x the pixel rate of 720p30, through a SOFTWARE jpegdec and a SOFTWARE
- * openh264enc that between them were measured at ~1.3 cores at 720p30. The
- * rear was REVERTED to 1280x720@30 on 2026-08-13, so that specific question
- * is moot and the ~1.3 core figure applies directly again.
+ * This line exists because the rear used to be encoded HERE, in software, and
+ * nothing else on the car could see the cost: TMP shows heat AFTER the work,
+ * and the health check (segments growing) cannot distinguish an encoder
+ * keeping up from one quietly dropping frames. It caught exactly that —
+ * 1920x1080@30 went in on 2026-08-12 and came back well under 30 fps.
  *
- * The line STAYS. What made it worth adding outlives the mode it was added
- * for: the rear's decode and encode are both software on a four-core Pi that
- * is also running front-rec, and nothing else on the car can see headroom
- * being spent. TMP shows heat AFTER the work, and the health check (segments
- * growing) cannot distinguish an encoder keeping up from one quietly
- * dropping frames.
+ * What it measured turned out to be a per-CORE ceiling wearing a whole-box
+ * disguise, and reading it that way cost weeks: 40% busy here was ONE pinned
+ * core (openh264enc runs one slice, one slice is one thread) plus front-rec,
+ * with three cores idle. It read as headroom and there was none.
+ * INVESTIGATE-REAR-ENCODE.md has the numbers.
+ *
+ * The rear encode moved to the Zero on 2026-08-13, taking ~1.2 cores of
+ * decode+encode with it, so this figure should now sit far lower and this
+ * line becomes the instrument that CONFIRMS that rather than the one watching
+ * for strain. A rear that is still expensive here means the pipeline is not
+ * the remux it is supposed to be (see rear-rec).
  *
  * The counters are cumulative since boot, so the FIRST tick has no delta to
  * divide and shows ---. A failed read keeps the last figure rather than

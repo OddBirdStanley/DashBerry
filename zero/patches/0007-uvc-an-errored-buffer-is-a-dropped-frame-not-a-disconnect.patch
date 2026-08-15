@@ -1,0 +1,100 @@
+From: DashBerry <zero/README.md>
+Subject: [PATCH] uvc: an errored buffer is a dropped frame, not a disconnect
+
+uvc_v4l2_video_process() read V4L2_BUF_FLAG_ERROR on a dequeued UVC buffer as
+"the host is going away": it latched uvc_shutdown_requested, printed "Possible
+USB shutdown requested from Host", and RETURNED WITHOUT RE-QUEUEING THE
+BUFFER.
+
+That inference was always thin, and once f_uvc was taught to survive a missed
+isochronous slot it became wrong. A missed slot sets UVC_QUEUE_DROP_INCOMPLETE
+and the buffer completes with an error — normal, expected, and nothing to do
+with a disconnect.
+
+The leak is what killed the stream. Each dropped frame permanently removed one
+buffer from the rotation, so the pool drained one error at a time until there
+was nothing left to fill, and the host got:
+
+    poll error 1: Invalid argument (22)
+    Failed to allocate a buffer
+
+Measured on an unchanged card: 8 buffers allocated, seven "Possible USB
+shutdown" lines over 23 seconds, then that error.
+
+This is also why results were INCONSISTENT with nothing rebuilt between runs.
+How long a capture lasted was only how long it took to miss enough slots, and
+that varies with scene content, USB timing and temperature — the same mode
+gave 4.17 s, 12.93 s, 14.16 s and 18.38 s on one image. It is why raising the
+pool from 2 to 8 lengthened runs without fixing them: it bought more errors
+before the same end, which read as a partial fix and was not one.
+
+A genuine disconnect still arrives by the two routes that mean it:
+UVC_EVENT_DISCONNECT, and ENODEV from the QBUF/DQBUF ioctls (both already
+handled, and both left alone here).
+
+So count the drop, say so rarely enough to stay readable, and recycle the
+buffer like any other.
+---
+--- a/uvc-gadget.c
++++ b/uvc-gadget.c
+@@ -1173,6 +1173,10 @@
+     }
+ }
+ 
++/* DashBerry: how many frames arrived incomplete. Counted rather than acted
++ * on: dropping one is normal for isochronous transfer. */
++static unsigned int uvc_dropped_frames = 0;
++
+ static void uvc_v4l2_video_process()
+ {
+     struct v4l2_buffer ubuf;
+@@ -1199,18 +1203,38 @@
+ 
+     uvc_dev.dqbuf_count++;
+ 
+-    /*
+-        * If the dequeued buffer was marked with state ERROR by the
+-        * underlying UVC driver gadget, do not queue the same to V4l2
+-        * and wait for a STREAMOFF event on UVC side corresponding to
+-        * set_alt(0). So, now all buffers pending at UVC end will be
+-        * dequeued one-by-one and we will enter a state where we once
+-        * again wait for a set_alt(1) command from the USB host side.
+-        */
++    /* DashBerry: an errored buffer is a DROPPED FRAME, not a disconnect.
++     *
++     * The original code read V4L2_BUF_FLAG_ERROR as "the host is going away"
++     * — it latched uvc_shutdown_requested and, critically, RETURNED WITHOUT
++     * RE-QUEUEING THE BUFFER. That inference was already thin, and once f_uvc
++     * was taught to survive a missed isochronous slot (see the kernel patch in
++     * zero/patches/linux-custom) it became simply wrong: a missed slot sets
++     * UVC_QUEUE_DROP_INCOMPLETE, which completes that buffer with an error.
++     * Normal, expected, and not a disconnect.
++     *
++     * Leaking the buffer is what actually killed the stream. Every dropped
++     * frame permanently removed one buffer from the rotation, so the pool
++     * drained one error at a time until the host got EINVAL from poll() and
++     * "Failed to allocate a buffer". That is exactly why runs were
++     * INCONSISTENT on an unchanged card: how long one lasted was only how long
++     * it took to miss enough slots, which varies with scene, timing and
++     * temperature. It is also why raising the pool from 2 to 8 lengthened runs
++     * without fixing anything — it bought more errors before the same end.
++     *
++     * A real disconnect still arrives by the two routes that actually mean it:
++     * UVC_EVENT_DISCONNECT, and ENODEV from the QBUF/DQBUF ioctls.
++     *
++     * So: count it, mention it rarely enough to be readable, and recycle the
++     * buffer like any other.
++     */
+     if (ubuf.flags & V4L2_BUF_FLAG_ERROR) {
+-        uvc_shutdown_requested = true;
+-        printf("UVC: Possible USB shutdown requested from Host, seen during VIDIOC_DQBUF\n");
+-        return;
++        uvc_dropped_frames++;
++        if (uvc_dropped_frames == 1 || uvc_dropped_frames % 100 == 0) {
++            printf("UVC: %u incomplete frame(s) dropped so far "
++                   "(missed isochronous slots — the stream continues)\n",
++                   uvc_dropped_frames);
++        }
+     }
+ 
+     /* Queue the buffer to V4L2 domain */

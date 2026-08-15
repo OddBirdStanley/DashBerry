@@ -1,0 +1,46 @@
+From: DashBerry <zero/README.md>
+Subject: [PATCH] configfs: select H.264 when the format name starts with 'h'
+
+uvc-gadget picks the V4L2 capture fourcc from the FIRST CHARACTER of the
+configfs format instance name: 'm' -> MJPEG, 'u' -> YUYV, and nothing else.
+That is the entire format-selection logic, which is why a gadget configured
+with a framebased/h format would otherwise fall through to 0 and stream
+nothing recognisable.
+
+DashBerry needs the Zero to encode H.264 in hardware, because the Pi 4 that
+consumes this stream cannot software-encode any usable mode at 30 fps (one
+openh264 slice = one thread = ~65,000 macroblocks/s; 720p30 alone wants
+108,000). See DashBerry/INVESTIGATE-REAR-ENCODE.md.
+
+The second hunk is diagnostics only: v4l2_get_available_formats() just prints
+what the capture device offers, and without H264 in its filter the startup log
+stays silent about exactly the formats someone bringing this up is looking for.
+
+Applies to peterbay/uvc-gadget @ e9a733fe5c4a7fcb48e963e8d994bc33d24d814e,
+the SHA package/piwebcam/piwebcam.mk pins.
+---
+diff --git a/uvc-gadget.c b/uvc-gadget.c
+index c402125..f147304 100644
+--- a/uvc-gadget.c
++++ b/uvc-gadget.c
+@@ -1015,7 +1015,9 @@ static void v4l2_get_available_formats()
+     fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+ 
+     while (ioctl(v4l2_dev.fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
+-        if (fmtdesc.pixelformat == V4L2_PIX_FMT_MJPEG || fmtdesc.pixelformat == V4L2_PIX_FMT_YUYV) {
++        if (fmtdesc.pixelformat == V4L2_PIX_FMT_MJPEG ||
++            fmtdesc.pixelformat == V4L2_PIX_FMT_YUYV ||
++            fmtdesc.pixelformat == V4L2_PIX_FMT_H264) {
+             frmsize.pixel_format = fmtdesc.pixelformat;
+             frmsize.index = 0;
+             while (ioctl(v4l2_dev.fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) >= 0) {
+@@ -2098,6 +2100,9 @@ static int configfs_video_format(const char * format)
+     } else if (!strncmp(format, "u", 1)) {
+         return V4L2_PIX_FMT_YUYV;
+ 
++    } else if (!strncmp(format, "h", 1)) {
++        return V4L2_PIX_FMT_H264;
++
+     }
+     return 0;
+ }

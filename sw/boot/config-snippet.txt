@@ -51,9 +51,10 @@ disable_splash=1
 dtoverlay=disable-bt
 
 # --- VideoCore firmware memory. The firmware-backed camera/codec contexts
-# (bcm2835-isp for the front 1080p libcamera path, bcm2835-codec for its
-# H.264 encode and the rear 720p H.264 encode; rear MJPEG decode is
-# software, see rear-rec) allocate here, NOT from ARM-side CMA. The 76 MB
+# (bcm2835-isp for the front 1080p libcamera path and bcm2835-codec for its
+# H.264 encode; the rear adds NO firmware context — both its MJPEG decode
+# and its H.264 encode are software, see rear-rec) allocate here, NOT from
+# ARM-side CMA. The 76 MB
 # default cannot hold them all: the last context to arrive fails —
 # bench-observed both as a clean REQBUFS ENOMEM ("Failed to allocate
 # required memory") and as a VCHIQ sync timeout that wedges the firmware

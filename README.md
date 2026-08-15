@@ -13,9 +13,11 @@ no account, no companion app, and no telemetry.
 ## Features
 
 - **Dual-camera H.264 recording** — 1080p30 front (CSI camera, hardware-encoded)
-  and 720p30 rear (Pi Zero UVC gadget, software-encoded), 60-second MPEG-TS
-  segments, ~110–120 h of retention on a 256 GB card. Setting up the rear
-  camera's card: [ZERO_SETUP.md](ZERO_SETUP.md).
+  and 1640×922@30 rear (Pi Zero UVC gadget, **also hardware-encoded, on the
+  Zero itself**), 60-second MPEG-TS segments, ~35 h of retention on a 256 GB
+  card at 8 Mbps per camera. The Pi 4 only parses and muxes the rear stream;
+  it owns the rear camera's settings and pushes them over the cable each
+  session. Building and flashing that card: [zero/README.md](zero/README.md).
 - **5 Hz GPS logging** — raw NMEA per drive; Doppler-derived speed accurate
   to well under 1 km/h
 - **Crash-only design** — ignition off is a hard power cut, and the system
@@ -99,7 +101,7 @@ PC-side CLI.
 
 | Component | Notes |
 |---|---|
-| Raspberry Pi Zero W | runs [showmewebcam](https://github.com/showmewebcam/showmewebcam) (open firmware, UVC gadget) |
+| Raspberry Pi Zero W | runs a DashBerry build of [showmewebcam](https://github.com/showmewebcam/showmewebcam) (open firmware, UVC gadget): H.264 in hardware, plus a control port the Pi 4 configures it through — [zero/README.md](zero/README.md) |
 | IMX219 wide camera module | standard Zero-footprint board |
 | Official Pi Zero case (camera lid) | sealed camera brick |
 | microSD, 8 GB | written once, stateless |
