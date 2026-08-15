@@ -32,15 +32,20 @@
 # toolchain against what buildroot 2021.02 expects and stops, which is seconds
 # rather than the hour it would otherwise take to find out.
 #
-# THE PART THAT IS NOT SETTLED
-# The kernel pin. This built and booted on rpi-6.16.y; it is now rpi-6.18.y,
-# for two f_uvc fixes that 6.16 will never get because they landed after it
-# went end-of-life (see zero/edits.sh section 1), and 6.18 has not been built
-# here yet. showmewebcam's buildroot pin also predates 6.x host-tool
-# requirements, so buildroot itself may need bumping. If it fights back,
-# KERNEL_BRANCH=rpi-6.16.y is the known-good branch, and
-# KERNEL_BRANCH=rpi-6.12.y plus a backport of 7b5a5895 is the documented
-# fallback below that (see zero/README.md).
+# THE KERNEL PIN, AND ITS FALLBACKS
+# rpi-6.18.y, for two f_uvc fixes that rpi-6.16.y will never get because they
+# landed after it went end-of-life (see zero/edits.sh section 1). VERIFIED
+# 2026-08-15: it builds for raspberrypi0w and the card streams — image
+# dashberry-zero-7729166, 690 frames at 1640x922@30 with 0 decoder errors.
+# showmewebcam's buildroot pin needed no bump after all.
+#
+# If a future move fights back: KERNEL_BRANCH=rpi-6.16.y boots, but SET
+# /boot/uvc-interval BACK TO 1 IF YOU TAKE IT. The default is 3, and 6.16 is
+# missing 010dc57cb516/56135c0c60b0, so its f_uvc reads bInterval linearly
+# where dwc2 reads it as an exponent — every interval above 1 over-commits the
+# endpoint. KERNEL_BRANCH=rpi-6.12.y plus a backport of 7b5a5895 is the
+# fallback below that, and predates the whole request rework, so the interval
+# is unconstrained there (see zero/README.md).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
