@@ -25,9 +25,15 @@ h264  1640  922
 # horizontal field. Reverted 2026-08-12 only because the PI 4 could not encode
 # it — that objection died with this image.
 h264  1920 1080
-# Kept for bench comparison. Not a production candidate: binned, downscaled,
-# AND below bcm2835-v4l2's 1280x720 port threshold, which routes it down the
-# driver's poor path.
+# Kept for bench comparison. Not a production candidate: it is binned and then
+# DOWNSCALED, so it throws away detail the 1640 modes keep for free, at no
+# saving the Zero cares about now that it encodes in hardware.
+# (An earlier note here blamed "bcm2835-v4l2's 1280x720 port threshold, which
+# routes it down the driver's poor path". Wrong twice: that test lives in
+# case COMP_CAMERA: and so applies to RAW formats only — H.264 is
+# COMP_VIDEO_ENCODE and always gets CAM_PORT_VIDEO — and even for raw,
+# being at or below the threshold selects the VIDEO port, which is the right
+# one for continuous capture.)
 h264  1280  720
 
 # MJPEG, kept deliberately: it is the diagnostic fallback and the format any
@@ -65,14 +71,20 @@ mjpeg 1280  720
 #     1640x922   922 rows  ok        2048x1152  1152 rows  hangs
 #     1920x1080 1080 rows  ok        2560x1440  1440 rows  hangs
 #
-# THE EARLIER EXPLANATION WAS WRONG and is recorded here so it is not
+# THE BANDWIDTH EXPLANATION WAS WRONG and is recorded here so it is not
 # retested: this file used to blame ~48 Mbps of MJPEG over USB and suggest
-# H.264 at ~1 MB/s might lift the restriction. It does not. The reason MJPEG
-# could carry 1640x1232 at all is that MJPEG is COMP_IMAGE_ENCODE, which uses
-# CAM_PORT_CAPTURE — the STILLS port, sized from max_stills_w/h, i.e. the full
-# 3280x2464 sensor. Same camera, same resolution, different port, different
-# pool. The MJPEG hang was the stills path being pressed into continuous
-# service, not a bandwidth ceiling.
+# H.264 at ~1 MB/s might lift the restriction. The pool is sized in ROWS and
+# the format never enters into it, so no encode change can move it.
+#
+# STILL UNEXPLAINED, and do not build anything on it: an MJPEG-era note (see
+# cam/rear-modetest.sh) records 1640x1232 as hanging at 30 fps but "streaming
+# at 15". Nothing in the driver accounts for that. MJPEG is COMP_VIDEO_ENCODE
+# too — the same component as H.264, only V4L2_PIX_FMT_JPEG (still JPEG, a
+# fourcc uvc-gadget never asks for) is COMP_IMAGE_ENCODE — so MJPEG runs off
+# the same CAM_PORT_VIDEO and the same 1088-row pool, and should fail
+# identically. Either that observation was never a verified 1232-row stream or
+# something else was different at the time. It has not been reproduced on this
+# image and is not a reason to expect the mode to work.
 #
 # The knob, if it is ever wanted: max_video_height is module_param(..., 0644),
 # so booting with bcm2835_v4l2.max_video_height=1232 should size the pool for

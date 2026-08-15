@@ -444,13 +444,18 @@ eye**, off `cam/rear-modetest.sh` footage of a parked, detailed target:
 
 **The bandwidth explanation this section used to give was wrong**, and is
 recorded so it is not retested: it blamed ~48 Mbps of MJPEG over USB and
-expected H.264's ~1 MB/s to lift the ban. It does not — the pool is sized in
-rows, and the format never enters into it. The reason MJPEG could carry
-1640×1232 at all is that MJPEG is `COMP_IMAGE_ENCODE`, which uses
-`CAM_PORT_CAPTURE` — the **stills** port, sized from `max_stills_w/h`, i.e.
-the full 3280×2464 sensor. Same camera, same resolution, different port,
-different pool. The MJPEG hang was the stills path being pressed into
-continuous service.
+expected H.264's ~1 MB/s to lift the ban. The pool is sized in **rows**, and
+the format never enters into it, so no encode change can move it.
+
+**One thing is still unexplained**, and nothing should be built on it: an
+MJPEG-era note in `cam/rear-modetest.sh` records 1640×1232 as hanging at 30
+fps but "streaming at 15". Nothing in the driver accounts for that. MJPEG is
+`COMP_VIDEO_ENCODE` too — the same component as H.264; only
+`V4L2_PIX_FMT_JPEG` (still JPEG, a fourcc `uvc-gadget` never asks for) is
+`COMP_IMAGE_ENCODE` — so MJPEG runs off the same `CAM_PORT_VIDEO` and the same
+1088-row pool and should fail identically. Either that observation was never a
+verified 1232-row stream, or something else differed at the time. It has not
+been reproduced on this image.
 
 The knob, if a taller mode is ever wanted: `max_video_height` is
 `module_param(..., 0644)`, so booting with `bcm2835_v4l2.max_video_height=1232`
