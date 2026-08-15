@@ -182,8 +182,8 @@ repin_kernel() {
     # WQ_HIGHPRI, so a longer deadline is the only thing left to give it.
     #
     # It changes no request COUNT and no service interval, so it cannot disturb
-    # dwc2's target-frame clock — the failure that killed both uvc-overspeed
-    # above 1 and the pre-6.13 fixed request sizing. Costs ~33 KB and some
+    # dwc2's target-frame clock — the failure that killed both the reported-
+    # interval divisor and the pre-6.13 fixed request sizing. Costs ~33 KB and some
     # mid-frame latency; ureq->last_buf still forces an interrupt at the end of
     # every buffer, so buffer turnaround is unchanged. NOT YET MEASURED.
     #
@@ -213,30 +213,36 @@ repin_kernel() {
 # every frame off its 15 fps default and cut it into 534 isochronous slots that
 # all had to land. See the patch header.
 #
-# 0010 also DIVIDES the interval it reports, by /boot/uvc-overspeed. THE DEFAULT
-# IS 1 AND MUST STAY 1 — see below; the knob survives only because it produced
-# the measurement that explained the whole failure.
-# USB slots arrive every 125 us whatever we report, so nreq is also the number
-# of microframes a frame occupies: at the true 30 fps interval that is 267 slots
-# = 33.375 ms of wire for a 33.33 ms frame period, a 100.1% duty cycle with no
-# slack for a missed slot to be made up in. Halving it drains each frame in
-# 16.8 ms and leaves 16.5 ms of idle wire, while still offering 135 KB/frame
-# against a measured worst frame of 24 KB.
+# 0010 reports that interval UNCHANGED, and the reason is worth keeping here
+# because scaling it is the obvious next idea. USB slots arrive every 125 us
+# whatever we report, so nreq is also the number of microframes a frame
+# occupies: at the true 30 fps interval that is 267 slots = 33.375 ms of wire
+# for a 33.33 ms frame period, a 100.1% duty cycle with no slack for a missed
+# slot to be made up in. Reporting half drains each frame in 16.8 ms and leaves
+# 16.5 ms of idle wire, while still offering 135 KB/frame against a measured
+# worst frame of 24 KB. Every number in that argument is favourable.
 #
-# MEASURED 2026-08-15, and the mechanism is dwc2. dwc2_gadget_incr_frame_num()
-# advances target_frame by hs_ep->interval PER REQUEST SUBMITTED, and
-# dwc2_hsotg_start_req() drops any request whose target frame has already
-# passed (-ENODATA). Submit fewer requests than there are service intervals and
-# the target falls behind wall-clock, after which everything is dropped:
+# MEASURED 2026-08-15, and it is wrong. The mechanism is dwc2:
+# dwc2_gadget_incr_frame_num() advances target_frame by hs_ep->interval PER
+# REQUEST SUBMITTED, and dwc2_hsotg_start_req() drops any request whose target
+# frame has already passed (-ENODATA). Submit fewer requests than there are
+# service intervals and the target falls behind wall-clock, after which
+# everything is dropped:
 #
-#     divisor 1  → 8010 req/s ≈ the 8000/s dwc2 expects → 30.6 fps
-#     divisor 2  → 4020 req/s, half                     → 6 fps with freezes
-#     ~12/frame  →  360 req/s (tried via a kernel patch) → dead
+#     true interval → 8010 req/s ≈ the 8000/s dwc2 expects → 30.6 fps
+#     halved        → 4020 req/s, half                     → 6 fps with freezes
+#     ~12/frame     →  360 req/s (tried via a kernel patch) → dead
 #
 # So nreq is not a bandwidth budget — it is one request per service interval,
 # and the 100.1% duty cycle is mandatory. There is no slack to win here. The
 # only knob that cuts the submission rate WITHOUT breaking dwc2's clock is
 # /boot/uvc-interval, which divides nreq and the service interval alike.
+#
+# A /boot/uvc-overspeed knob carried that divisor from 2026-08-15 until it was
+# removed the same day, defaulted to 1 with "leave it there" beside it. Every
+# setting it accepted above the default broke the camera, which makes it a trap
+# rather than a tuning surface. The measurement it produced is the table above
+# and needed no code to survive.
 # ---------------------------------------------------------------------------
 PINNED_UVC_SHA=e9a733fe5c4a7fcb48e963e8d994bc33d24d814e
 

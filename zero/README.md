@@ -184,7 +184,13 @@ edit rather than an image rebuild:
 | --- | --- | --- |
 | `/boot/uvc-nbufs` | 8 | `-n` to uvc-gadget, the V4L2 buffer count. Upstream default is 2, the minimum the option accepts. |
 | `/boot/uvc-interval` | **3** | the isochronous endpoint's `bInterval`. **The only knob that safely reduces the request rate** — it divides `nreq` and the service interval by the same factor, so dwc2's target-frame clock still tracks wall-clock. At 3 the Zero submits 2000 requests/s instead of 8000 and the endpoint still offers 68 KB/frame (16 Mbps). |
-| `/boot/uvc-overspeed` | 1 — **leave it there** | divisor on the frame interval reported to `f_uvc`. Anything above 1 breaks dwc2, see below. Kept only because it produced the measurement that explained the failure. |
+| `/boot/uvc-maxpacket` | 1024 | the isochronous endpoint's `wMaxPacketSize`. **Leave it.** 3072 asks for high-bandwidth isochronous (3 transactions per microframe), which `f_uvc` will advertise but dwc2 then needs a dedicated TX FIFO of `maxpacket × mult` = 3072 bytes to serve — more than the Zero's controller has to give one endpoint. Raising `/boot/uvc-interval` is the supported way to change what the endpoint offers per frame. |
+
+A fourth, `/boot/uvc-overspeed`, existed for part of 2026-08-15 and was
+removed. It divided the frame interval reported to `f_uvc`, and every value it
+accepted above its default of 1 broke the camera — see the dwc2 table below,
+which is what it was built to produce. A knob whose only non-default settings
+break the device is a trap; the finding survives without it.
 
 `nreq` is not a bandwidth budget. `dwc2_gadget_incr_frame_num()` advances the
 endpoint's target frame by `hs_ep->interval` **per request submitted**, and
@@ -194,8 +200,8 @@ target falls behind wall-clock, after which every request is dropped on arrival:
 
 | requests/s at 30 fps | vs the 8000/s dwc2 expects | result |
 | --- | --- | --- |
-| 8010 (`overspeed 1`) | matches | 30.6 fps |
-| 4020 (`overspeed 2`) | half | 6 fps, minute-long freezes |
+| 8010 (true interval reported) | matches | 30.6 fps |
+| 4020 (half the interval reported) | half | 6 fps, minute-long freezes |
 | 360 (fixed-size requests) | 22× behind | stream dead |
 
 So `nreq = interval / (2^(bInterval-1) × 1250)` is **one request per service
@@ -236,7 +242,7 @@ requests and that completion is what re-arms the submit kthread, so the cap —
 Miss it and dwc2 finds nothing queued when the target frame elapses. The submit
 path is already `SCHED_FIFO` and the pump workqueue already `WQ_HIGHPRI`, so a
 longer deadline is the only thing left to give it. The patch changes no request
-count and no service interval, so unlike `uvc-overspeed` it cannot disturb
+count and no service interval, so unlike a scaled frame interval it cannot disturb
 dwc2's clock. **Not yet measured** — 3 events in 690 frames is a thin baseline,
 so shoot a long run before and after.
 

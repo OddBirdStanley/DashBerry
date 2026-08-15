@@ -1,5 +1,5 @@
 From: DashBerry <zero/README.md>
-Subject: [PATCH] uvc: tell the gadget the frame interval, and overspeed it
+Subject: [PATCH] uvc: tell the gadget the frame interval
 
 f_uvc sizes its USB requests from video->interval, and since Linux 6.13 that
 one number decides how many isochronous slots a video frame is cut across:
@@ -41,57 +41,20 @@ the host with. This hands the same value to the gadget, at COMMIT/SET time,
 which is after the format is applied and before STREAMON - and STREAMON is when
 uvc_video_alloc_requests() reads it.
 
-AND THEN DIVIDES IT, because the true interval is not a safe transmission plan.
-USB slots arrive every 125 us regardless of what we report, so nreq is also the
-number of microframes a frame occupies: 267 slots for a 33.33 ms frame period
-is 33.375 ms of wire, a 100.1% duty cycle with no slack at all. Measured
-2026-08-15 with the interval correct and the divisor at 1, on 720p30 H.264:
-
-    frames in the recording                689
-    frames arriving as 39-63 byte stubs     96   in bursts of six, one
-                                                 timestamp per burst - the
-                                                 queued buffers being flushed
-    packets carrying UVC_STREAM_ERR        213   ~1.9 per stub frame, i.e.
-                                                 f_uvc truncated them itself;
-                                                 the host lost nothing
-
-Halving the reported interval halves nreq: the frame drains in 16.8 ms and
-leaves 16.5 ms of idle wire behind it, while still offering 135 KB per frame
-against a measured worst frame of 24 KB. The divisor is read from
-/boot/uvc-overspeed, like /boot/uvc-nbufs and /boot/uvc-interval, so it can be
-swept on the card.
-
-Divisor 2 was then measured. It cuts truncation - stub frames 96 -> 22, worst
-burst 6 -> 3, decoder errors 125 -> 70 - and collapses delivery to 6.02 fps,
-freezing for about a minute mid-run. Driving the request count lower still, via
-a kernel patch that restored pre-6.13 fixed-size requests (~12 per frame),
-stalled the stream outright.
-
-That gradient is dwc2:
-
-	dwc2_gadget_incr_frame_num():	target_frame += hs_ep->interval
-	dwc2_hsotg_start_req():		if (dwc2_gadget_target_frame_elapsed())
-						complete(-ENODATA); return;
-
-hs_ep->interval is 1 << (bInterval - 1) microframes, and dwc2 advances its
-target frame by that much PER REQUEST SUBMITTED. Submit fewer requests than
-there are service intervals and the target falls behind wall-clock, after which
-every request is dropped on arrival:
-
-	divisor   reqs/s at 30 fps   vs the 8000/s dwc2 expects   result
-	    1           8010         matches                      30.6 fps
-	    2           4020         half                         6 fps, freezes
-	  (12 reqs/frame)   360      22x behind                   dead
-
-So nreq is not a bandwidth budget - it is one request per service interval, and
-the 100.1% duty cycle is mandatory rather than unfortunate. THE DEFAULT IS 1 AND
-SHOULD STAY 1. The knob is kept only because it produced the measurement that
-explained this. The way to cut the submission rate without breaking dwc2's clock
-is /boot/uvc-interval, which divides nreq and the service interval by the same
-factor.
+It is handed over UNCHANGED, and the code comment says at length why, because
+scaling it is the obvious next idea and it is wrong. Between 2026-08-15 and
+this commit a /boot/uvc-overspeed knob carried a divisor for exactly that. It
+defaulted to 1 with "leave it there" written beside it, because every setting
+above 1 breaks the camera: dwc2 advances its target frame PER REQUEST
+SUBMITTED, so under-submitting makes the target fall behind wall-clock and
+every subsequent request is dropped on arrival. Divisor 2 measured 6.02 fps
+with minute-long freezes. The knob is removed here - a tunable whose only
+non-default settings break the device is a trap, not a tuning surface - and
+the finding it produced is preserved in the comment, where it costs nothing
+and cannot be set to 2.
 
 video->interval reaches no descriptor - only uvc_video_prep_requests() and
-VIDIOC_G_PARM read it - so the host cannot see the divisor and the negotiated
+VIDIOC_G_PARM read it - so the host cannot see this value and the negotiated
 dwFrameInterval is unchanged.
 
 Applies to peterbay/uvc-gadget @ e9a733fe5c4a7fcb48e963e8d994bc33d24d814e,
@@ -100,102 +63,10 @@ the SHA package/piwebcam/piwebcam.mk pins.
 diff --git a/uvc-gadget.c b/uvc-gadget.c
 --- a/uvc-gadget.c
 +++ b/uvc-gadget.c
-@@ -894,6 +894,160 @@
+@@ -894,6 +894,108 @@
      return v4l2_get_format(dev);
  }
  
-+/*
-+ * How much faster than real time to tell the gadget it is streaming.
-+ *
-+ * nreq is derived from video->interval, and USB slots arrive every 125 us no
-+ * matter what, so nreq is also the number of microframes a frame occupies. At
-+ * the true interval that is DIV_ROUND_UP(333333, 1250) = 267 slots for a
-+ * 33.33 ms frame period - 33.375 ms of wire, a 100.1% duty cycle with no slack
-+ * whatsoever. A missed isochronous slot then has nowhere to be made up: f_uvc
-+ * sets UVC_QUEUE_DROP_INCOMPLETE and uvc_video_encode_isoc() ends the buffer
-+ * where it stands.
-+ *
-+ * Reporting a shorter interval than reality shrinks nreq proportionally, so the
-+ * frame drains early and leaves idle wire behind it for the pump to recover in.
-+ * Byte capacity - nreq * (req_size - 12) - falls with it, but there is a lot to
-+ * give away:
-+ *
-+ *      divisor   nreq   drain     slack      capacity   vs 8 Mbps @ 30 fps
-+ *          1      267   33.4 ms    -0.1 ms    270 KB       8.1x
-+ *          2      134   16.8 ms   +16.5 ms    135 KB       4.1x
-+ *          3       89   11.1 ms   +22.2 ms     90 KB       2.7x
-+ *
-+ * Measured 2026-08-15 at divisor 1 (i.e. before this knob existed): 96 of 689
-+ * frames arrived as 39-63 byte stubs, in bursts of six, each burst sharing one
-+ * timestamp - the six queued buffers being flushed after a stall. 213 packets
-+ * carried UVC_STREAM_ERR, ~1.9 per stub frame, which is f_uvc reporting that it
-+ * truncated them itself rather than the host losing anything.
-+ *
-+ * Divisor 2 was then measured on the same bench. It cuts truncation exactly as
-+ * the arithmetic says it should - and breaks pacing in a way the arithmetic does
-+ * not explain at all:
-+ *
-+ *                          divisor 1        divisor 2
-+ *      stub frames         96 (13.9%)       22 (3.2%)
-+ *      worst stub burst    6                3
-+ *      median slice        11652 B          18241 B
-+ *      decoder errors      125              70
-+ *      delivered rate      30.6 fps         6.0 fps
-+ *
-+ * The mechanism is dwc2, and it means ANY divisor above 1 is wrong:
-+ *
-+ *     dwc2_gadget_incr_frame_num():  target_frame += hs_ep->interval
-+ *     dwc2_hsotg_start_req():        if (dwc2_gadget_target_frame_elapsed())
-+ *                                            complete(-ENODATA); return;
-+ *
-+ * hs_ep->interval is 1 << (bInterval - 1) microframes, and dwc2 advances its
-+ * target frame by exactly that much PER REQUEST SUBMITTED. Submit fewer
-+ * requests than there are service intervals and the target falls behind
-+ * wall-clock, at which point every request is dropped on arrival. It is not a
-+ * bandwidth budget, it is a clock the gadget has to keep wound.
-+ *
-+ *      divisor   reqs/s at 30 fps   vs the 8000/s dwc2 expects   result
-+ *          1          8010          matches                      30.6 fps
-+ *          2          4020          half                         6 fps, freezes
-+ *      (12 reqs/frame, via the fixed_req_size kernel patch, gave 360/s: dead.)
-+ *
-+ * So nreq = interval / (2^(bInterval-1) * 1250) is not a smoothing heuristic -
-+ * it is one request per service interval, and the 100.1% duty cycle is
-+ * mandatory rather than unfortunate. There is no slack to be won here.
-+ *
-+ * THE DEFAULT IS 1 AND SHOULD STAY 1. This knob is kept only because it is what
-+ * produced the measurement that explained the whole thing; the way to reduce
-+ * the submission rate without breaking dwc2's clock is /boot/uvc-interval,
-+ * which divides nreq and the service interval by the SAME factor.
-+ */
-+#define UVC_OVERSPEED_PATH    "/boot/uvc-overspeed"
-+#define UVC_OVERSPEED_DEFAULT 1
-+#define UVC_OVERSPEED_MAX     8
-+
-+static unsigned int uvc_overspeed(void)
-+{
-+    static unsigned int cached = 0;
-+    unsigned int value;
-+    FILE * fp;
-+
-+    if (cached) {
-+        return cached;
-+    }
-+
-+    cached = UVC_OVERSPEED_DEFAULT;
-+
-+    fp = fopen(UVC_OVERSPEED_PATH, "r");
-+    if (fp) {
-+        if (fscanf(fp, "%u", &value) == 1
-+            && value >= 1 && value <= UVC_OVERSPEED_MAX) {
-+            cached = value;
-+        }
-+        fclose(fp);
-+    }
-+
-+    return cached;
-+}
-+
 +/*
 + * Tell the UVC gadget the frame interval it is streaming at.
 + *
@@ -215,12 +86,60 @@ diff --git a/uvc-gadget.c b/uvc-gadget.c
 + *
 + * The interval is already in hand: uvc_fill_streaming_control() reads it from
 + * the frame's dwDefaultFrameInterval. This just hands it over.
++ *
++ * DO NOT SCALE IT, and the reason is worth the space because the arithmetic
++ * argues loudly for scaling it. USB slots arrive every 125 us no matter what we
++ * report, so nreq is also the number of microframes a frame occupies: at the
++ * true interval that is DIV_ROUND_UP(333333, 1250) = 267 slots, 33.375 ms of
++ * wire against a 33.33 ms frame period. A 100.1% duty cycle, with no slack
++ * whatsoever for a missed slot to be made up in - and a missed slot costs the
++ * whole rest of the frame, since f_uvc sets UVC_QUEUE_DROP_INCOMPLETE and
++ * uvc_video_encode_isoc() ends the buffer where it stands. Reporting half the
++ * true interval halves nreq: the frame drains in 16.8 ms, leaves 16.5 ms of
++ * idle wire for the pump to recover in, and still offers 135 KB per frame
++ * against a measured worst frame of 24 KB. Every number there is favourable.
++ *
++ * It was measured on the bench, 2026-08-15. It cuts truncation exactly as
++ * predicted and destroys delivery:
++ *
++ *                          true interval    halved
++ *      stub frames         96 (13.9%)       22 (3.2%)
++ *      worst stub burst    6                3
++ *      median slice        11652 B          18241 B
++ *      decoder errors      125              70
++ *      delivered rate      30.6 fps         6.0 fps, minute-long freezes
++ *
++ * The mechanism is dwc2, and it rules out every divisor above 1:
++ *
++ *     dwc2_gadget_incr_frame_num():  target_frame += hs_ep->interval
++ *     dwc2_hsotg_start_req():        if (dwc2_gadget_target_frame_elapsed())
++ *                                            complete(-ENODATA); return;
++ *
++ * hs_ep->interval is 1 << (bInterval - 1) microframes, and dwc2 advances its
++ * target frame by exactly that much PER REQUEST SUBMITTED. Submit fewer
++ * requests than there are service intervals and the target falls behind
++ * wall-clock, at which point every request is dropped on arrival. nreq is not a
++ * bandwidth budget to be economised - it is a clock the gadget has to keep
++ * wound, and one request per service interval is the winding.
++ *
++ *      reqs/s at 30 fps   vs the 8000/s dwc2 expects   result
++ *          8010           matches                      30.6 fps
++ *          4020           half                         6 fps, freezes
++ *           360           22x behind                   stream dead
++ *
++ * (360/s came from a kernel patch restoring pre-6.13 fixed-size requests, ~12
++ * per frame. A third point on the same gradient, and the one that made the
++ * mechanism unmistakable rather than merely suspected.)
++ *
++ * So the 100.1% duty cycle is mandatory rather than unfortunate. The way to
++ * reduce the submission rate WITHOUT breaking dwc2's clock is /boot/uvc-interval
++ * - the endpoint's bInterval - because it divides nreq and the service interval
++ * by the same factor, leaving the clock tracking wall-clock. That knob is real
++ * and 3 is its measured answer; this one was a trap and is gone.
 + */
 +static int v4l2_apply_frame_interval(struct v4l2_device * dev, unsigned int frame_interval)
 +{
 +    struct v4l2_streamparm parm;
-+    unsigned int overspeed;
-+    unsigned int planned;
 +    int ret;
 +
 +    if (dev->is_streaming || !dev->fd || !frame_interval) {
@@ -228,32 +147,24 @@ diff --git a/uvc-gadget.c b/uvc-gadget.c
 +    }
 +
 +    /*
-+     * What we report is a transmission plan, not a claim about the sensor.
 +     * video->interval is read by uvc_video_prep_requests() and returned by
 +     * VIDIOC_G_PARM, and by nothing else - it reaches no descriptor, so the
 +     * host cannot see it and the negotiated dwFrameInterval is unaffected.
 +     */
-+    overspeed = uvc_overspeed();
-+    planned = frame_interval / overspeed;
-+    if (!planned) {
-+        planned = frame_interval;
-+    }
-+
 +    CLEAR(parm);
 +    parm.type = dev->buffer_type;
-+    parm.parm.output.timeperframe.numerator   = planned;
++    parm.parm.output.timeperframe.numerator   = frame_interval;
 +    parm.parm.output.timeperframe.denominator = 10000000;
 +
 +    ret = ioctl(dev->fd, VIDIOC_S_PARM, &parm);
 +    if (ret < 0) {
 +        printf("%s: Unable to set frame interval %u: %s (%d).\n",
-+            dev->device_type_name, planned, strerror(errno), errno);
++            dev->device_type_name, frame_interval, strerror(errno), errno);
 +        return ret;
 +    }
 +
-+    printf("%s: Setting frame interval to: %u (%u fps), real %u (%u fps), overspeed %ux\n",
-+        dev->device_type_name, planned, 10000000 / planned,
-+        frame_interval, 10000000 / frame_interval, overspeed);
++    printf("%s: Setting frame interval to: %u (%u fps)\n",
++        dev->device_type_name, frame_interval, 10000000 / frame_interval);
 +
 +    return 0;
 +}
@@ -261,7 +172,7 @@ diff --git a/uvc-gadget.c b/uvc-gadget.c
  static void v4l2_set_ctrl_value(struct control_mapping_pair ctrl, unsigned int ctrl_v4l2, int v4l2_ctrl_value)
  {
      struct v4l2_queryctrl queryctrl;
-@@ -1602,6 +1756,12 @@
+@@ -1602,6 +1698,12 @@
              v4l2_apply_format(&v4l2_dev, frame_format->video_format, frame_format->wWidth, frame_format->wHeight);
          }
          v4l2_apply_format(&uvc_dev, frame_format->video_format, frame_format->wWidth, frame_format->wHeight);
