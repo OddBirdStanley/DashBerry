@@ -484,3 +484,35 @@ a getty on it. This is the only one that owes nothing to `dwc2` or
 uvc-webcam` before provoking the failure shows the last line before the wedge.
 Wiring: USB-TTL GND to pin 6, its RX to pin 8 (Zero TXD), its TX to pin 10
 (Zero RXD), 115200 8N1.
+
+### What the daemon prints
+
+`uvc-gadget`'s own telemetry, all of it in `journalctl -u uvc-webcam` and all
+of it from `patches/`:
+
+```
+UVC: N incomplete frame(s) dropped so far (missed isochronous slots — …)
+TOTALS: N frames to UVC, N incomplete (dropped), N frames from sensor
+```
+
+`TOTALS` prints once per stream, at STREAM OFF, and it is the **only**
+gadget-side loss counter there is. It exists to be held against the host's
+side of the same stream — `uvcvideo` keeps frames, packets, empty, errors and
+invalid under `/sys/kernel/debug/usb/uvcvideo/<stream>/stats`. Read together
+they separate two faults that look identical from either end alone: a host
+reporting damage while the gadget reports none means the payload is lost or
+mangled **after** it leaves the Zero; both ends reporting the same losses
+means it happened here. That comparison is what identified the `vchiq` page
+stride, and it is worth making before believing any theory about the cable.
+
+**A third line, `TIMING:`, was removed on 2026-08-15** along with
+`patches/0008-uvc-report-where-the-start-up-gap-goes.patch`. It measured how
+long after `V4L2 STREAM ON` the first sensor frame was dequeued and then
+queued to UVC, to split a 10–15 s silence between the two `STREAM ON` log
+lines that three traces had shown. The question it was built for dissolved
+before it ever reported a number worth acting on: the symptom that motivated
+it — a 23 s capture yielding "No valid frames found before end of stream" —
+turned out to be `repeat_sequence_header=0`, so the card emitted SPS/PPS once
+and `h264parse` could never form an access unit (`a4a1fc0`). The bytes were on
+the wire the whole time. Nothing since has needed the start-up split, so the
+instrument goes and this paragraph stays in its place.
