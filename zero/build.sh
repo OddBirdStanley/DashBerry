@@ -33,12 +33,14 @@
 # rather than the hour it would otherwise take to find out.
 #
 # THE PART THAT IS NOT SETTLED
-# The kernel repin (5.10.11 → rpi-6.16.y) is the risk in this build, and it is
-# unproven at the time of writing: showmewebcam's buildroot pin predates 6.x
-# host-tool requirements, so buildroot itself may need bumping, and an ARMv6
-# Zero W has never been built or booted on that branch here. If it fights
-# back, KERNEL_BRANCH=rpi-6.12.y plus a backport of 7b5a5895 is the documented
-# fallback (see zero/README.md).
+# The kernel pin. This built and booted on rpi-6.16.y; it is now rpi-6.18.y,
+# for two f_uvc fixes that 6.16 will never get because they landed after it
+# went end-of-life (see zero/edits.sh section 1), and 6.18 has not been built
+# here yet. showmewebcam's buildroot pin also predates 6.x host-tool
+# requirements, so buildroot itself may need bumping. If it fights back,
+# KERNEL_BRANCH=rpi-6.16.y is the known-good branch, and
+# KERNEL_BRANCH=rpi-6.12.y plus a backport of 7b5a5895 is the documented
+# fallback below that (see zero/README.md).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -477,7 +479,7 @@ version        $VERSION
 built          $(date -u +%Y-%m-%dT%H:%M:%SZ)
 showmewebcam   $REF = $(git -C "$SMW_DIR" rev-parse HEAD)
 board          $BOARD
-kernel         ${KERNEL_BRANCH:-rpi-6.16.y} @ $(cat "$SMW_DIR/.dashberry-kernel-sha" 2>/dev/null || echo '?')
+kernel         ${KERNEL_BRANCH:-rpi-6.18.y} @ $(cat "$SMW_DIR/.dashberry-kernel-sha" 2>/dev/null || echo '?')
 host gcc       $(version_of gcc)
 host cmake     $(version_of cmake)
 host cflags    $HOST_CFLAGS

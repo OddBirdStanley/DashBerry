@@ -36,7 +36,7 @@ What it distinguishes:
              printf("UVC: %u incomplete frame(s) dropped so far "
                     "(missed isochronous slots — the stream continues)\n",
                     uvc_dropped_frames);
-@@ -1329,6 +1329,20 @@
+@@ -1329,6 +1329,28 @@
  
  static void uvc_handle_streamoff_event()
  {
@@ -50,8 +50,16 @@ What it distinguishes:
 +     * frames while the gadget reports none means the payload is being lost or
 +     * mangled AFTER it leaves here; both ends reporting the same losses means
 +     * it is happening on this side.
++     *
++     * The two counts that come from struct v4l2_device are unsigned long long
++     * and MUST be printed with %llu. With %u this line was varargs-mismatched:
++     * on 32-bit ARM EABI a 64-bit argument is 8-byte aligned and occupies two
++     * slots, so three %u conversions read padding and half-words instead of
++     * the three counters. That is why the frame counts printed 0 beside a
++     * credible drop count, and why INVESTIGATE-REAR-CORRUPTION.md said the
++     * other two "must not be trusted".
 +     */
-+    printf("TOTALS: %u frames to UVC, %u incomplete (dropped), %u frames from sensor\n",
++    printf("TOTALS: %llu frames to UVC, %u incomplete (dropped), %llu frames from sensor\n",
 +           uvc_dev.qbuf_count, uvc_dropped_frames, v4l2_dev.dqbuf_count);
 +
      if (settings.source_device == DEVICE_TYPE_V4L2) {

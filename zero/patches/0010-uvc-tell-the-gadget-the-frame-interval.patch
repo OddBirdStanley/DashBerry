@@ -1,0 +1,116 @@
+From: DashBerry <zero/README.md>
+Subject: [PATCH] uvc: tell the gadget the frame interval, or it plans for 15 fps
+
+f_uvc sizes its USB requests from video->interval, and since Linux 6.13 that
+one number decides how many isochronous slots a video frame is cut across:
+
+    uvc_video_prep_requests():
+        nreq = DIV_ROUND_UP(video->interval, 2^(bInterval-1) * 1250)
+    uvc_buffer_prepare():
+        req_payload_size = (bytesused + nreq * 12) / nreq
+
+video->interval has EXACTLY ONE WRITER in the whole driver - uvc_v4l2_s_parm(),
+i.e. VIDIOC_S_PARM on the UVC node - and that interface only arrived upstream in
+October 2024 (2fe7c94dcd09). This daemon predates it and never calls it, so
+video->interval keeps the value uvcg_video_init() left there:
+
+    video->interval = 666666;       /* 15 fps */
+
+On a high-speed gadget at bInterval 1 that is 534 requests per frame. A 42 KB
+H.264 frame becomes 534 packets of 91 bytes, one per 125 us microframe, taking
+66 ms of wire time for a frame the sensor delivers every 33 ms. Three
+consequences, all of which were measured on a Pi Zero W before the cause was
+known:
+
+  - The gadget cannot deliver more than 15 fps, whatever else is tuned. The
+    frame is spread over video->interval by construction, so bInterval,
+    maxpacket and buffer count all leave the ceiling exactly where it is.
+
+  - All 534 slots must land. On dwc2 a missed slot completes -ENODATA, f_uvc
+    sets UVC_QUEUE_DROP_INCOMPLETE, and uvc_video_encode_isoc() then ends the
+    buffer where it stands - so one miss discards the rest of the frame. 711 of
+    745 frames arrived truncated, and every recording decoded as a wall of
+    "bytestream -5" and "concealing N DC, N AC, N MV errors".
+
+  - req_payload_size is unbounded before Linux 6.19 (upstream 2edc1acb1a25), so
+    a frame larger than nreq * (req_size - 12) overruns the request buffer.
+
+The interval is already in hand: uvc_fill_streaming_control() reads it from the
+frame's dwDefaultFrameInterval and puts it in the streaming control it answers
+the host with. This hands the same value to the gadget, at COMMIT/SET time,
+which is after the format is applied and before STREAMON - and STREAMON is when
+uvc_video_alloc_requests() reads it.
+
+Applies to peterbay/uvc-gadget @ e9a733fe5c4a7fcb48e963e8d994bc33d24d814e,
+the SHA package/piwebcam/piwebcam.mk pins.
+---
+diff --git a/uvc-gadget.c b/uvc-gadget.c
+--- a/uvc-gadget.c
++++ b/uvc-gadget.c
+@@ -858,6 +858,53 @@
+     return v4l2_get_format(dev);
+ }
+ 
++/*
++ * Tell the UVC gadget the frame interval it is streaming at.
++ *
++ * f_uvc sizes its USB requests from video->interval, and since Linux 6.13 that
++ * decides how many isochronous slots a frame is cut across:
++ *
++ *     nreq = DIV_ROUND_UP(video->interval, 2^(bInterval-1) * 1250)
++ *     req_payload_size = (bytesused + nreq * 12) / nreq
++ *
++ * video->interval has exactly one writer in the whole driver - VIDIOC_S_PARM on
++ * the UVC node - and nothing here ever called it, so it kept the value
++ * uvcg_video_init() left there: 666666, i.e. 15 fps. A 30 fps frame was then
++ * spread over 534 requests of 91 bytes and 66 ms of wire time, the gadget could
++ * not deliver more than 15 fps whatever else was tuned, and a single missed
++ * isochronous slot out of the 534 truncated the frame - which is what the host
++ * saw as every frame decoding short.
++ *
++ * The interval is already in hand: uvc_fill_streaming_control() reads it from
++ * the frame's dwDefaultFrameInterval. This just hands it over.
++ */
++static int v4l2_apply_frame_interval(struct v4l2_device * dev, unsigned int frame_interval)
++{
++    struct v4l2_streamparm parm;
++    int ret;
++
++    if (dev->is_streaming || !dev->fd || !frame_interval) {
++        return -EINVAL;
++    }
++
++    CLEAR(parm);
++    parm.type = dev->buffer_type;
++    parm.parm.output.timeperframe.numerator   = frame_interval;
++    parm.parm.output.timeperframe.denominator = 10000000;
++
++    ret = ioctl(dev->fd, VIDIOC_S_PARM, &parm);
++    if (ret < 0) {
++        printf("%s: Unable to set frame interval %u: %s (%d).\n",
++            dev->device_type_name, frame_interval, strerror(errno), errno);
++        return ret;
++    }
++
++    printf("%s: Setting frame interval to: %u (%u fps)\n",
++        dev->device_type_name, frame_interval, 10000000 / frame_interval);
++
++    return 0;
++}
++
+ static void v4l2_set_ctrl_value(struct control_mapping_pair ctrl, unsigned int ctrl_v4l2, int v4l2_ctrl_value)
+ {
+     struct v4l2_queryctrl queryctrl;
+@@ -1458,6 +1505,12 @@
+             v4l2_apply_format(&v4l2_dev, frame_format->video_format, frame_format->wWidth, frame_format->wHeight);
+         }
+         v4l2_apply_format(&uvc_dev, frame_format->video_format, frame_format->wWidth, frame_format->wHeight);
++        /*
++         * ...and the frame interval, which is NOT part of the format. Without
++         * it f_uvc keeps its 15 fps default and cuts every frame into 534
++         * requests. See v4l2_apply_frame_interval().
++         */
++        v4l2_apply_frame_interval(&uvc_dev, frame_interval);
+     }
+ }
+ 

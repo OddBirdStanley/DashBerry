@@ -50,22 +50,47 @@ anchor() {
 # array. Frame-based format support was accepted upstream in Sept 2024
 # (commit 7b5a5895) and reaches the RPi tree at rpi-6.13.y.
 #
-# We take rpi-6.16.y, which needs NO kernel patch and still carries
+# We take rpi-6.18.y, which needs NO kernel patch for H.264 and still carries
 # drivers/staging/vc04_services/bcm2835-camera — the legacy MMAL driver this
 # image depends on for the sensor AND for the encoder controls (video_bitrate,
 # h264_i_frame_period, compression_quality, auto_exposure_bias).
+#
+# 6.18 AND NOT 6.16, which this built on first. f_uvc was reworked in 6.13 to
+# size its USB requests from the frame interval, and 6.16 carries two bugs in
+# that new code which 6.18 has the fixes for. Both are Cc: stable and both
+# landed after 6.16 went end-of-life, so 6.16 will never receive them:
+#
+#   2edc1acb1a25  clamp req_payload_size to req_size. Without it a frame larger
+#                 than nreq * (req_size - 12) memcpys past the end of a
+#                 kmalloc'd request buffer, in softirq context. On this card
+#                 that threshold is ~540 KB, which H.264 at 10 Mbps never
+#                 reaches and a large MJPEG frame can.
+#   010dc57cb516  interval_duration = 2^(bInterval-1) * 1250, not bInterval *
+#   56135c0c60b0  1250. dwc2 uses the exponent (gadget.c: hs_ep->interval =
+#                 1 << (bInterval - 1)); 6.16's f_uvc used it linearly, so the
+#                 two halves of the same kernel disagreed and every
+#                 /boot/uvc-interval above 1 over-committed the endpoint. That
+#                 is why raising it appeared to make the corruption worse and
+#                 was wrongly written off — see INVESTIGATE-REAR-CORRUPTION
+#                 .response.md §3.
+#
+# NOTE the repin ALONE fixes neither the frame rate nor the corruption. It
+# repairs the overflow and the bInterval knob; the thing that was actually
+# breaking every frame is that nothing told f_uvc the frame interval at all, so
+# it planned 534 requests per frame off its 15 fps default. That is
+# patches/0010, on the uvc-gadget side, and the two go together.
 #
 # The branch is resolved to a SHA here, not left as a branch name: buildroot's
 # $(call github,...) will happily fetch a moving branch, and a card you cannot
 # rebuild byte for byte is not a card you can debug.
 #
-# UNVERIFIED, and this is the risk in the whole image: no ARMv6 Zero W has
-# been built or booted on 6.16 here, board/linux-base.config was written for
-# 5.10, and showmewebcam's buildroot submodule predates 6.x host tooling.
-# Fallback: KERNEL_BRANCH=rpi-6.12.y (RPi's protected branch) plus a backport
-# of 7b5a5895.
+# Fallbacks, in order: KERNEL_BRANCH=rpi-6.16.y is where this image was built
+# and booted, and is fine as long as /boot/uvc-interval stays at 1;
+# KERNEL_BRANCH=rpi-6.12.y (RPi's protected branch) predates the f_uvc rework
+# entirely and cannot exhibit any of it, but needs a backport of 7b5a5895 for
+# framebased.
 # ---------------------------------------------------------------------------
-KERNEL_BRANCH=${KERNEL_BRANCH:-rpi-6.16.y}
+KERNEL_BRANCH=${KERNEL_BRANCH:-rpi-6.18.y}
 
 repin_kernel() {
     anchor "$CFG" "BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION" "the kernel pin"
@@ -138,13 +163,19 @@ repin_kernel() {
 }
 
 # ---------------------------------------------------------------------------
-# 2. uvc-gadget — teach it the H.264 fourcc, via a buildroot patch.
+# 2. uvc-gadget — teach it the H.264 fourcc and the frame interval, via
+#    buildroot patches.
 #
 # piwebcam.mk fetches peterbay/uvc-gadget at a pinned SHA, so there is nothing
 # in this checkout to sed. Buildroot applies package/<pkg>/*.patch to the
-# fetched source; the patch in zero/patches/ was generated against that same
-# SHA, so if the pin moves, the patch fails to apply and the build stops —
-# which is what should happen.
+# fetched source; the patches in zero/patches/ were generated against that same
+# SHA, so if the pin moves, they fail to apply and the build stops — which is
+# what should happen.
+#
+# 0010 is the one that matters most and it is not about H.264 at all: nothing
+# in this daemon ever set the UVC gadget's frame interval, so f_uvc planned
+# every frame off its 15 fps default and cut it into 534 isochronous slots that
+# all had to land. See the patch header.
 # ---------------------------------------------------------------------------
 PINNED_UVC_SHA=e9a733fe5c4a7fcb48e963e8d994bc33d24d814e
 
@@ -156,15 +187,15 @@ patch_uvc_gadget() {
     if [ "$pinned" != "$PINNED_UVC_SHA" ]; then
         die "uvc-gadget's pin moved: piwebcam.mk now wants
     $pinned
-  but zero/patches/0001-*.patch was generated against
+  but zero/patches/*.patch were generated against
     $PINNED_UVC_SHA
-  Regenerate the patch against the new SHA before building. It adds one
-  branch to configfs_video_format() ('h' -> V4L2_PIX_FMT_H264) and widens a
-  diagnostic filter; both are three-line changes, but a patch that applies
-  with fuzz to a moved file is exactly how a card ends up streaming the
-  wrong thing."
+  Regenerate them against the new SHA before building. 0001 adds one branch to
+  configfs_video_format() ('h' -> V4L2_PIX_FMT_H264) and widens a diagnostic
+  filter; 0010 adds a VIDIOC_S_PARM on the UVC node beside the existing
+  VIDIOC_S_FMT. All small — but a patch that applies with fuzz to a moved file
+  is exactly how a card ends up streaming the wrong thing."
     fi
-    say "uvc-gadget → +h264 (patch into package/piwebcam/)"
+    say "uvc-gadget → +h264, +frame interval (patches into package/piwebcam/)"
     cp "$HERE"/patches/*.patch "$PIWEBCAM/"
 }
 
@@ -470,12 +501,13 @@ open(p, 'w').write(s)
 PY
 
     # --- isochronous endpoint sizing -------------------------------------
-    # f_uvc defaults to bInterval 1, which asks the gadget for a USB request
-    # every 125 us microframe: 8000 a second, forever, whether or not there is
-    # a frame's worth to send. On a 1 GHz single-core ARM11 also running the
-    # camera and the encoder, it cannot keep up, and dwc2 completes each late
-    # request with -ENODATA ("target frame elapsed"). The payload in that slot
-    # is simply never sent.
+    # bInterval sets how often the host services the video endpoint: every
+    # 2^(bInterval-1) microframes, so 125 us at 1 and 500 us at 3. Since 6.13
+    # it also sets how many requests f_uvc cuts a frame into, because
+    # uvc_video_prep_requests() divides the frame interval by the service
+    # period. EVERY slot in that count must land — on dwc2 a missed one
+    # completes -ENODATA and f_uvc ends the frame where it stands — so this is
+    # the knob that decides how exposed a frame is.
     #
     # Measured 2026-08-15, both ends agreeing for the first time:
     #   gadget: TOTALS: 711 incomplete (dropped)
@@ -483,23 +515,30 @@ PY
     # 711 of 745 frames — 95% — lost payload, which is why every recording
     # decodes as "bytestream -5" and "concealing N DC, AC, MV errors".
     #
-    # THAT THEORY WAS TESTED AND IS WRONG. bInterval 3 and 6 were both tried:
-    # the corruption was unchanged, and 6 also cut delivery to 15 fps. If the
-    # request rate were the binding constraint, cutting it to a third would
-    # have moved the loss substantially. It did not, so the loss is not
-    # rate-driven and the default is back to f_uvc's 1.
+    # bInterval 3 and 6 were tried against that and made it worse, which read
+    # as "the rate is not the mechanism" and was wrong twice over:
     #
-    # The rate does set a CEILING, and that is what the 15 fps was: capacity is
-    # nreq x 1012 bytes per frame period, so 270 KB at bInterval 1, 90 KB at 3
-    # and 45 KB at 6. A 10 Mbps stream (the card's default, since nothing
-    # pushes REAR_BITRATE on a bench PC) wants ~42 KB per frame at 30 fps, so 6
-    # leaves almost no margin for a large IDR and frames start overrunning
-    # their period.
+    #   - 6.16's f_uvc computed the service period as bInterval * 1250 rather
+    #     than 2^(bInterval-1) * 1250, so it planned for more slots than the
+    #     hardware gives and any value above 1 over-committed. Fixed by the
+    #     repin to rpi-6.18.y.
+    #   - nothing set video->interval, so the plan was 534 requests per frame
+    #     whatever bInterval said, and the 15 fps ceiling came from that rather
+    #     than from bandwidth. Fixed by patches/0010.
     #
-    # These stay tunable because they are worth having, not because they are
-    # the fix. maxpacket was never raised from 1024: 3072 asks for
-    # high-bandwidth isoc, which changes how much rides in a slot but not how
-    # often one must be filled, and on this evidence neither is the problem.
+    # THE DEFAULT STAYS 1. With both fixes in, 30 fps at bInterval 1 is 267
+    # slots per frame over 33.2 ms — correct, and one change at a time. If
+    # frames still arrive truncated, `echo 3 > /boot/uvc-interval` on the card
+    # cuts that to 67 slots and the interrupt rate to 2000/s with no rebuild,
+    # at the cost of a 16.4 Mbps endpoint ceiling that H.264 fits inside and
+    # MJPEG does not. cam/rear-uvc-model.sh --table prints the whole sweep.
+    #
+    # maxpacket stays 1024. 3072 asks for high-bandwidth isoc, which f_uvc
+    # answers by FORCING bInterval to 1, and which dwc2 then refuses outright:
+    # it needs a dedicated TX FIFO of maxpacket * mult = 3072 bytes, and the
+    # Pi's dwc2-overlay.dts declares g-tx-fifo-size = <512 512 512 512 512 256
+    # 256> in 32-bit words, so the largest FIFO on the chip is 2048. The
+    # endpoint would fail to enable with -ENOMEM and nothing would stream.
     say "multi-gadget.sh → isoc bInterval/maxpacket from /boot (defaults 1/1024)"
     python3 - "$f" <<'PY'
 import sys

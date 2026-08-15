@@ -110,7 +110,7 @@ depending on which adapter is in the run that day.
 
 | | |
 |---|---|
-| **Kernel** | `raspberrypi/linux` **`rpi-6.16.y`**, repinned from showmewebcam's `6af8ae32` (5.10.11) |
+| **Kernel** | `raspberrypi/linux` **`rpi-6.18.y`**, repinned from showmewebcam's `6af8ae32` (5.10.11) |
 | **Format** | H.264 over UVC, via the kernel's `framebased` configfs format |
 | **Control** | `rear-ctld` on a second CDC-ACM function (`/dev/ttyGS1`), a systemd unit ordered after the gadget comes up |
 | **Console** | the first CDC-ACM function (`/dev/ttyGS0`), unchanged — `post-build.sh` puts an autologin getty there |
@@ -126,17 +126,31 @@ static const char * const uvcg_format_names[] = { "uncompressed", "mjpeg", };
 No `framebased`, no H.264, no `guidFormat` — **there is no configfs directory
 the gadget could advertise H.264 in**. Frame-based format support was accepted
 upstream in September 2024 (`7b5a5895`) and lands in the RPi tree at
-`rpi-6.13.y`. We take `rpi-6.16.y`: it needs **no kernel patch at all**, and it
-still carries `drivers/staging/vc04_services/bcm2835-camera`, the legacy MMAL
-driver this image depends on for the sensor and for every encoder control.
+`rpi-6.13.y`. We take `rpi-6.18.y`: it needs **no kernel patch at all** for
+H.264, and it still carries `drivers/staging/vc04_services/bcm2835-camera`, the
+legacy MMAL driver this image depends on for the sensor and for every encoder
+control.
 
-> **UNVERIFIED at the time of writing.** No ARMv6 Zero W has been built or
-> booted on `rpi-6.16.y` here, showmewebcam's buildroot pin predates 6.x host
-> tooling and may itself need bumping, and the legacy-camera firmware path
-> (`start_x=1`, MMAL) has not been confirmed on that branch. **The documented
-> fallback is `KERNEL_BRANCH=rpi-6.12.y` plus a backport of `7b5a5895`** —
-> 6.12 is RPi's protected long-term branch and the line `bcm2835-v4l2` is
-> known good on. Try it the moment 6.16 costs more than an afternoon.
+**6.18 and not 6.16, which this first built on.** 6.13 reworked f_uvc to size
+its USB requests from the frame interval, and 6.16 carries two bugs in that new
+code — an unclamped `req_payload_size` that memcpys past a request buffer on a
+large frame, and a `bInterval` treated as linear where dwc2 treats it as the
+exponent it is. Both fixes are `Cc: stable`
+([`2edc1acb1a25`](https://github.com/torvalds/linux/commit/2edc1acb1a25),
+[`010dc57cb516`](https://github.com/torvalds/linux/commit/010dc57cb516),
+[`56135c0c60b0`](https://github.com/torvalds/linux/commit/56135c0c60b0)) and
+both landed after 6.16 went end-of-life, so 6.16 will never receive them.
+`INVESTIGATE-REAR-CORRUPTION.response.md` has the reasoning; `zero/edits.sh`
+section 1 has the short version.
+
+> **UNVERIFIED at the time of writing.** No ARMv6 Zero W has been built on
+> `rpi-6.18.y` here — 6.16 is the branch this image was built and booted on.
+> showmewebcam's buildroot pin predates 6.x host tooling and may itself need
+> bumping. **Fallbacks, in order:** `KERNEL_BRANCH=rpi-6.16.y` is known good
+> and is safe as long as `/boot/uvc-interval` stays at 1; below that,
+> `KERNEL_BRANCH=rpi-6.12.y` plus a backport of `7b5a5895` — 6.12 is RPi's
+> protected long-term branch, the line `bcm2835-v4l2` is known good on, and its
+> f_uvc predates the whole request rework and so cannot exhibit any of it.
 
 The pin is a GitHub **tarball**, not a git ref, and `edits.sh` resolves the
 branch to a SHA before substituting it — a card you cannot rebuild byte for
@@ -149,7 +163,8 @@ widens two descriptor bitfields that `f_uvc.c` hardcoded — camera terminal
 and those are what make the seven UVC controls visible to a host at all. Since
 ~5.15 both are **writable configfs attributes**
 (`control/terminal/camera/default/bmControls`,
-`control/processing/default/bmControls`; verified in `rpi-6.16.y`'s
+`control/processing/default/bmControls`; verified in `rpi-6.16.y` and
+`rpi-6.18.y`'s
 `uvc_configfs.c`), so `multi-gadget.sh` writes the identical values from
 userspace and the host-visible control surface is unchanged. DashBerry does
 not need those controls — `rear-ctl` reaches *every* v4l2 control over the
@@ -164,6 +179,14 @@ Userspace changes, all in `edits.sh` except the first:
   (`zero/patches/`), because `piwebcam.mk` fetches uvc-gadget from a pinned
   SHA rather than vendoring it; buildroot applies `package/<pkg>/*.patch`, and
   `edits.sh` refuses to build if that pin has moved out from under the patch.
+  A second patch (`0010`) gives the gadget its **frame interval**, via
+  `VIDIOC_S_PARM` on `/dev/video1`. That is not cosmetic: `video->interval` is
+  what f_uvc divides by the endpoint service period to decide how many
+  isochronous slots to cut a frame across, its only writer is that ioctl, and
+  this daemon never called it — so the gadget planned every frame off its
+  15 fps default, cut it into 534 requests of 91 bytes, and lost the whole
+  remainder of the frame to the first missed slot. It is the fix for the
+  corruption in `INVESTIGATE-REAR-CORRUPTION.md`.
 - **`multi-gadget.sh`** needs four changes, and only the first is obvious:
   its parser greps `^(mjpeg|uncompressed)`, so an `h264` line is silently
   dropped; `config_frame` writes `dwMaxVideoFrameBufferSize`, which the
