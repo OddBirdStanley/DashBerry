@@ -190,16 +190,22 @@ repin_kernel() {
 # every frame off its 15 fps default and cut it into 534 isochronous slots that
 # all had to land. See the patch header.
 #
-# 0010 also DIVIDES the interval it reports, by /boot/uvc-overspeed (default 2).
+# 0010 also DIVIDES the interval it reports, by /boot/uvc-overspeed (default 1,
+# i.e. off).
 # USB slots arrive every 125 us whatever we report, so nreq is also the number
 # of microframes a frame occupies: at the true 30 fps interval that is 267 slots
 # = 33.375 ms of wire for a 33.33 ms frame period, a 100.1% duty cycle with no
 # slack for a missed slot to be made up in. Halving it drains each frame in
 # 16.8 ms and leaves 16.5 ms of idle wire, while still offering 135 KB/frame
-# against a measured worst frame of 24 KB. The default of 2 is arithmetic, NOT
-# a measurement — set /boot/uvc-overspeed to 1 to reproduce the behaviour the
-# 2026-08-15 bench run measured (96 of 689 frames arriving as 39-63 byte stubs,
-# in bursts of six, with 213 packets carrying UVC_STREAM_ERR).
+# against a measured worst frame of 24 KB.
+#
+# MEASURED 2026-08-15, and the default is 1 because of it. Divisor 2 cuts
+# truncation exactly as predicted — stub frames 96 → 22, worst burst 6 → 3,
+# decoder errors 125 → 70 — and collapses delivery to 6.02 fps, freezing for
+# about a minute mid-capture. Nothing in prep_requests/pump/hw_submit accounts
+# for a stall that long and nothing else reads video->interval, so the
+# mechanism is NOT understood. 2 stays reachable; do not make it the default
+# until it is.
 # ---------------------------------------------------------------------------
 PINNED_UVC_SHA=e9a733fe5c4a7fcb48e963e8d994bc33d24d814e
 

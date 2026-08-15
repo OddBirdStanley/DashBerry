@@ -184,13 +184,31 @@ edit rather than an image rebuild:
 | --- | --- | --- |
 | `/boot/uvc-nbufs` | 8 | `-n` to uvc-gadget, the V4L2 buffer count. Upstream default is 2, the minimum the option accepts. |
 | `/boot/uvc-interval` | 1 | the isochronous endpoint's `bInterval`. Raising it does **not** buy recovery room — `nreq` shrinks and the slot period grows by the same factor, so wall-clock drain time is unchanged and byte capacity falls. |
-| `/boot/uvc-overspeed` | 2 | divisor applied to the frame interval reported to `f_uvc`, which is what does buy recovery room. See `patches/0010`. |
+| `/boot/uvc-overspeed` | 1 (off) | divisor applied to the frame interval reported to `f_uvc`, which is what does buy recovery room. See `patches/0010`. |
 
 `uvc-overspeed` is the one to sweep. At 1 the gadget plans 267 requests for a
 33.33 ms frame period — 33.375 ms of wire, no slack, and a missed isochronous
 slot truncates the frame outright. At 2 it plans 134, drains in 16.8 ms and
 leaves 16.5 ms idle, still offering 135 KB per frame against a measured worst
-frame of 24 KB. **The default of 2 is arithmetic, not a measurement.**
+frame of 24 KB.
+
+Measured 2026-08-15:
+
+| | divisor 1 | divisor 2 |
+| --- | --- | --- |
+| stub frames | 96 (13.9%) | 22 (3.2%) |
+| worst stub burst | 6 | 3 |
+| median slice | 11,652 B | 18,241 B |
+| decoder errors | 125 | 70 |
+| delivered rate | 30.6 fps | **6.0 fps** |
+
+Divisor 2 cuts truncation exactly as the arithmetic predicts and collapses
+delivery, freezing for about a minute mid-capture and taking 114 s to collect
+690 frames that take 23 s at divisor 1. **Nothing in `uvc_video_prep_requests()`,
+`uvcg_video_pump()` or `uvcg_video_hw_submit()` accounts for a stall of that
+length, and nothing else in the driver reads `video->interval` — the mechanism
+is not understood.** The default is 1 for that reason. 2 stays reachable because
+it is the only change so far that has moved truncation.
 
 The pin is a GitHub **tarball**, not a git ref, and `edits.sh` resolves the
 branch to a SHA before substituting it — a card you cannot rebuild byte for

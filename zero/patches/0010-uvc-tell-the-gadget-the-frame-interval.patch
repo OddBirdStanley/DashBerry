@@ -59,8 +59,19 @@ Halving the reported interval halves nreq: the frame drains in 16.8 ms and
 leaves 16.5 ms of idle wire behind it, while still offering 135 KB per frame
 against a measured worst frame of 24 KB. The divisor is read from
 /boot/uvc-overspeed, like /boot/uvc-nbufs and /boot/uvc-interval, so it can be
-swept on the card. THE DEFAULT OF 2 IS ARITHMETIC, NOT A MEASUREMENT; 1
-reproduces the behaviour measured above.
+swept on the card.
+
+Divisor 2 was then measured, and it does cut truncation - stub frames 96 -> 22,
+worst burst 6 -> 3, decoder errors 125 -> 70, median slice 11652 -> 18241 bytes -
+while collapsing delivery to 6.02 fps, with the capture freezing for about a
+minute mid-run and taking 114 s to collect 690 frames that take 23 s at divisor
+1. Nothing in uvc_video_prep_requests(), uvcg_video_pump() or
+uvcg_video_hw_submit() accounts for a stall of that length, and nothing else in
+the driver reads video->interval, so THE MECHANISM IS NOT UNDERSTOOD.
+
+THE DEFAULT IS THEREFORE 1, which is the configuration measured at 30.6 fps. 2
+stays reachable because it is the only change so far that has moved truncation.
+Do not raise the default until the stall has an explanation.
 
 video->interval reaches no descriptor - only uvc_video_prep_requests() and
 VIDIOC_G_PARM read it - so the host cannot see the divisor and the negotiated
@@ -72,7 +83,7 @@ the SHA package/piwebcam/piwebcam.mk pins.
 diff --git a/uvc-gadget.c b/uvc-gadget.c
 --- a/uvc-gadget.c
 +++ b/uvc-gadget.c
-@@ -894,6 +894,128 @@
+@@ -894,6 +894,146 @@
      return v4l2_get_format(dev);
  }
  
@@ -103,13 +114,31 @@ diff --git a/uvc-gadget.c b/uvc-gadget.c
 + * carried UVC_STREAM_ERR, ~1.9 per stub frame, which is f_uvc reporting that it
 + * truncated them itself rather than the host losing anything.
 + *
-+ * THE DEFAULT OF 2 IS ARITHMETIC, NOT A MEASUREMENT. It is the smallest divisor
-+ * that buys real slack. 1 reproduces exactly the behaviour above. It is read
-+ * from /boot so sweeping it costs a card edit rather than an image rebuild, the
-+ * same as /boot/uvc-nbufs and /boot/uvc-interval.
++ * Divisor 2 was then measured on the same bench. It cuts truncation exactly as
++ * the arithmetic says it should - and breaks pacing in a way the arithmetic does
++ * not explain at all:
++ *
++ *                          divisor 1        divisor 2
++ *      stub frames         96 (13.9%)       22 (3.2%)
++ *      worst stub burst    6                3
++ *      median slice        11652 B          18241 B
++ *      decoder errors      125              70
++ *      delivered rate      30.6 fps         6.0 fps
++ *
++ * At divisor 2 the capture ran about 80 frames, froze for roughly a minute,
++ * then resumed, and took 114 s to collect the 690 frames that take 23 s at
++ * divisor 1. Nothing in uvc_video_prep_requests(), uvcg_video_pump() or
++ * uvcg_video_hw_submit() accounts for a stall of that length, and nothing else
++ * in the driver reads video->interval, so THE MECHANISM IS NOT UNDERSTOOD.
++ *
++ * THE DEFAULT IS THEREFORE 1 - the configuration known to deliver 30 fps - and
++ * 2 is left reachable because it is the only thing so far that has moved
++ * truncation. Do not raise the default until the stall has an explanation.
++ * It is read from /boot so sweeping it costs a card edit rather than an image
++ * rebuild, the same as /boot/uvc-nbufs and /boot/uvc-interval.
 + */
 +#define UVC_OVERSPEED_PATH    "/boot/uvc-overspeed"
-+#define UVC_OVERSPEED_DEFAULT 2
++#define UVC_OVERSPEED_DEFAULT 1
 +#define UVC_OVERSPEED_MAX     8
 +
 +static unsigned int uvc_overspeed(void)
@@ -201,7 +230,7 @@ diff --git a/uvc-gadget.c b/uvc-gadget.c
  static void v4l2_set_ctrl_value(struct control_mapping_pair ctrl, unsigned int ctrl_v4l2, int v4l2_ctrl_value)
  {
      struct v4l2_queryctrl queryctrl;
-@@ -1602,6 +1724,12 @@
+@@ -1602,6 +1742,12 @@
              v4l2_apply_format(&v4l2_dev, frame_format->video_format, frame_format->wWidth, frame_format->wHeight);
          }
          v4l2_apply_format(&uvc_dev, frame_format->video_format, frame_format->wWidth, frame_format->wHeight);
