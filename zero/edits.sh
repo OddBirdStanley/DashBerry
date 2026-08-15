@@ -565,12 +565,29 @@ PY
     #     whatever bInterval said, and the 15 fps ceiling came from that rather
     #     than from bandwidth. Fixed by patches/0010.
     #
-    # THE DEFAULT STAYS 1. With both fixes in, 30 fps at bInterval 1 is 267
-    # slots per frame over 33.2 ms — correct, and one change at a time. If
-    # frames still arrive truncated, `echo 3 > /boot/uvc-interval` on the card
-    # cuts that to 67 slots and the interrupt rate to 2000/s with no rebuild,
-    # at the cost of a 16.4 Mbps endpoint ceiling that H.264 fits inside and
-    # MJPEG does not. cam/rear-uvc-model.sh --table prints the whole sweep.
+    # THE DEFAULT IS 3, and it is the third thing that had to be right. What
+    # bInterval actually buys is not recovery room — there is none to buy —
+    # it is a lower REQUEST RATE. dwc2_gadget_incr_frame_num() advances the
+    # endpoint's target frame by hs_ep->interval per request SUBMITTED, and
+    # dwc2_hsotg_start_req() drops any request whose target frame has already
+    # passed (-ENODATA). The gadget therefore has to submit exactly one request
+    # per service interval, forever, or dwc2's clock falls behind wall-clock
+    # and everything after that is dropped. bInterval divides nreq and the
+    # service interval by the SAME factor, so the clock still tracks while the
+    # Zero's submission rate falls 4x, from 8000/s to 2000/s.
+    #
+    # Measured 2026-08-15, 720p30 H.264 with motion in frame:
+    #
+    #                       bInterval 1     bInterval 3
+    #   truncated frames    96 of 689       3 of 690
+    #   in bursts of        6               1 (isolated)
+    #   decoder errors      125             4
+    #   delivered rate      30.6 fps        30.01 fps
+    #   real payload        2.56 Mbps       3.85 Mbps
+    #   largest frame       24383 B         37849 B  (ceiling 67804)
+    #
+    # 6 is too far: 9 slots per frame is a 2.2 Mbps ceiling and the frames do
+    # not fit. cam/rear-uvc-model.sh --table prints the whole sweep.
     #
     # maxpacket stays 1024. 3072 asks for high-bandwidth isoc, which f_uvc
     # answers by FORCING bInterval to 1, and which dwc2 then refuses outright:
@@ -578,7 +595,7 @@ PY
     # Pi's dwc2-overlay.dts declares g-tx-fifo-size = <512 512 512 512 512 256
     # 256> in 32-bit words, so the largest FIFO on the chip is 2048. The
     # endpoint would fail to enable with -ENOMEM and nothing would stream.
-    say "multi-gadget.sh → isoc bInterval/maxpacket from /boot (defaults 1/1024)"
+    say "multi-gadget.sh → isoc bInterval/maxpacket from /boot (defaults 3/1024)"
     python3 - "$f" <<'PY'
 import sys
 path = sys.argv[1]
@@ -590,13 +607,13 @@ new = """config_usb_webcam () {
 
   # DashBerry: how often the host polls the video endpoint, and how much it
   # may take each time. See edits.sh for why these exist and what was measured.
-  UVC_INTERVAL=1
+  UVC_INTERVAL=3
   UVC_MAXPACKET=1024
   [ -r /boot/uvc-interval ]  && read -r UVC_INTERVAL  < /boot/uvc-interval
   [ -r /boot/uvc-maxpacket ] && read -r UVC_MAXPACKET < /boot/uvc-maxpacket
-  case "$UVC_INTERVAL"  in ''|*[!0-9]*) UVC_INTERVAL=1 ;;  esac
+  case "$UVC_INTERVAL"  in ''|*[!0-9]*) UVC_INTERVAL=3 ;;  esac
   case "$UVC_MAXPACKET" in ''|*[!0-9]*) UVC_MAXPACKET=1024 ;; esac
-  [ "$UVC_INTERVAL" -ge 1 ] && [ "$UVC_INTERVAL" -le 16 ] || UVC_INTERVAL=1
+  [ "$UVC_INTERVAL" -ge 1 ] && [ "$UVC_INTERVAL" -le 16 ] || UVC_INTERVAL=3
   [ "$UVC_MAXPACKET" -ge 1 ] && [ "$UVC_MAXPACKET" -le 3072 ] || UVC_MAXPACKET=1024
   echo "uvc: isoc bInterval $UVC_INTERVAL, maxpacket $UVC_MAXPACKET"
   echo "$UVC_INTERVAL"  > functions/uvc.usb0/streaming_interval

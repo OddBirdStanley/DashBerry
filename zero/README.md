@@ -183,7 +183,7 @@ edit rather than an image rebuild:
 | file | default | what it does |
 | --- | --- | --- |
 | `/boot/uvc-nbufs` | 8 | `-n` to uvc-gadget, the V4L2 buffer count. Upstream default is 2, the minimum the option accepts. |
-| `/boot/uvc-interval` | 1 | the isochronous endpoint's `bInterval`. **This is the only knob that safely reduces the request rate** — it divides `nreq` and the service interval by the same factor, so dwc2's target-frame clock still tracks wall-clock. 3 cuts submissions from 8000/s to 2000/s and still offers 68 KB/frame (16 Mbps). |
+| `/boot/uvc-interval` | **3** | the isochronous endpoint's `bInterval`. **The only knob that safely reduces the request rate** — it divides `nreq` and the service interval by the same factor, so dwc2's target-frame clock still tracks wall-clock. At 3 the Zero submits 2000 requests/s instead of 8000 and the endpoint still offers 68 KB/frame (16 Mbps). |
 | `/boot/uvc-overspeed` | 1 — **leave it there** | divisor on the frame interval reported to `f_uvc`. Anything above 1 breaks dwc2, see below. Kept only because it produced the measurement that explained the failure. |
 
 `nreq` is not a bandwidth budget. `dwc2_gadget_incr_frame_num()` advances the
@@ -204,17 +204,23 @@ There is no slack to be won by planning fewer requests. Raising `bInterval`
 is different in kind: it divides `nreq` *and* the service interval by the same
 factor, so the clock still tracks and the submission rate genuinely falls.
 
-**The experiment to run next is `/boot/uvc-interval`**, not `uvc-overspeed`. At
-3 the endpoint is serviced every 500 µs, `nreq` falls to 67, and the gadget has
-to submit 2000 requests/s instead of 8000 — four times less pressure on a 1 GHz
-ARM11 — while dwc2's target-frame clock still advances in step. Capacity is
-67 × 1012 = 68 KB/frame, 16 Mbps at 30 fps, against a largest measured frame of
-24 KB.
+**`bInterval` is the lever, and 3 is the measured answer.** At 3 the endpoint is
+serviced every 500 µs, `nreq` falls to 67, and the Zero submits 2000 requests/s
+instead of 8000 — four times less pressure on a 1 GHz ARM11 — while dwc2's
+target-frame clock still advances in step. Measured 2026-08-15, 720p30 H.264
+with motion in frame:
 
-For the record, what `uvc-overspeed 2` bought before it broke the clock: stub
-frames 96 → 22, worst burst 6 → 3, decoder errors 125 → 70, median slice
-11,652 → 18,241 B. Truncation really does fall when there are fewer slots to
-miss; the problem is that dwc2 will not tolerate the way that knob achieves it.
+| | bInterval 1 | bInterval 3 |
+| --- | --- | --- |
+| truncated frames | 96 of 689 (13.9%) | **3 of 690 (0.4%)** |
+| arriving in bursts of | 6 | 1, isolated |
+| decoder errors | 125 | 4 |
+| delivered rate | 30.6 fps | 30.01 fps |
+| real payload | 2.56 Mbps | 3.85 Mbps |
+| largest frame | 24,383 B | 37,849 B (ceiling 67,804) |
+
+6 is too far: 9 slots per frame is a 2.2 Mbps ceiling and the frames do not fit,
+which is what made it look worse than 1 when it was tried early on.
 
 The pin is a GitHub **tarball**, not a git ref, and `edits.sh` resolves the
 branch to a SHA before substituting it — a card you cannot rebuild byte for
