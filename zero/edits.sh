@@ -84,10 +84,13 @@ anchor() {
 # $(call github,...) will happily fetch a moving branch, and a card you cannot
 # rebuild byte for byte is not a card you can debug.
 #
-# Fallbacks, in order: KERNEL_BRANCH=rpi-6.16.y is where this image was built
-# and booted, and is fine as long as /boot/uvc-interval stays at 1;
-# KERNEL_BRANCH=rpi-6.12.y (RPi's protected branch) predates the f_uvc rework
-# entirely and cannot exhibit any of it, but needs a backport of 7b5a5895 for
+# Fallbacks, in order: KERNEL_BRANCH=rpi-6.16.y boots, but SET
+# /boot/uvc-interval BACK TO 1 IF YOU TAKE IT — the default is 3 and 6.16 is
+# missing 010dc57cb516/56135c0c60b0, so its f_uvc reads bInterval linearly
+# where dwc2 reads it as an exponent and every interval above 1 over-commits
+# the endpoint (see above). KERNEL_BRANCH=rpi-6.12.y (RPi's protected branch)
+# predates the f_uvc rework entirely and cannot exhibit any of it, so the
+# interval is unconstrained there, but it needs a backport of 7b5a5895 for
 # framebased.
 # ---------------------------------------------------------------------------
 KERNEL_BRANCH=${KERNEL_BRANCH:-rpi-6.18.y}

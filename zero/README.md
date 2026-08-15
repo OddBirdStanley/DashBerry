@@ -160,14 +160,21 @@ present in `rpi-6.16.y`, `rpi-6.17.y` and `rpi-6.18.y`; `rpi-6.12.y` and 5.10
 are clean, which is why stock showmewebcam never showed it. See
 `patches/linux-custom/0002-vchiq-walk-bulk-pages-by-bytes-not-by-ints.patch`.
 
-> **UNVERIFIED at the time of writing.** No ARMv6 Zero W has been built on
-> `rpi-6.18.y` here — 6.16 is the branch this image was built and booted on.
-> showmewebcam's buildroot pin predates 6.x host tooling and may itself need
-> bumping. **Fallbacks, in order:** `KERNEL_BRANCH=rpi-6.16.y` is known good
-> and is safe as long as `/boot/uvc-interval` stays at 1; below that,
-> `KERNEL_BRANCH=rpi-6.12.y` plus a backport of `7b5a5895` — 6.12 is RPi's
-> protected long-term branch, the line `bcm2835-v4l2` is known good on, and its
-> f_uvc predates the whole request rework and so cannot exhibit any of it.
+> **VERIFIED 2026-08-15.** `rpi-6.18.y` @ `ce0873cb` builds for `raspberrypi0w`
+> and the card streams: image `dashberry-zero-7729166`, shot at 1640×922@30
+> through `rear-rec`'s exact chain for 690 frames with 0 decoder errors and
+> 99.0% non-zero payload. showmewebcam's buildroot pin needed no bump.
+>
+> **Fallbacks, in order, if the pin ever has to move:** `KERNEL_BRANCH=rpi-6.16.y`
+> boots, but **set `/boot/uvc-interval` back to 1 if you take it.** 6.16 computes
+> `interval_duration` as `bInterval × 1250` where dwc2 uses the exponent
+> (`1 << (bInterval - 1)`), so the two halves of that kernel disagree and the
+> default of 3 over-commits the endpoint — the fixes (`010dc57cb516`,
+> `56135c0c60b0`) landed after 6.16 went end-of-life and will never reach it.
+> Below that, `KERNEL_BRANCH=rpi-6.12.y` plus a backport of `7b5a5895` — 6.12 is
+> RPi's protected long-term branch, the line `bcm2835-v4l2` is known good on,
+> and its f_uvc predates the whole request rework and so cannot exhibit any of
+> it (so `uvc-interval` is unconstrained there).
 >
 > **On the 6.12 fallback, drop `patches/linux-custom/0002`.** 6.12 already has
 > the correct byte-stride page walk, in `vchiq_arm.c` rather than `vchiq_core.c`,

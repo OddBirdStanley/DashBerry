@@ -52,14 +52,21 @@ dtoverlay=disable-bt
 
 # --- VideoCore firmware memory. The firmware-backed camera/codec contexts
 # (bcm2835-isp for the front 1080p libcamera path and bcm2835-codec for its
-# H.264 encode; the rear adds NO firmware context — both its MJPEG decode
-# and its H.264 encode are software, see rear-rec) allocate here, NOT from
-# ARM-side CMA. The 76 MB
+# H.264 encode) allocate here, NOT from ARM-side CMA. The 76 MB
 # default cannot hold them all: the last context to arrive fails —
 # bench-observed both as a clean REQBUFS ENOMEM ("Failed to allocate
 # required memory") and as a VCHIQ sync timeout that wedges the firmware
 # until power-cycle, taking the ISP and front recording down with it.
 # 256 MB fits everything (bench-verified). ---
+#
+# THE REAR IS NOT IN THIS BUDGET, and has not been since 2026-08-13. It used
+# to be: the rear encoded H.264 through bcm2835-codec, which is a firmware
+# context and did allocate here. Then the encode went to software openh264enc
+# on this box, and then off this box entirely — the Zero encodes now and
+# rear-rec is a remux, so there is no rear decode and no rear encode here to
+# hold a context. Both times the rear left this budget it left it smaller,
+# never larger, so 256 stays right by margin rather than by measurement. Do
+# not read a rear camera into this figure if it needs re-deriving.
 gpu_mem=256
 
 # ---------------------------------------------------------------
