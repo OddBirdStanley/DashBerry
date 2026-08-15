@@ -701,7 +701,7 @@ PY
 patch_camera_txt() {
     local f="$PIWEBCAM/camera.txt"
     anchor "$f" "video_bitrate=25000000" "the shipped camera settings"
-    say "camera.txt → dropping video_bitrate (rear-ctl owns it)"
+    say "camera.txt → dropping video_bitrate (rear-ctl owns it), +i_frame_period"
     python3 - "$f" <<'PY'
 import sys
 p = sys.argv[1]
@@ -733,6 +733,31 @@ s = s.replace("video_bitrate=25000000\n",
 # by any host that opens it — a laptop, ffplay, a browser — with nothing
 # pushed.
 s = s.rstrip("\n") + "\nrepeat_sequence_header=1\n"
+
+# h264_i_frame_period: ADDED by DashBerry, for the same reason as the line
+# above — a card that nothing pushes has to be usable on its own.
+#
+# The encoder's own default is 60 frames, two whole seconds at 30 fps, and
+# that is what a bench PC gets because nothing there runs rear-ctl. It is the
+# multiplier on every remaining truncated frame: H.264 predicts forward, so one
+# damaged frame is damaged video until the next IDR. Measured 2026-08-15 on a
+# clean 690-frame capture, three frames were truncated by missed isochronous
+# slots — 0.4% — and the one at t=6.86s was visible as green smearing until the
+# IDR at t=8.00s. 1.13 seconds of ruined footage from one lost frame, and
+# ~8% of the run's wall time ruined by 0.4% of its frames.
+#
+# 27 is not a new number: it is REAR_GOP from the Pi 4's dashberry.conf, which
+# rear-ctl already pushes here on every start of rear-rec. Setting it on the
+# card makes a pushed and an unpushed card behave identically, which is the
+# whole point — the bench measurements now describe the deployed configuration.
+# It also inherits that setting's reasoning: 27 rather than 30 deliberately
+# detunes the keyframe cadence off exactly 1 Hz, so it cannot phase-lock with
+# ext4's journal commits on the Pi 4 (see dashberry.conf FRONT_GOP).
+#
+# It does not reduce the truncation rate — nothing here does; that is the
+# missed-slot problem and bInterval 3 is what addresses it. It bounds the COST
+# of each one, from 2.0 s to 0.9 s.
+s = s.rstrip("\n") + "\nh264_i_frame_period=27\n"
 open(p, 'w').write(s)
 PY
 }
