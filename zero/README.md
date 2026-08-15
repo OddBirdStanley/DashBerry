@@ -143,6 +143,23 @@ both landed after 6.16 went end-of-life, so 6.16 will never receive them.
 `INVESTIGATE-REAR-CORRUPTION.response.md` has the reasoning; `zero/edits.sh`
 section 1 has the short version.
 
+**6.18 needs one kernel patch that has nothing to do with UVC**, and it is the
+one that actually fixes the rear corruption. `vchiq`'s `create_pagelist()` walks
+a kernel bulk buffer with the pointer cast to `unsigned int *`, so it strides
+16384 bytes per page instead of 4096 — page 0 is correct and every page after it
+names a page four times too far into the buffer. VideoCore duly DMAs each
+encoded frame's second 4 KB to buffer offset 16384, and userspace reads 4096
+real bytes followed by zeros with the frame length still reported correctly, so
+nothing downstream can tell. Measured straight off `/dev/video0` with the USB
+gadget not involved: **45.7% of captured bytes are non-zero, ~4092 real bytes
+per frame**; in the recorded stream, 92% of P slices carry exactly 4096 live
+bytes, IDR slices carry exactly 20453 (= 16384 + 4096), and interior zero runs
+are exactly 12288 (= 16384 − 4096) bytes long. The bug arrived with the
+`bulk_params` refactor that moved `create_pagelist()` into `vchiq_core.c` and is
+present in `rpi-6.16.y`, `rpi-6.17.y` and `rpi-6.18.y`; `rpi-6.12.y` and 5.10
+are clean, which is why stock showmewebcam never showed it. See
+`patches/linux-custom/0002-vchiq-walk-bulk-pages-by-bytes-not-by-ints.patch`.
+
 > **UNVERIFIED at the time of writing.** No ARMv6 Zero W has been built on
 > `rpi-6.18.y` here — 6.16 is the branch this image was built and booted on.
 > showmewebcam's buildroot pin predates 6.x host tooling and may itself need

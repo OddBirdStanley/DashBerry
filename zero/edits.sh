@@ -151,6 +151,19 @@ repin_kernel() {
     # any status but -EXDEV as fatal and cancels the video queue, dwc2 reports
     # a missed slot as -ENODATA, and at bInterval 1 that happens almost at
     # once. See the patch header for the measurement.
+    #
+    # zero/patches/linux-custom/0002 is THE rear-corruption fix. vchiq's
+    # create_pagelist() walks a kernel bulk buffer with the pointer cast to
+    # unsigned int *, so the page stride is 16384 bytes instead of 4096: page 0
+    # is right and every page after it names a page four times too far in.
+    # VideoCore therefore DMAs each encoded frame's second 4 KB to buffer
+    # offset 16384, and userspace reads 4096 real bytes followed by zeros.
+    # Measured straight off /dev/video0 with USB not involved: 45.7% of the
+    # captured bytes are non-zero, ~4092 real bytes per frame. Present in
+    # rpi-6.16.y, rpi-6.17.y and rpi-6.18.y; rpi-6.12.y and 5.10 are clean,
+    # which is why the original showmewebcam image never showed it. This is
+    # not specific to the camera — it corrupts every vchiq bulk transfer from
+    # a kernel buffer larger than one page. See the patch header.
     rm -rf "$SMW/patches/linux-dashberry"
     mkdir -p "$SMW/patches/linux-dashberry"
     cp "$HERE"/patches/linux-custom/*.patch "$SMW/patches/linux-dashberry/"

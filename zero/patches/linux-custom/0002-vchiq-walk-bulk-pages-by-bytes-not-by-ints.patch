@@ -1,0 +1,68 @@
+vchiq: walk a kernel bulk buffer by bytes, not by ints
+
+create_pagelist() builds the scatter list that tells VideoCore where to
+DMA a bulk transfer.  For a kernel (vmalloc) buffer it walks the buffer a
+page at a time:
+
+	struct page *pg =
+		vmalloc_to_page(((unsigned int *)bulk->offset +
+				 (actual_pages * PAGE_SIZE)));
+
+bulk->offset is a void *.  Casting it to unsigned int * makes the
+addition scale by sizeof(unsigned int), so page N is looked up at byte
+offset N * PAGE_SIZE * 4 = N * 16384 instead of N * 4096.  Page 0 is
+right because 0 * anything is 0; every page after it names a page four
+times too far into the buffer.
+
+rpi-6.12.y had this right — the pointer was a char * and the arithmetic
+was in bytes.  The bug arrived with the bulk_params refactor that moved
+create_pagelist() from vchiq_arm.c into vchiq_core.c, and it is present
+in rpi-6.16.y, rpi-6.17.y and rpi-6.18.y.
+
+What it does to a capture: VideoCore writes the encoded frame into the
+pages it was given, so the frame's first 4096 bytes land at buffer offset
+0 and its second 4096 bytes land at offset 16384.  The driver then hands
+userspace bytes 0..bytesused-1 of that buffer, which contain
+
+	    0 ..  4095   frame bytes 0..4095       (correct)
+	 4096 .. 16383   never written             (zeros)
+	16384 .. 20479   frame bytes 4096..8191    (correct, wrong place)
+
+Measured on 1280x720 H.264 at 30 fps, straight off /dev/video0 with the
+USB gadget not involved (v4l2-ctl --stream-mmap --stream-to):
+
+	  total bytes                       2685760
+	  non-zero bytes                    1227688   (45.7%)
+	  non-zero bytes per frame             4092   (~1 page)
+
+and in the recorded stream, over 689 frames:
+
+	  P slices with exactly 4096 live bytes    634  (92%)
+	  IDR slices with exactly 20453 live bytes  11  (20480 = 16384 + 4096)
+	  interior zero runs, length                     exactly 12288
+	                                                 (16384 - 4096)
+	  decoder errors, all "bytestream -N"      662
+
+Every one of those numbers is what the 4x stride predicts.  The frame
+lengths are correct throughout, so nothing downstream can detect this;
+the transport faithfully carries a buffer that is 55% zeros.
+
+This affects every vchiq bulk transfer from a kernel buffer larger than
+one page, not just the camera.
+
+Signed-off-by: DashBerry <dashberry@localhost>
+
+diff --git a/drivers/staging/vc04_services/interface/vchiq_arm/vchiq_core.c b/drivers/staging/vc04_services/interface/vchiq_arm/vchiq_core.c
+--- a/drivers/staging/vc04_services/interface/vchiq_arm/vchiq_core.c
++++ b/drivers/staging/vc04_services/interface/vchiq_arm/vchiq_core.c
+@@ -1590,8 +1590,8 @@
+ 		for (actual_pages = 0; actual_pages < num_pages;
+ 		     actual_pages++) {
+ 			struct page *pg =
+-				vmalloc_to_page(((unsigned int *)bulk->offset +
+-						 (actual_pages * PAGE_SIZE)));
++				vmalloc_to_page(((char *)bulk->offset +
++						 (actual_pages * PAGE_SIZE)));
+ 			size_t bytes = PAGE_SIZE - off;
+
+ 			if (!pg) {
