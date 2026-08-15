@@ -469,6 +469,58 @@ config_usb_control''')
 open(p, 'w').write(s)
 PY
 
+    # --- isochronous endpoint sizing -------------------------------------
+    # f_uvc defaults to bInterval 1, which asks the gadget for a USB request
+    # every 125 us microframe: 8000 a second, forever, whether or not there is
+    # a frame's worth to send. On a 1 GHz single-core ARM11 also running the
+    # camera and the encoder, it cannot keep up, and dwc2 completes each late
+    # request with -ENODATA ("target frame elapsed"). The payload in that slot
+    # is simply never sent.
+    #
+    # Measured 2026-08-15, both ends agreeing for the first time:
+    #   gadget: TOTALS: 711 incomplete (dropped)
+    #   host:   745 frames, 267209 packets, 86 errors, 546 invalid
+    # 711 of 745 frames — 95% — lost payload, which is why every recording
+    # decodes as "bytestream -5" and "concealing N DC, AC, MV errors".
+    #
+    # bInterval is the only knob that changes the REQUEST RATE, which is what
+    # is being missed. 3 means every 3rd microframe: 2670 requests a second
+    # instead of 8000, and 1012 bytes per 375 us is still 21 Mbps against a
+    # stream that wants 8. maxpacket is left at f_uvc's 1024 deliberately —
+    # raising it to 3072 would ask for high-bandwidth isoc (3 transactions per
+    # microframe), which changes how much rides in each slot but not how often
+    # a slot must be filled, and is the less well-trodden path on dwc2.
+    #
+    # ONE change, aimed at the measured mechanism. Both are readable from /boot
+    # so the next number costs a file edit rather than an image rebuild.
+    say "multi-gadget.sh → isoc bInterval/maxpacket from /boot (defaults 3/1024)"
+    python3 - "$f" <<'PY'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+old = "config_usb_webcam () {\n  mkdir -p functions/uvc.usb0/control/header/h\n"
+assert s.count(old) == 1, "config_usb_webcam moved"
+new = """config_usb_webcam () {
+  mkdir -p functions/uvc.usb0/control/header/h
+
+  # DashBerry: how often the host polls the video endpoint, and how much it
+  # may take each time. See edits.sh for why these exist and what was measured.
+  UVC_INTERVAL=3
+  UVC_MAXPACKET=1024
+  [ -r /boot/uvc-interval ]  && read -r UVC_INTERVAL  < /boot/uvc-interval
+  [ -r /boot/uvc-maxpacket ] && read -r UVC_MAXPACKET < /boot/uvc-maxpacket
+  case "$UVC_INTERVAL"  in ''|*[!0-9]*) UVC_INTERVAL=3 ;;  esac
+  case "$UVC_MAXPACKET" in ''|*[!0-9]*) UVC_MAXPACKET=1024 ;; esac
+  [ "$UVC_INTERVAL" -ge 1 ] && [ "$UVC_INTERVAL" -le 16 ] || UVC_INTERVAL=3
+  [ "$UVC_MAXPACKET" -ge 1 ] && [ "$UVC_MAXPACKET" -le 3072 ] || UVC_MAXPACKET=1024
+  echo "uvc: isoc bInterval $UVC_INTERVAL, maxpacket $UVC_MAXPACKET"
+  echo "$UVC_INTERVAL"  > functions/uvc.usb0/streaming_interval
+  echo "$UVC_MAXPACKET" > functions/uvc.usb0/streaming_maxpacket
+"""
+open(path, "w").write(s.replace(old, new))
+PY
+    grep -q 'streaming_interval' "$f" || die "isoc sizing edit did not take — read multi-gadget.sh."
+
     grep -q 'config_usb_control' "$f" || die "multi-gadget.sh edits did not take — read it."
 }
 
