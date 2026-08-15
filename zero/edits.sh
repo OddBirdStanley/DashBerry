@@ -164,6 +164,27 @@ repin_kernel() {
     # which is why the original showmewebcam image never showed it. This is
     # not specific to the camera — it corrupts every vchiq bulk transfer from
     # a kernel buffer larger than one page. See the patch header.
+    #
+    # zero/patches/linux-custom/0003 restores pre-6.13 request sizing as an
+    # OPT-IN, off by default:
+    #
+    #     echo 1 > /sys/module/usb_f_uvc/parameters/fixed_req_size
+    #
+    # before the host starts streaming. 6.13's planner spreads a frame evenly
+    # across the frame interval — 267 requests of ~50 bytes at 30 fps — and
+    # since isoc slots arrive at a fixed 8 kHz that is also 33.375 ms of wire
+    # for a 33.33 ms period, so every one of the 267 must land. dwc2 on a Zero
+    # W does not manage it, and a missed slot is unrecoverable: the request's
+    # bytes are NOT resent (uvc_video_complete() returns it to req_free with
+    # buf_used already advanced), so f_uvc truncates the frame and marks the
+    # rest UVC_STREAM_ERR, which the host turns into buf->error and discards.
+    # 5.10 and 6.12 filled requests to maxpacket instead — 12 requests of 1024
+    # bytes for the same frame, 22x fewer slots to miss — which is why this
+    # hardware ran those kernels without any of it.
+    #
+    # NOT YET MEASURED ON HARDWARE, which is why it is off. Turn it on, shoot a
+    # modetest, and compare the stub-frame count against the 96-of-689 the
+    # default path measured on 2026-08-15.
     rm -rf "$SMW/patches/linux-dashberry"
     mkdir -p "$SMW/patches/linux-dashberry"
     cp "$HERE"/patches/linux-custom/*.patch "$SMW/patches/linux-dashberry/"

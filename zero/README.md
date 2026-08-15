@@ -186,6 +186,24 @@ edit rather than an image rebuild:
 | `/boot/uvc-interval` | 1 | the isochronous endpoint's `bInterval`. Raising it does **not** buy recovery room — `nreq` shrinks and the slot period grows by the same factor, so wall-clock drain time is unchanged and byte capacity falls. |
 | `/boot/uvc-overspeed` | 1 (off) | divisor applied to the frame interval reported to `f_uvc`, which is what does buy recovery room. See `patches/0010`. |
 
+There is a fourth knob, in sysfs rather than on `/boot`, from
+`patches/linux-custom/0003`:
+
+```sh
+echo 1 > /sys/module/usb_f_uvc/parameters/fixed_req_size   # before streaming starts
+```
+
+It restores pre-6.13 request sizing — fill every request to the endpoint's
+maxpacket and drain the frame as fast as the endpoint takes it, rather than
+spreading it across the frame interval. A 12 KB frame becomes 12 requests of
+1024 bytes (1.5 ms of wire, then 31.8 ms idle) instead of 267 of ~50 bytes
+(33.375 ms of wire for a 33.33 ms period), so there are ~22× fewer slots to
+miss. This is what 5.10 and 6.12 did, and it is why this hardware ran those
+kernels without any of the truncation. **Off by default and not yet measured on
+hardware** — upstream's planner exists to keep bandwidth demand flat across the
+interval, which matters on a shared bus and does not on a cable with one device
+on it.
+
 `uvc-overspeed` is the one to sweep. At 1 the gadget plans 267 requests for a
 33.33 ms frame period — 33.375 ms of wire, no slack, and a missed isochronous
 slot truncates the frame outright. At 2 it plans 134, drains in 16.8 ms and
