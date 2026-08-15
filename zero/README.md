@@ -183,50 +183,38 @@ edit rather than an image rebuild:
 | file | default | what it does |
 | --- | --- | --- |
 | `/boot/uvc-nbufs` | 8 | `-n` to uvc-gadget, the V4L2 buffer count. Upstream default is 2, the minimum the option accepts. |
-| `/boot/uvc-interval` | 1 | the isochronous endpoint's `bInterval`. Raising it does **not** buy recovery room — `nreq` shrinks and the slot period grows by the same factor, so wall-clock drain time is unchanged and byte capacity falls. |
-| `/boot/uvc-overspeed` | 1 (off) | divisor applied to the frame interval reported to `f_uvc`, which is what does buy recovery room. See `patches/0010`. |
+| `/boot/uvc-interval` | 1 | the isochronous endpoint's `bInterval`. **This is the only knob that safely reduces the request rate** — it divides `nreq` and the service interval by the same factor, so dwc2's target-frame clock still tracks wall-clock. 3 cuts submissions from 8000/s to 2000/s and still offers 68 KB/frame (16 Mbps). |
+| `/boot/uvc-overspeed` | 1 — **leave it there** | divisor on the frame interval reported to `f_uvc`. Anything above 1 breaks dwc2, see below. Kept only because it produced the measurement that explained the failure. |
 
-There is a fourth knob, in sysfs rather than on `/boot`, from
-`patches/linux-custom/0003`:
+`nreq` is not a bandwidth budget. `dwc2_gadget_incr_frame_num()` advances the
+endpoint's target frame by `hs_ep->interval` **per request submitted**, and
+`dwc2_hsotg_start_req()` drops any request whose target frame has already passed
+with `-ENODATA`. Submit fewer requests than there are service intervals and the
+target falls behind wall-clock, after which every request is dropped on arrival:
 
-```sh
-echo 1 > /sys/module/usb_f_uvc/parameters/fixed_req_size   # before streaming starts
-```
-
-It restores pre-6.13 request sizing — fill every request to the endpoint's
-maxpacket and drain the frame as fast as the endpoint takes it, rather than
-spreading it across the frame interval. A 12 KB frame becomes 12 requests of
-1024 bytes (1.5 ms of wire, then 31.8 ms idle) instead of 267 of ~50 bytes
-(33.375 ms of wire for a 33.33 ms period), so there are ~22× fewer slots to
-miss. This is what 5.10 and 6.12 did, and it is why this hardware ran those
-kernels without any of the truncation. **Off by default and not yet measured on
-hardware** — upstream's planner exists to keep bandwidth demand flat across the
-interval, which matters on a shared bus and does not on a cable with one device
-on it.
-
-`uvc-overspeed` is the one to sweep. At 1 the gadget plans 267 requests for a
-33.33 ms frame period — 33.375 ms of wire, no slack, and a missed isochronous
-slot truncates the frame outright. At 2 it plans 134, drains in 16.8 ms and
-leaves 16.5 ms idle, still offering 135 KB per frame against a measured worst
-frame of 24 KB.
-
-Measured 2026-08-15:
-
-| | divisor 1 | divisor 2 |
+| requests/s at 30 fps | vs the 8000/s dwc2 expects | result |
 | --- | --- | --- |
-| stub frames | 96 (13.9%) | 22 (3.2%) |
-| worst stub burst | 6 | 3 |
-| median slice | 11,652 B | 18,241 B |
-| decoder errors | 125 | 70 |
-| delivered rate | 30.6 fps | **6.0 fps** |
+| 8010 (`overspeed 1`) | matches | 30.6 fps |
+| 4020 (`overspeed 2`) | half | 6 fps, minute-long freezes |
+| 360 (fixed-size requests) | 22× behind | stream dead |
 
-Divisor 2 cuts truncation exactly as the arithmetic predicts and collapses
-delivery, freezing for about a minute mid-capture and taking 114 s to collect
-690 frames that take 23 s at divisor 1. **Nothing in `uvc_video_prep_requests()`,
-`uvcg_video_pump()` or `uvcg_video_hw_submit()` accounts for a stall of that
-length, and nothing else in the driver reads `video->interval` — the mechanism
-is not understood.** The default is 1 for that reason. 2 stays reachable because
-it is the only change so far that has moved truncation.
+So `nreq = interval / (2^(bInterval-1) × 1250)` is **one request per service
+interval**, and the 100.1% duty cycle is mandatory rather than unfortunate.
+There is no slack to be won by planning fewer requests. Raising `bInterval`
+is different in kind: it divides `nreq` *and* the service interval by the same
+factor, so the clock still tracks and the submission rate genuinely falls.
+
+**The experiment to run next is `/boot/uvc-interval`**, not `uvc-overspeed`. At
+3 the endpoint is serviced every 500 µs, `nreq` falls to 67, and the gadget has
+to submit 2000 requests/s instead of 8000 — four times less pressure on a 1 GHz
+ARM11 — while dwc2's target-frame clock still advances in step. Capacity is
+67 × 1012 = 68 KB/frame, 16 Mbps at 30 fps, against a largest measured frame of
+24 KB.
+
+For the record, what `uvc-overspeed 2` bought before it broke the clock: stub
+frames 96 → 22, worst burst 6 → 3, decoder errors 125 → 70, median slice
+11,652 → 18,241 B. Truncation really does fall when there are fewer slots to
+miss; the problem is that dwc2 will not tolerate the way that knob achieves it.
 
 The pin is a GitHub **tarball**, not a git ref, and `edits.sh` resolves the
 branch to a SHA before substituting it — a card you cannot rebuild byte for
