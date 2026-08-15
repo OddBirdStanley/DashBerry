@@ -412,26 +412,57 @@ things the Pi 4 actually needs to say could never have ridden that path.
 `video_formats.txt` advertises 1640×922, 1920×1080 and 1280×720 in H.264, plus
 two MJPEG modes as a diagnostic fallback any laptop can read.
 
-Now that the Pi 4 pays nothing to record, the choice is **purely optical
-again** and is to be made **by eye**, off `cam/rear-modetest.sh` footage of a
-parked, detailed target — not from arithmetic:
+Now that the Pi 4 pays nothing to record, the Pi 4's cost is no longer the
+constraint. The remaining one is a driver constant, and it is hard:
 
-- **1640×1232@30** — the full 4:3 field, the widest this lens gives, and the
-  mode worth having. **Not advertised yet.** It hung the entire gadget under
-  MJPEG — camera *and* console, until a power cycle, which on the car a Pi 4
-  reboot cannot deliver, since both boards share the 12 V injection. The
-  theory is that ~48 Mbps of MJPEG plus the encode was the thing it could not
-  sustain and that H.264 at ~1 MB/s lifts it. **That is bandwidth arithmetic,
-  not a measurement.** Test it on the bench. If the hang is the sensor
-  readout, it stays banned.
+**Nothing taller than 1088 rows will stream H.264.** `bcm2835-camera`'s
+`set_camera_parameters()` sends `MMAL_PARAMETER_CAMERA_CONFIG` once at init
+with `max_preview_video_h = (max_video_height > 1088) ? max_video_height :
+1088`, and `max_video_height` is a module parameter defaulting to 720 — so the
+ternary always falls through and the VideoCore's video-port frame pool is
+always dimensioned for 1920×1088. H.264 always feeds `CAM_PORT_VIDEO`. Ask
+that port for a taller frame and the firmware refuses: **ENOMEM**.
+
+| mode | rows | | mode | rows |
+| --- | --- | --- | --- | --- |
+| 1280×720 | 720 ✅ | | 1640×1232 | 1232 ❌ |
+| 1640×922 | 922 ✅ | | 2048×1152 | 1152 ❌ |
+| 1920×1080 | 1080 ✅ | | 2560×1440 | 1440 ❌ |
+
+The boundary is **height alone** — not pixel count, not pixel rate. 1920×1080
+is 2.07 MP against 1640×1232's 2.02 MP and streams fine. Confirmed on hardware
+2026-08-15: 1640×1232 returns "cannot allocate memory" and hangs, 1640×922
+unaffected in the same session.
+
+Within that ceiling the choice is **purely optical** and is to be made **by
+eye**, off `cam/rear-modetest.sh` footage of a parked, detailed target:
+
 - **1640×922@30** — what `dashberry.conf` records today. Known to stream.
 - **1920×1080@30** — the unbinned crop: 2× the detail per degree for 41.5% of
   the horizontal field. Reverted 2026-08-12 *only* because the Pi 4 could not
   encode it. That objection has expired.
 
-`2048×1152` and `2560×1440` hang the gadget too, and H.264 does nothing about
-it: the Zero cannot sustain the unbinned 3280×2464 readout plus an ISP
-downscale.
+**The bandwidth explanation this section used to give was wrong**, and is
+recorded so it is not retested: it blamed ~48 Mbps of MJPEG over USB and
+expected H.264's ~1 MB/s to lift the ban. It does not — the pool is sized in
+rows, and the format never enters into it. The reason MJPEG could carry
+1640×1232 at all is that MJPEG is `COMP_IMAGE_ENCODE`, which uses
+`CAM_PORT_CAPTURE` — the **stills** port, sized from `max_stills_w/h`, i.e.
+the full 3280×2464 sensor. Same camera, same resolution, different port,
+different pool. The MJPEG hang was the stills path being pressed into
+continuous service.
+
+The knob, if a taller mode is ever wanted: `max_video_height` is
+`module_param(..., 0644)`, so booting with `bcm2835_v4l2.max_video_height=1232`
+should size the pool for it. **Untested.** It has to be set at boot (the value
+is read once, in `mmal_init()`), and the same variable drives the raw-format
+port selection, so raw captures above 720p would change ports — irrelevant
+here, nothing captures raw. It would not even cost memory: 1664×1232×1.5×3 ≈
+9.2 MB against 1920×1088's ≈ 9.4 MB.
+
+**Not pursued (2026-08-15).** 1640×922 is 16:9, matching the front camera, and
+1640×1232 adds vertical field only — both binned modes put 1640 px across the
+same full horizontal field, so it buys no width and no sharpness.
 
 ## 6. The console stays
 

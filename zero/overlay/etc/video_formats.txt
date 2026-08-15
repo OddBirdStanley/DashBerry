@@ -36,16 +36,53 @@ h264  1280  720
 mjpeg 1640  922
 mjpeg 1280  720
 
-# --- NOT ADVERTISED, and why -------------------------------------------
-# 1640x1232@30 — the full 4:3 field, the widest this lens gives, and the mode
-#   worth having. Under MJPEG it HUNG the entire gadget: camera and console
-#   both, until a power cycle, which on the car a Pi 4 reboot cannot deliver
-#   (both boards share the 12 V injection). The theory is that ~48 Mbps of
-#   MJPEG plus the encode was what the Zero could not sustain, and that H.264
-#   at ~1 MB/s lifts it. THAT IS ARITHMETIC, NOT A MEASUREMENT. Test it on the
-#   BENCH, with the card in a PC and nothing depending on it, before adding
-#   the line — and if the hang is the sensor readout rather than the
-#   bandwidth, it stays banned.
-# 2048x1152, 2560x1440 — hang the gadget too. The Zero cannot sustain the
-#   unbinned 3280x2464 readout plus an ISP downscale, which H.264 does nothing
-#   about.
+# --- NOT ADVERTISED: NOTHING TALLER THAN 1088 ROWS ----------------------
+# 1640x1232, 2048x1152 and 2560x1440 are all barred by the same driver
+# constant, and no amount of bitrate, format or USB tuning moves it.
+#
+# bcm2835-camera's set_camera_parameters() sends MMAL_PARAMETER_CAMERA_CONFIG
+# once at init, and it is what the VideoCore firmware sizes the video-port
+# frame pool from:
+#
+#     .max_preview_video_w = (max_video_width  > 1920) ? max_video_width  : 1920,
+#     .max_preview_video_h = (max_video_height > 1088) ? max_video_height : 1088,
+#     .num_preview_video_frames = 3,
+#
+# max_video_height is a module parameter defaulting to MAX_VIDEO_MODE_HEIGHT
+# = 720, so that ternary always falls through to the floor and the pool is
+# ALWAYS dimensioned for 1920x1088. H.264 always feeds CAM_PORT_VIDEO (the
+# resolution test further up that function picks between video and capture
+# ports for RAW formats only), so a mode taller than 1088 rows asks the video
+# port for a frame the pool was never dimensioned for. The firmware refuses
+# and MMAL returns ENOMEM.
+#
+# CONFIRMED ON HARDWARE 2026-08-15: 1640x1232 fails "cannot allocate memory"
+# and hangs; 1640x922 is unaffected in the same session. The boundary is
+# HEIGHT ALONE, not pixel count and not pixel rate — 1920x1080 is 2.07 MP
+# against 1640x1232's 2.02 MP and streams fine, because 1080 <= 1088.
+#
+#     1280x720   720 rows  ok        1640x1232  1232 rows  ENOMEM
+#     1640x922   922 rows  ok        2048x1152  1152 rows  hangs
+#     1920x1080 1080 rows  ok        2560x1440  1440 rows  hangs
+#
+# THE EARLIER EXPLANATION WAS WRONG and is recorded here so it is not
+# retested: this file used to blame ~48 Mbps of MJPEG over USB and suggest
+# H.264 at ~1 MB/s might lift the restriction. It does not. The reason MJPEG
+# could carry 1640x1232 at all is that MJPEG is COMP_IMAGE_ENCODE, which uses
+# CAM_PORT_CAPTURE — the STILLS port, sized from max_stills_w/h, i.e. the full
+# 3280x2464 sensor. Same camera, same resolution, different port, different
+# pool. The MJPEG hang was the stills path being pressed into continuous
+# service, not a bandwidth ceiling.
+#
+# The knob, if it is ever wanted: max_video_height is module_param(..., 0644),
+# so booting with bcm2835_v4l2.max_video_height=1232 should size the pool for
+# it. UNTESTED. It must be set at boot (the value is read once, in mmal_init),
+# and the same variable drives the raw-format port selection above, so raw
+# captures over 720p would move ports. Nothing here captures raw. The pool
+# would not even cost more: 1664x1232x1.5x3 ~ 9.2 MB against 1920x1088's
+# ~9.4 MB, which is why this reads as a dimension check rather than a byte
+# budget.
+#
+# NOT PURSUED (2026-08-15). 1640x922 is 16:9, matching the front camera, and
+# 1640x1232 adds vertical field only — both binned modes are 1640 px across
+# the same full horizontal field, so it buys no width and no sharpness.
