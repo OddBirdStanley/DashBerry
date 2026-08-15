@@ -483,17 +483,24 @@ PY
     # 711 of 745 frames — 95% — lost payload, which is why every recording
     # decodes as "bytestream -5" and "concealing N DC, AC, MV errors".
     #
-    # bInterval is the only knob that changes the REQUEST RATE, which is what
-    # is being missed. 3 means every 3rd microframe: 2670 requests a second
-    # instead of 8000, and 1012 bytes per 375 us is still 21 Mbps against a
-    # stream that wants 8. maxpacket is left at f_uvc's 1024 deliberately —
-    # raising it to 3072 would ask for high-bandwidth isoc (3 transactions per
-    # microframe), which changes how much rides in each slot but not how often
-    # a slot must be filled, and is the less well-trodden path on dwc2.
+    # THAT THEORY WAS TESTED AND IS WRONG. bInterval 3 and 6 were both tried:
+    # the corruption was unchanged, and 6 also cut delivery to 15 fps. If the
+    # request rate were the binding constraint, cutting it to a third would
+    # have moved the loss substantially. It did not, so the loss is not
+    # rate-driven and the default is back to f_uvc's 1.
     #
-    # ONE change, aimed at the measured mechanism. Both are readable from /boot
-    # so the next number costs a file edit rather than an image rebuild.
-    say "multi-gadget.sh → isoc bInterval/maxpacket from /boot (defaults 3/1024)"
+    # The rate does set a CEILING, and that is what the 15 fps was: capacity is
+    # nreq x 1012 bytes per frame period, so 270 KB at bInterval 1, 90 KB at 3
+    # and 45 KB at 6. A 10 Mbps stream (the card's default, since nothing
+    # pushes REAR_BITRATE on a bench PC) wants ~42 KB per frame at 30 fps, so 6
+    # leaves almost no margin for a large IDR and frames start overrunning
+    # their period.
+    #
+    # These stay tunable because they are worth having, not because they are
+    # the fix. maxpacket was never raised from 1024: 3072 asks for
+    # high-bandwidth isoc, which changes how much rides in a slot but not how
+    # often one must be filled, and on this evidence neither is the problem.
+    say "multi-gadget.sh → isoc bInterval/maxpacket from /boot (defaults 1/1024)"
     python3 - "$f" <<'PY'
 import sys
 path = sys.argv[1]
@@ -505,13 +512,13 @@ new = """config_usb_webcam () {
 
   # DashBerry: how often the host polls the video endpoint, and how much it
   # may take each time. See edits.sh for why these exist and what was measured.
-  UVC_INTERVAL=3
+  UVC_INTERVAL=1
   UVC_MAXPACKET=1024
   [ -r /boot/uvc-interval ]  && read -r UVC_INTERVAL  < /boot/uvc-interval
   [ -r /boot/uvc-maxpacket ] && read -r UVC_MAXPACKET < /boot/uvc-maxpacket
-  case "$UVC_INTERVAL"  in ''|*[!0-9]*) UVC_INTERVAL=3 ;;  esac
+  case "$UVC_INTERVAL"  in ''|*[!0-9]*) UVC_INTERVAL=1 ;;  esac
   case "$UVC_MAXPACKET" in ''|*[!0-9]*) UVC_MAXPACKET=1024 ;; esac
-  [ "$UVC_INTERVAL" -ge 1 ] && [ "$UVC_INTERVAL" -le 16 ] || UVC_INTERVAL=3
+  [ "$UVC_INTERVAL" -ge 1 ] && [ "$UVC_INTERVAL" -le 16 ] || UVC_INTERVAL=1
   [ "$UVC_MAXPACKET" -ge 1 ] && [ "$UVC_MAXPACKET" -le 3072 ] || UVC_MAXPACKET=1024
   echo "uvc: isoc bInterval $UVC_INTERVAL, maxpacket $UVC_MAXPACKET"
   echo "$UVC_INTERVAL"  > functions/uvc.usb0/streaming_interval
