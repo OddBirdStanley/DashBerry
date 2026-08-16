@@ -39,10 +39,20 @@ log() { echo "rear-ctld: $*" >&2; }
 # Resolve a menu control's LABEL to its index, so the Pi 4 can say
 # "h264_profile high" instead of "h264_profile 4" and its config stays
 # readable. Non-menu controls fall through unchanged.
+#
+# Both walkers below reset `inblock` on the next CONTROL line, and that
+# pattern carries the same leading-whitespace tolerance as is_menu() and for
+# the same reason — v4l2-ctl indents control names into a column. Without it
+# the block never closes, so the scan keeps reading menu entries belonging to
+# later controls: harmless for menu_label (it matches an index and exits
+# inside the right block, which comes first) but wrong for menu_index, which
+# searches by label and could return an index from an entirely different
+# control. $1 is unaffected either way — awk strips leading blanks for it,
+# which is exactly why this went unnoticed while is_menu() was failing loudly.
 menu_index() {                     # $1 = control, $2 = label → index, or $2
     v4l2-ctl -d "$DEV" --list-ctrls-menus 2>/dev/null | awk -v c="$1" -v want="$2" '
         $1 == c            { inblock = ($0 ~ /\(menu\)/); next }
-        /^[a-z_0-9]+ 0x/   { inblock = 0 }
+        /^[ \t]*[a-z_0-9]+ 0x/ { inblock = 0 }
         inblock && $1 ~ /^[0-9]+:$/ {
             idx = $1; sub(":", "", idx)
             label = $2; for (i = 3; i <= NF; i++) label = label " " $i
@@ -57,7 +67,7 @@ menu_index() {                     # $1 = control, $2 = label → index, or $2
 menu_label() {                     # $1 = control, $2 = index → label, or $2
     v4l2-ctl -d "$DEV" --list-ctrls-menus 2>/dev/null | awk -v c="$1" -v want="$2" '
         $1 == c            { inblock = ($0 ~ /\(menu\)/); next }
-        /^[a-z_0-9]+ 0x/   { inblock = 0 }
+        /^[ \t]*[a-z_0-9]+ 0x/ { inblock = 0 }
         inblock && $1 ~ /^[0-9]+:$/ {
             idx = $1; sub(":", "", idx)
             if (idx == want) {
@@ -70,8 +80,28 @@ menu_label() {                     # $1 = control, $2 = index → label, or $2
 }
 
 is_menu() {                        # $1 = control
+    # THE ANCHOR MUST TOLERATE LEADING WHITESPACE. v4l2-ctl right-aligns the
+    # control name inside a fixed-width column, under a class heading, so the
+    # line really reads "        h264_profile 0x00990176 (menu) : ...". A ^
+    # tight against the name matches NOTHING, which is not a cosmetic bug: it
+    # made this function answer "no" for EVERY control on the device, so
+    # menu_index/menu_label above were dead code and never ran once.
+    #
+    # What that cost (2026-08-15, found on the car): SET h264_profile high
+    # skipped the label->index translation and handed "high" to v4l2-ctl,
+    # which parsed it as the integer 0 and set BASELINE. The SET succeeded, so
+    # nothing faulted there — and then GET answered the raw 0, the Pi 4's
+    # read-back compared "0" against "high", and rear-ctl exited nonzero on
+    # every single start of rear-rec. The rear recorded nothing for the life
+    # of the card while the camera itself streamed perfectly.
+    #
+    # (menu) stays an EXACT match, deliberately: v4l2-ctl prints integer menus
+    # as (intmenu), and for those the value IS the index at both ends, so
+    # passing them through untranslated is already correct. Widening this to
+    # catch them would send auto_exposure_bias through a label lookup that has
+    # no labels to find.
     v4l2-ctl -d "$DEV" --list-ctrls-menus 2>/dev/null |
-        grep -qE "^${1}[[:space:]]+0x[0-9a-f]+[[:space:]]+\(menu\)"
+        grep -qE "^[[:space:]]*${1}[[:space:]]+0x[0-9a-f]+[[:space:]]+\(menu\)"
 }
 
 handle() {                         # $1.. = one command line → one reply line
