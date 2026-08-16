@@ -473,7 +473,8 @@ static int fb_init(void)
         fprintf(stderr, "dashberry-panel: mmap: %s\n", strerror(errno));
         return -1;
     }
-    fprintf(stderr, "dashberry-panel: display %s %ux%u @ %u bpp\n",
+    fprintf(stderr, "dashberry-panel: " DASHBERRY_VERSION
+            ", display %s %ux%u @ %u bpp\n",
             fb_dev, fb_xres, fb_yres, vi.bits_per_pixel);
     return 0;
 }
@@ -1235,6 +1236,7 @@ static bool storage_ok(void)
  * turns it into No Signal / GPS Error overlays). One record per line,
  * space-separated, first field the wall-clock epoch:
  *   <epoch> boot                       log opened (≈ panel start)
+ *   <epoch> ver <release>              the DashBerry release writing the log
  *   <epoch> <comp> <OK|ERR>            comp: front rear gps time storage
  *   <epoch> gpsfix <FIX|NOFIX>         RMC fix presence (OK-but-fixless)
  *   <epoch> event                      button-B marker
@@ -1314,6 +1316,7 @@ static void hlog_open(const char *session, int64_t now)
     hlog.inited = false;           /* a reopen re-dumps state: parser-safe */
     hlog.last_hb_ms = now;
     hlog_line("boot");
+    hlog_line("ver " DASHBERRY_VERSION);
 }
 
 static void hlog_sync(const char *session, int64_t now)
@@ -2138,7 +2141,8 @@ static int script_log_open(const char *name)
     struct tm tm;
     localtime_r(&t, &tm);
     int k = snprintf(hdr, sizeof hdr,
-                     "\n=== %s %04d-%02d-%02d %02d:%02d:%02d ===\n", name,
+                     "\n=== %s %04d-%02d-%02d %02d:%02d:%02d"
+                     " (DashBerry " DASHBERRY_VERSION ") ===\n", name,
                      tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                      tm.tm_hour, tm.tm_min, tm.tm_sec);
     if (k > 0) {

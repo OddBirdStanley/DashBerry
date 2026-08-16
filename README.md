@@ -2,6 +2,10 @@
 
 **Open-source, privacy-hardened, minimal dashcam for Raspberry Pi.**
 
+Current release: **1.0** — tracked in [`VERSION`](VERSION), shown on the
+panel's PAGE 2, and stamped into a card's install log, health log and
+config at build time.
+
 DashBerry is a self-built, two-camera vehicle dashcam running exclusively
 free software. It records front and rear video with a synchronized 5 Hz GPS
 track, stores everything locally on a microSD card, and transmits nothing:

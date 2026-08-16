@@ -148,5 +148,7 @@ case $r in
     *) fail "APPLY rejected: $r" ;;
 esac
 
-echo "rear-ctl: $VER — pushed and verified"
+# Both halves on one line: this card's release (/etc/dashberry-version,
+# stamped by firstinstall) next to what the Zero answered.
+echo "rear-ctl $(cat /etc/dashberry-version 2>/dev/null || echo '?'): $VER — pushed and verified"
 exec 3>&-

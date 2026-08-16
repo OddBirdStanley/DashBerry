@@ -46,6 +46,21 @@ import subprocess
 import sys
 import tempfile
 
+def _version():
+    # The repo root's VERSION file, one directory above cli/ — this tool
+    # runs from a checkout, never from the card (the runtime footprint rule
+    # above), so the file is normally there. A copy of the script that
+    # wandered off alone answers honestly instead of guessing.
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               os.pardir, "VERSION")) as f:
+            return f.read().strip()
+    except OSError:
+        return "unknown"
+
+
+VERSION = _version()
+
 KNOTS_TO_MPH = 1.15078
 KNOTS_TO_KMH = 1.852
 KNOTS_TO_MS = 0.514444
@@ -156,8 +171,9 @@ def health_path(data, session):
 
 def parse_health(path):
     """Parse the panel's per-session health log (format: IMPL.md — lines of
-    '<epoch> boot' / '<epoch> <comp> <OK|ERR>' / '<epoch> gpsfix <FIX|NOFIX>'
-    / '<epoch> event' / '<epoch> hb' / '<epoch> tmp <degC>'). Returns None if
+    '<epoch> boot' / '<epoch> ver <release>' / '<epoch> <comp> <OK|ERR>' /
+    '<epoch> gpsfix <FIX|NOFIX>' / '<epoch> event' / '<epoch> hb' /
+    '<epoch> tmp <degC>'; unknown kinds are skipped). Returns None if
     absent/unreadable, else a dict:
       start, end   first/last record epoch (boot .. last heartbeat)
       err          {comp: [(t0, t1), ...]} ERR spans (open spans end at end)
@@ -1034,9 +1050,13 @@ def cmd_render(args):
         # CRF 18 = x264's visually-lossless neighborhood — generous next
         # to the ~2 Mbps hardware-encoded source, so the mandatory
         # re-encode costs no quality a viewer can see.
+        # The rendered file is the one artifact that leaves the toolchain —
+        # a comment tag lets it name the release that produced it.
         cmd = (["ffmpeg", "-hide_banner", "-y"] + input_args +
                ["-filter_complex_script", script, "-map", "[%s]" % vid,
                 "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                "-metadata", "comment=DashBerry %s (dashberry-cli render)"
+                % VERSION,
                 "-an", args.output])
         try:
             subprocess.run(cmd, check=True)
@@ -1079,8 +1099,10 @@ def cmd_gpx(args):
     # GPX 1.0 on purpose: it has a NATIVE <speed> element (m/s); 1.1 buries
     # speed in extensions that many tools ignore (PLAN §3c).
     out.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-    out.write('<gpx version="1.0" creator="dashberry-cli" '
-              'xmlns="http://www.topografix.com/GPX/1/0">\n')
+    # creator is the GPX spec's "name version" slot — the one place the
+    # exported track names the tool and release that wrote it.
+    out.write('<gpx version="1.0" creator="dashberry-cli %s" '
+              'xmlns="http://www.topografix.com/GPX/1/0">\n' % VERSION)
     out.write("<trk><name>%s</name><trkseg>\n" % args.drive)
     for t, lat, lon, knots in sel:
         out.write('<trkpt lat="%.6f" lon="%.6f">'
@@ -1220,6 +1242,8 @@ def main():
     ap = argparse.ArgumentParser(
         prog="dashberry-cli",
         description="DashBerry data exporter for PC")
+    ap.add_argument("--version", action="version",
+                    version="dashberry-cli %s" % VERSION)
     ap.add_argument("--data", required=True, metavar="DIR",
                     help="path to a copy of /data")
     sub = ap.add_subparsers(dest="cmd", required=True)

@@ -116,7 +116,10 @@ if [ "${DB_INSTALL_LOG:-0}" != 1 ] && touch "$INSTALL_LOG" 2>/dev/null; then
     rm -f "$_rc_file"
     {
         echo
-        echo "===== firstinstall $(date -u '+%Y-%m-%dT%H:%M:%SZ') UTC ====="
+        # ../VERSION: the repo root's release file, which dashberry-install
+        # stages beside sw/ — so this line names WHICH TREE built the card.
+        # The cd to the script dir has not happened yet, hence $0.
+        echo "===== firstinstall $(cat "$(dirname "$0")/../VERSION" 2>/dev/null || echo '?') $(date -u '+%Y-%m-%dT%H:%M:%SZ') UTC ====="
         # Card clock, and it is allowed to be wrong: an install that runs at
         # the image build date is exactly the apt-404 fingerprint.
         set +e
@@ -326,6 +329,10 @@ install_files() {
 echo "installing files..."
 install_files 755 /usr/local/bin/ usr/local/bin/*
 install -m 644 etc/dashberry.conf /etc/dashberry.conf
+# The release stamp: runtime scripts (rear-ctl) read it so the card can say
+# what it is running without the repo present. Absent on a payload staged
+# before the VERSION file existed — never a reason to fail the install.
+[ -f ../VERSION ] && install -m 644 ../VERSION /etc/dashberry-version || true
 install_files 644 /etc/systemd/system/ etc/systemd/system/*
 # Both rules files: the device symlinks and the boot-time rfkill block.
 # Installing the latter is safe even on a --wifi first boot — udev reloads

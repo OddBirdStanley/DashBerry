@@ -1539,7 +1539,7 @@ function create(hw) {
     };
 }
 
-return { create, KEY, KEY_GPIO, XRES, YRES, COLS, ROWS,
+return { create, VERSION, KEY, KEY_GPIO, XRES, YRES, COLS, ROWS,
          SETTINGS, SET_PAGE_FIRST, OPT_COLS,
          TICK_MS, BLANK_MS, BURN_STEP_MS, STALE_MS, GPS_SILENT_MS,
          EVENT_HOLD_MS, RF_HOLD_MS, STAGE_HOLD_MS, JW_IDLE_MS,

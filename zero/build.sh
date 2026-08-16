@@ -74,7 +74,12 @@ resolve_ref() {                     # → the ref to check out
     printf '%s\n' "${head#origin/}"
 }
 
-VERSION=${DASHBERRY_ZERO_VERSION:-$(git -C "$HERE/.." rev-parse --short HEAD 2>/dev/null || echo dev)}
+# <release>-<sha>: the release names what the card claims to be, the sha
+# names the exact tree that built it. This string becomes
+# /etc/dashberry-zero-version on the image, so it reaches everything that
+# reads that file: rear-ctld's VERSION reply, boot-report, the manifest.
+RELEASE=$(cat "$HERE/../VERSION" 2>/dev/null || echo 0.0)
+VERSION=${DASHBERRY_ZERO_VERSION:-$RELEASE-$(git -C "$HERE/.." rev-parse --short HEAD 2>/dev/null || echo dev)}
 export DASHBERRY_ZERO_VERSION=$VERSION
 
 die() { printf 'build.sh: %s\n' "$*" >&2; exit 1; }

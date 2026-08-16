@@ -410,6 +410,9 @@ fi
 
 # --- the point of no return: a typed confirmation, nothing softer ----------
 [ -t 0 ] || die "This script must be run on a visual terminal"
+# The release about to be written, named at the one gate a human always
+# reads. Also staged onto the card (beside sw/) and stamped into the conf.
+DB_VER=$(cat "$(dirname "$(readlink -f "$0")")/../VERSION" 2>/dev/null || echo '?')
 echo "################################################################"
 echo "#                          WARNING                             #"
 if [ "$KEEP_DATA" = 1 ]; then
@@ -422,6 +425,7 @@ echo
 lsblk -o NAME,MODEL,SIZE,TYPE,MOUNTPOINT "$DEV" | sed 's/^/    /'
 echo
 echo "    image : $IMG"
+echo "    ver   : DashBerry $DB_VER"
 if [ "$KEEP_DATA" = 1 ]; then
     echo "    layout: boot | OS ~${KEEP_ROOT_GIB_APPROX} GiB$( [ $DEBUG = 0 ] && echo ' (read-only)' ) | /data (KEPT, $((KEEP_DATA_BYTES / 1024 / 1024 / 1024)) GiB)"
     echo "    keep  : $DATAP at sector $KEEP_DATA_START, fs UUID $KEEP_DATA_UUID"
@@ -776,6 +780,9 @@ sed -i '1s/$/ fbcon=map:9/' "$BOOTDIR/cmdline.txt"
 info "Staging sw/ payload and first-boot installer..."
 mkdir -p "$MNT/opt/dashberry"
 cp -a "$SWDIR" "$MNT/opt/dashberry/sw"
+# The release file rides beside sw/, where firstinstall's ../VERSION finds
+# it — for the install-log header and the /etc/dashberry-version stamp.
+[ -f "$SWDIR/../VERSION" ] && install -m 644 "$SWDIR/../VERSION" "$MNT/opt/dashberry/VERSION"
 # Docs stay on the PC — the payload ships code only (README.md is
 # gitignored dev documentation, not part of the runtime).
 rm -f "$MNT/opt/dashberry/sw/README.md"
@@ -788,6 +795,10 @@ rm -f "$MNT/opt/dashberry/sw/README.md"
 #     card cannot execute.
 find "$MNT/opt/dashberry/sw" -name __pycache__ -type d -prune -exec rm -rf {} +
 rm -f "$MNT/opt/dashberry/sw/src/dashberry-panel"
+# The conf's header says "as the card was BUILT" — so it names the release
+# that built it, stamped here where the values below are decided. A comment
+# line: the panel reads exactly five keys and every script sources it as sh.
+sed -i "1i # built from DashBerry $DB_VER" "$MNT/opt/dashberry/sw/etc/dashberry.conf"
 # Bypass and mode flags ride in the payload's conf — the one the
 # firstinstall step installs to /etc — so the panel (which bakes the
 # shield/wireless glyph off DEBUG) and firstinstall read the same truth.
@@ -822,6 +833,7 @@ fi
 if [ "$RISKY_SCRIPTS" = 1 ]; then
     mkdir -p "$MNT/opt/dashberry/sw/scripts"
     : > "$MNT/opt/dashberry/sw/scripts.manifest"
+    printf '# dashberry %s\n' "$DB_VER" >> "$MNT/opt/dashberry/sw/scripts.manifest"
     for f in "$RISKY_DIR"/*; do
         [ -f "$f" ] && [ -x "$f" ] || continue
         install -m 755 "$f" "$MNT/opt/dashberry/sw/scripts/"

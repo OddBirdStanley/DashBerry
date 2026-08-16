@@ -47,6 +47,9 @@ while :; do
         # Is the daemon still THERE? Without this the log cannot tell "it died"
         # from "nothing was asked of it" — and those want opposite fixes. A
         # journal that simply stops looks identical either way.
+        # Identity first: the trace is read off a pulled card, possibly
+        # months later — it should say which image wrote it.
+        echo "DashBerry Zero $(cat /etc/dashberry-zero-version 2>/dev/null || echo '?')"
         echo "=== state ==="
         echo "uvc-webcam:  $(systemctl is-active uvc-webcam 2>&1) / $(systemctl is-failed uvc-webcam 2>&1)"
         systemctl show uvc-webcam \

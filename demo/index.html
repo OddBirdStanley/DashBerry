@@ -424,6 +424,9 @@ function runRfJobs() {
 
 let panel = PANEL.create(hw);
 
+/* append() adds a text node, so the subtitle's <code> child survives */
+$("subtitle").append(" DashBerry " + PANEL.VERSION + ".");
+
 /* ----------------------------------------------------------- display -- */
 
 const ctx = $("oled").getContext("2d");
