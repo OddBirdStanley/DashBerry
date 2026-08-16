@@ -410,8 +410,8 @@ ok(decodeRow(0) === "TMP 31 C",
    `PAGE 2 row 0 renders "TMP 31 C" (got "${decodeRow(0)}")`);
 ok(decodeRow(1) === "PWR OK",
    `PAGE 2 row 1 renders "PWR OK" (got "${decodeRow(1)}")`);
-ok(decodeRow(2) === "" && decodeRow(3, 15) === "",
-   "PAGE 2 rows 2-3 are reserved (empty)");
+ok(decodeRow(2) === "" && decodeRow(3, 15) === "VER  1.0",
+   `PAGE 2 row 3 shows the version (got "${decodeRow(3, 15)}")`);
 ok(glyphCellPixels().join("") === expectedGlyphPixels('S').join(""),
    "RF glyph shows on PAGE 2 too");
 

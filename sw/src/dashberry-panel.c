@@ -76,6 +76,13 @@
 #include <linux/fb.h>
 #include <linux/gpio.h>
 
+/* -------------------------------------------------------------- version - */
+
+/* The DashBerry release this tree builds — the system's one version number,
+ * kept in step with VERSION at the repo root. Shown on PAGE 2 line 4, which
+ * is the only place a deployed card reports what it is running. */
+#define DASHBERRY_VERSION "1.0"
+
 /* ---------------------------------------------------------------- paths - */
 
 #define FB_DRIVER     "ssd130"  /* /sys/class/graphics/fbN/name prefix */
@@ -2586,9 +2593,10 @@ static void compose(struct frame *f, int64_t now)
         /* PAGE 2 — line 1: Pi 4 SoC temperature, whole degrees C
          * (negative-safe round-to-nearest); line 2: rail under-voltage
          * (now beats latched); line 3: CPU load across all four cores;
-         * line 4 reserved. Load sits under TMP deliberately — heat is the
-         * consequence, load is the cause, and reading them together is what
-         * tells a thermal soak from a merely busy encoder. */
+         * line 4: the release version. Load sits under TMP deliberately —
+         * heat is the consequence, load is the cause, and reading them
+         * together is what tells a thermal soak from a merely busy
+         * encoder. */
         if (cpu_temp_valid) {
             snprintf(f->rows[0], sizeof f->rows[0], "TMP %d C", cpu_temp_c());
         } else {
@@ -2606,6 +2614,7 @@ static void compose(struct frame *f, int64_t now)
             snprintf(f->rows[2], sizeof f->rows[2], "CPU %d%%", cpu_load_pct);
         else
             snprintf(f->rows[2], sizeof f->rows[2], "CPU ---");
+        snprintf(f->rows[3], sizeof f->rows[3], "VER  %s", DASHBERRY_VERSION);
         return;
     }
 

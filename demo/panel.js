@@ -58,6 +58,7 @@ const PANEL = (() => {
 
 /* --------------------------------------------------------------- timing - */
 
+const VERSION       = "1.0";    /* DASHBERRY_VERSION in the C; PAGE 2 line 4 */
 const TICK_MS       = 200;      /* repaint/watchdog tick: 5 Hz cap (§3b) */
 const HEALTH_TICKS  = 5;        /* health re-eval every 1 s */
 const BLANK_MS      = 10000;    /* AUTO-BLANK after 10 s without keys */
@@ -1212,7 +1213,8 @@ function create(hw) {
         if (PAGES[ui.page_idx] === 2) {
             /* PAGE 2 — line 1: Pi 4 SoC temperature, whole degrees C
              * (negative-safe round-to-nearest); line 2: firmware power
-             * flags (under-voltage now beats latched); rest reserved */
+             * flags (under-voltage now beats latched); line 4: the release
+             * version. Line 3 (CPU load in the C) is not simulated here. */
             if (cpu_temp_valid) {
                 const mc = cpu_temp_mc;
                 const deg = Math.trunc((mc + (mc >= 0 ? 500 : -500)) / 1000);
@@ -1224,6 +1226,7 @@ function create(hw) {
             else if (uv_now)                 f.rows[1] = "PWR UV NOW";
             else if (uv_seen)                f.rows[1] = "PWR UV SEEN";
             else                             f.rows[1] = "PWR OK";
+            f.rows[3] = "VER  " + VERSION;
             return f;
         }
 
