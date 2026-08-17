@@ -2618,7 +2618,7 @@ static void compose(struct frame *f, int64_t now)
             snprintf(f->rows[2], sizeof f->rows[2], "CPU %d%%", cpu_load_pct);
         else
             snprintf(f->rows[2], sizeof f->rows[2], "CPU ---");
-        snprintf(f->rows[3], sizeof f->rows[3], "VER  %s", DASHBERRY_VERSION);
+        snprintf(f->rows[3], sizeof f->rows[3], "VER %s", DASHBERRY_VERSION);
         return;
     }
 
